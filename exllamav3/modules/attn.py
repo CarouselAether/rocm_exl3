@@ -1,0 +1,1241 @@
+from __future__ import annotations
+from typing_extensions import override
+import torch
+import torch.nn.functional as F
+from ..model.config import Config
+from ..util.rope import RopeSettings, RoPE
+from ..util.tensor import get_for_device, to2
+from . import Module, Linear, RMSNorm, LayerNorm
+from ..constants import PAGE_SIZE
+from flash_attn import flash_attn_func, flash_attn_with_kvcache, flash_attn_varlen_func
+from .multilinear import MultiLinear
+from ..ext import exllamav3_ext as ext
+from ..model.model_tp_alloc import TPAllocation
+from ..util import profile_opt
+from torch.nn.attention.bias import causal_lower_right
+
+try:
+    import xformers.ops as xops
+    from xformers.ops.fmha import ck, cutlass, flash
+    from xformers.ops.fmha.attn_bias import (
+        BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        BlockDiagonalPaddedKeysMask,
+        LowerTriangularFromBottomRightMask,
+    )
+    # Monkey-patch xformers for sm_120 support, what could go wrong
+    from xformers.ops.fmha import cutlass as xf_cutlass
+    xf_cutlass.FwOp.CUDA_MAXIMUM_COMPUTE_CAPABILITY = (12, 0)
+    has_xformers = True
+except ModuleNotFoundError:
+    has_xformers = False
+
+# xformers imports on ROCm but its compiled backends (cutlassF etc.) are CUDA-only,
+# so memory_efficient_attention raises at dispatch time. Force the SDPA fallback
+# for bighead models (Gemma4, etc.) on ROCm.
+if has_xformers and getattr(torch.version, "hip", None) is not None:
+    has_xformers = False
+
+has_warned_sdpa_fallback = False
+
+"""
+SDPA:
+    
+    attn_mode: "sdpa_nc"
+    position (optional, default = 0): int *OR*
+    positions: shape (bsz) *OR*
+    position_ids: shape (bsz, seq_len)    
+    - no cache
+    - no chunking
+    - batch shape is determined by shape of input_ids
+    - no logit softcap support (Gemma)
+                    
+Flash Attention:
+                
+    attn_mode: "flash_attn"
+    batch_shape: tuple of (bsz, max_seq_len)
+    cache: Cache with capacity of at least bsz*max_seq_len tokens
+    past_len: int, *OR*
+    cache_seqlens: shape (bsz) 
+    position: int (overrides past_len for position emb)
+    positions: shape (bsz) (overrides cache_seqlens for position emb) *OR*
+    position_ids: shape (bsz, seq_len) (overrides cache_seqlens for position emb)
+    - max_seq_len must be divisible by 256
+    
+    attn_mode: "flash_attn"
+    block_table: list of page indices, shape (bsz, pages_per_seq)
+    cache: Paged cache
+    cache_seqlens: shape (bsz)
+    positions: shape (bsz) (overrides cache_seqlens for position emb) *OR*
+    position_ids: shape (bsz, seq_len) (overrides cache_seqlens for position emb)
+
+    attn_mode: "flash_attn_nc"
+    position (optional, default = 0): int *OR*
+    positions: shape (bsz) *OR*
+    position_ids: shape (bsz, seq_len)    
+    - no cache
+    - no chunking
+    - batch shape is determined by shape of input_ids
+"""
+
+def prepare_sdpa_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+    assert "cache" not in params, \
+        f"Cache provided for attn_mode: sdpa_nc"
+    return input_ids
+
+
+def prepare_flash_attn_nc(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+    assert "cache" not in params, \
+        f"Cache provided for attn_mode: sdpa_nc"
+    return input_ids
+
+
+def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+    bsz, seq_len = input_ids.shape
+
+    if "batch_shape" in params:
+        cache = params["cache"]
+        cache_bsz, cache_max_seq_len = params["batch_shape"]
+        past_len = params.get("past_len")
+        cache_seqlens = params.get("cache_seqlens") if past_len is None else None
+        position = params.get("position") if past_len is None else None
+        positions = params.get("positions") if past_len is None else None
+        position_ids = params.get("position_ids") if past_len is None else None
+        assert cache_bsz >= bsz, "batch size too large for cache"
+        assert cache_max_seq_len % PAGE_SIZE == 0, f"cache seq len must be a multiple of {PAGE_SIZE}"
+        # assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
+        assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
+        cache_bsz = min(bsz, cache_bsz)
+        num_pages = cache_bsz * cache_max_seq_len // PAGE_SIZE
+        block_table = torch.arange(num_pages, dtype = torch.int32).view(cache_bsz, cache_max_seq_len // PAGE_SIZE)
+        if past_len is not None:
+            cache_seqlens = torch.tensor([past_len], dtype = torch.int32).repeat(bsz)
+            if position is None: position = past_len
+        else:
+            if positions is None and position_ids is None: positions = cache_seqlens
+        if position is None: position = 0
+        params["block_table"] = block_table
+        params["cache_seqlens"] = cache_seqlens
+        params["position"] = position
+        params["positions"] = positions
+        params["position_ids"] = position_ids
+
+    elif "block_table" in params:
+        positions = params.get("positions")
+        position_ids = params.get("position_ids")
+        cache_seqlens = params.get("cache_seqlens")
+        if positions is None and position_ids is None: positions = cache_seqlens
+        params["cache_seqlens"] = cache_seqlens
+        params["positions"] = positions
+        params["position_ids"] = position_ids
+
+    return input_ids
+
+
+def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+    """
+    Add attn parameters to state
+    """
+    attn_mode = params.get("attn_mode", "flash_attn_nc")
+    match attn_mode:
+        case "sdpa_nc":
+            return prepare_sdpa_nc(input_ids, params)
+        case "flash_attn":
+            return prepare_flash_attn(input_ids, params)
+        case "flash_attn_nc":
+            return prepare_flash_attn_nc(input_ids, params)
+        case _:
+            raise ValueError(f"Unknown attn_mode: {attn_mode}")
+
+
+class Attention(Module):
+
+    def __init__(
+        self,
+        config: Config | None,
+        key: str,
+        layer_idx: int,
+        hidden_size: int,
+        head_dim: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        rope_settings: RopeSettings | None,
+        sm_scale: float | None = None,
+        key_q: str | None = None,
+        key_k: str | None = None,
+        key_v: str | None = None,
+        key_o: str | None = None,
+        key_g: str | None = None,
+        key_fused_qkv: str | None = None,
+        qmap: str | None = None,
+        out_dtype: torch.dtype | None = None,
+        sliding_window: int = -1,
+        logit_softcapping: float = 0.0,
+        q_norm: RMSNorm | LayerNorm | None = None,
+        k_norm: RMSNorm | LayerNorm | None = None,
+        v_norm: RMSNorm | LayerNorm | None = None,
+        q_proj: Linear | Module | None = None,
+        k_proj: Linear | Module | None = None,
+        v_proj: Linear | Module | None = None,
+        kv_proj: Linear | Module | None = None,
+        o_proj: Linear | Module | None = None,
+        g_proj: Linear | Module | None = None,
+        interleaved_gate: bool = False,
+        ve_gate: bool = False,
+        use_k_as_v: bool = False,
+        use_cu_seqlens: bool = False,
+        post_rope_norm: bool = False,
+        tp_split_norm: bool = True,
+        select_hq_bits: int = 0,
+    ):
+        super().__init__(config, key, None)
+
+        self.q_priority = 2 + select_hq_bits
+        self.layer_idx = layer_idx
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+        self.gqa = (num_q_heads != num_kv_heads)
+        self.sm_scale = sm_scale
+        self.rope_settings = rope_settings
+        self.rope = None
+        self.out_dtype = out_dtype
+        self.sliding_window = sliding_window
+        self.logit_softcapping = logit_softcapping
+        self.interleaved_gate = interleaved_gate
+        self.ve_gate = ve_gate
+        self.use_cu_seqlens = use_cu_seqlens
+        self.post_rope_norm = post_rope_norm
+        self.tp_split_norm = tp_split_norm
+        self.use_k_as_v = use_k_as_v
+
+        # Use fallback when head_dim exceeds 256 (max supported by flash-attn
+        self.use_bighead_fallback = self.head_dim > 256 or self.use_k_as_v
+        if self.use_bighead_fallback:
+            assert sliding_window == -1 and logit_softcapping == 0.0, \
+                "head_dim > 512 requires SDPA fallback path, which doesn't support sliding " \
+                "window attn or logit softcapping"
+
+        if post_rope_norm:
+            assert q_norm is None and k_norm is None, \
+                "Post-RoPE norm only supported without weights"
+
+        if self.num_kv_heads == 0:
+            return
+
+        # Create q, k, v projections
+        if key_fused_qkv:
+            assert not interleaved_gate, "Attn: interleaved_gate not implemented for fused QKV tensor"
+            fkey = f"{key}.{key_fused_qkv}"
+            frange_q = (0, num_q_heads * head_dim)
+            frange_k = (frange_q[1], frange_q[1] + num_kv_heads * head_dim)
+            frange_v = (frange_k[1], frange_k[1] + num_kv_heads * head_dim)
+        else:
+            fkey, frange_q, frange_k, frange_v = None, None, None, None
+
+        if key_q or frange_q:
+            f = 2 if interleaved_gate else 1
+            self.q_proj = Linear(
+                config,
+                f"{key}.{key_q}",
+                hidden_size,
+                num_q_heads * head_dim * f,
+                qmap = qmap + ".input" if qmap is not None else None,
+                fkey = fkey,
+                frange = frange_q,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkv",
+            )
+            self.register_submodule(self.q_proj)
+        else:
+            assert q_proj
+            self.q_proj = q_proj
+            self.register_submodule(self.q_proj)
+
+        if key_k or frange_k:
+            assert key_v or frange_v or use_k_as_v
+            self.k_proj = Linear(
+                config,
+                f"{key}.{key_k}",
+                hidden_size,
+                num_kv_heads * head_dim,
+                qmap =  qmap + ".input" if qmap is not None else None,
+                fkey = fkey,
+                frange = frange_k,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkv",
+            )
+            self.v_proj = Linear(
+                config,
+                f"{key}.{key_v}",
+                hidden_size,
+                num_kv_heads * head_dim,
+                qmap =  qmap + ".input" if qmap is not None else None,
+                fkey = fkey,
+                frange = frange_v,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".qkv",
+            ) if not use_k_as_v else None
+            self.register_submodule(self.k_proj)
+            self.register_submodule(self.v_proj)
+        else:
+            if kv_proj:
+                self.kv_proj = kv_proj
+                self.register_submodule(self.kv_proj)
+            else:
+                assert k_proj and v_proj
+                self.k_proj = k_proj
+                self.v_proj = v_proj
+                self.register_submodule(self.k_proj)
+                self.register_submodule(self.v_proj)
+
+        # Create o proj
+        if key_o:
+            self.o_proj = Linear(
+                config,
+                f"{key}.{key_o}",
+                num_q_heads * head_dim,
+                hidden_size,
+                qmap =  qmap + ".o" if qmap is not None else None,
+                out_dtype = out_dtype,
+                select_hq_bits = select_hq_bits,
+                qgroup = key + ".o" if qmap is not None else None,
+            )
+            self.register_submodule(self.o_proj)
+        else:
+            assert o_proj
+            self.o_proj = o_proj
+            self.register_submodule(self.o_proj)
+
+        # Register q/k norms
+        if q_norm:
+            assert k_norm, "Must have both Q and K norms, or neither"
+            self.q_norm = q_norm
+            self.k_norm = k_norm
+            self.register_submodule(self.q_norm)
+            self.register_submodule(self.k_norm)
+            if isinstance(q_norm, RMSNorm):
+                self.norm_eps = q_norm.rms_norm_eps
+                self.norm_constant_bias = q_norm.constant_bias
+                assert self.norm_eps == k_norm.rms_norm_eps
+            else:
+                self.norm_eps = q_norm.layernorm_eps
+                self.norm_constant_bias = 0.0
+        else:
+            self.q_norm = None
+            self.k_norm = None
+            self.norm_eps = 1e-6
+            self.norm_constant_bias = 0.0
+
+        # Register v norm
+        if v_norm:
+            self.v_norm = v_norm
+            self.register_submodule(self.v_norm)
+        else:
+            self.v_norm = None
+
+        # Register headwise gate
+        if key_g:
+            assert not interleaved_gate, \
+                "Cannot apply both interleaved and headwise gate"
+            self.g_proj = Linear(config, f"{key}.{key_g}", hidden_size, num_q_heads, qmap = None, out_dtype = torch.half, pad_to = 1)
+            self.headwise_gate = True
+            self.register_submodule(self.g_proj)
+        else:
+            if g_proj:
+                self.g_proj = g_proj
+                self.headwise_gate = True
+                self.register_submodule(self.g_proj)
+            else:
+                self.g_proj = None
+                self.headwise_gate = False
+
+        self.caps.update({
+            "kv_cache": True
+        })
+
+        self.cache_layers = []
+        self.tp_cache_lookup = {}
+        self.multi_kv = None
+        self.tp_reduce = False
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
+
+        self.has_split_cache = False
+
+        # TP-aware span_heads norm support
+        self.tp_span_heads_norm = False
+        self.q_global_dim = 0
+        self.k_global_dim = 0
+
+
+    @override
+    def optimizer_targets(self):
+        q = self.q_proj.optimizer_targets()
+        k = self.k_proj.optimizer_targets()
+        v = self.v_proj.optimizer_targets()
+        o = self.o_proj.optimizer_targets()
+        return [[q, k + v, o]]
+
+
+    def load_local(self, device, **kwargs):
+
+        if self.num_kv_heads == 0:
+            return
+
+        # Cache
+        for cl in self.cache_layers:
+            cl.alloc(device)
+
+        if self.rope_settings:
+            self.rope = RoPE(
+                device,
+                self.rope_settings,
+            )
+
+        # Test if K and V proj can be fused.
+        # Skipped on ROCm: the mgemm cooperative kernel used by MultiLinear
+        # is unstable on gfx1151 wave32. Fall back to separate K/V linears.
+        _is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+        if (
+            not _is_rocm and
+            not self.use_k_as_v and
+            device != torch.device("cpu") and
+            self.k_proj.quant_type == "exl3" and
+            self.v_proj.quant_type == "exl3" and
+            self.k_proj.out_features == self.v_proj.out_features and
+            self.k_proj.inner.K == self.v_proj.inner.K and
+            self.k_proj.inner.bias is None and
+            self.v_proj.inner.bias is None
+        ):
+            self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
+
+        # Head norm
+        if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
+            self.q_norm_tensor = self.q_norm.weight.data
+            self.k_norm_tensor = self.k_norm.weight.data
+
+
+    @override
+    def load(self, device: torch.Device, **kwargs):
+        super().load(device)
+        self.load_local(device, **kwargs)
+
+
+    @override
+    def unload(self):
+        super().unload()
+
+        for cl in self.cache_layers:
+            cl.free()
+
+        self.rope = None
+
+        if self.multi_kv is not None:
+            self.multi_kv.unload()
+            self.multi_kv = None
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+
+        if self.num_kv_heads == 0:
+            x = torch.zeros_like(x, dtype = self.out_dtype)
+            if self.tp_reduce:
+                params["backend"].all_reduce(x, False)
+        else:
+            bsz, seqlen, _ = x.shape
+            attn_mode = params.get("attn_mode", "flash_attn_nc")
+            match attn_mode:
+                case "sdpa_nc":
+                    x = self.decode_sdpa_nc(x, bsz, seqlen, params)
+                case "flash_attn":
+                    x = self.decode_flash_attn(x, bsz, seqlen, params)
+                case "flash_attn_nc":
+                    x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
+                case _:
+                    raise ValueError(f"Unknown attn_mode: {attn_mode}")
+            if self.tp_reduce:
+                params["backend"].all_reduce(x)
+
+        return to2(x, out_dtype, self.out_dtype)
+
+
+    def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
+        bsz, q_len, dim = x.shape
+        q = self.q_proj.forward(x, params)
+
+        if self.interleaved_gate:
+            q, g = torch.chunk(q.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+            g = g.reshape(bsz, q_len, -1)
+        elif self.g_proj:
+            g = self.g_proj.forward(x, params)
+        else:
+            g = None
+
+        if self.multi_kv is None or bsz * q_len > 32:
+            k = self.k_proj.forward(x, params)
+            v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
+
+        else:
+            x = x.view(1, bsz * q_len, dim)
+            kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+            kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
+            ext.exl3_mgemm(
+                x,
+                self.multi_kv.ptrs_trellis,
+                kv,
+                self.multi_kv.ptrs_suh,
+                kvh,
+                self.multi_kv.ptrs_svh,
+                None,
+                None,
+                self.multi_kv.K,
+                -1,
+                self.multi_kv.mcg,
+                self.multi_kv.mul1,
+                -1,
+                -1,
+                0
+            )
+            k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+            v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+
+        q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
+        k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+
+        if self.v_norm is not None:
+            v = self.v_norm.forward(v, params, out_dtype = torch.half)
+
+        return q, k, v, g
+
+
+    def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
+        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        x = self.o_proj.forward(o, params)
+        return x
+
+
+    def apply_qk_norms_tp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        params: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply Q/K RMSNorm with TP-aware variance reduction.
+        Used when span_heads=True and tp_reduce=True.
+
+        The variance is computed locally, then all-reduced across TP ranks
+        to get the true global variance.
+        """
+        backend = params["backend"]
+        orig_q_shape = q.shape
+        orig_k_shape = k.shape
+        bsz, seq_len = q.shape[0], q.shape[1]
+
+        # Flatten head dimension for norm computation: (bsz, seq, num_heads*head_dim)
+        q_flat = q.view(bsz, seq_len, -1).float()
+        k_flat = k.view(bsz, seq_len, -1).float()
+
+        # Compute local sum of squares
+        q_sq_sum = q_flat.pow(2).sum(dim=-1, keepdim=True)
+        k_sq_sum = k_flat.pow(2).sum(dim=-1, keepdim=True)
+
+        # Native TP backend requires data_size (numel * 2 bytes) to be multiple of 16.
+        # So numel must be multiple of 8. We have 2 values (q, k) per position.
+        # Flatten to 1D and pad to multiple of 8 elements.
+        qk_sq_sum = torch.cat([q_sq_sum.view(-1), k_sq_sum.view(-1)])  # (bsz*seq_len*2,)
+        numel = qk_sq_sum.numel()
+        pad_to = (numel + 7) // 8 * 8
+        if pad_to > numel:
+            qk_sq_sum = torch.nn.functional.pad(qk_sq_sum, (0, pad_to - numel))
+        backend.all_reduce(qk_sq_sum)
+        # Extract back (first half is q, second half is k)
+        half = bsz * seq_len
+        q_sq_sum = qk_sq_sum[:half].view(bsz, seq_len, 1)
+        k_sq_sum = qk_sq_sum[half:half*2].view(bsz, seq_len, 1)
+
+        # Compute global variance (sum / global_dim)
+        q_var = q_sq_sum / self.q_global_dim
+        k_var = k_sq_sum / self.k_global_dim
+
+        # Compute normalization factors
+        q_rmf = torch.rsqrt(q_var + self.norm_eps)
+        k_rmf = torch.rsqrt(k_var + self.norm_eps)
+
+        # Get weights (handle constant_bias if needed)
+        q_w = self.q_norm.weight
+        k_w = self.k_norm.weight
+        if self.norm_constant_bias != 0.0:
+            q_w = q_w + self.norm_constant_bias
+            k_w = k_w + self.norm_constant_bias
+
+        # Apply normalization and reshape back
+        q = (q_flat * q_rmf * q_w).half().view(orig_q_shape)
+        k = (k_flat * k_rmf * k_w).half().view(orig_k_shape)
+
+        return q, k
+
+
+    def decode_sdpa_nc(
+        self,
+        x: torch.Tensor,
+        bsz: int,
+        seqlen: int,
+        params: dict,
+    ):
+        causal = params.get("causal", True)
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+
+        q, k, v, g = self.project_qkv(x, params)
+
+        # Optional addend to V tensor (e.g. value embeddings)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
+
+        assert self.sliding_window < 0, \
+            "Torch SDPA does not support sliding window attention (SWA)"
+        assert self.logit_softcapping == 0.0, \
+            "Torch SDPA does not support logit softcapping"
+
+        if self.q_norm:
+            if self.tp_span_heads_norm:
+                # TP-aware path for span_heads=True
+                q, k = self.apply_qk_norms_tp(q, k, params)
+            elif not self.rope or self.q_norm_tensor is None:
+                q = self.q_norm.forward(q, params, out_dtype = torch.half)
+                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor if not self.tp_span_heads_norm else None,
+                self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                self.norm_eps,
+                self.norm_constant_bias,
+                inv_freq,
+                self.post_rope_norm
+            )
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v, is_causal = causal, enable_gqa = self.gqa, scale = self.sm_scale)
+        o = o.transpose(1, 2)
+
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
+
+        o = self.project_o(o, bsz, seqlen, params)
+        return o
+
+
+    def decode_flash_attn_nc(
+        self,
+        x: torch.Tensor,
+        bsz: int,
+        seqlen: int,
+        params: dict,
+    ):
+        if self.use_bighead_fallback:
+            return self.decode_sdpa_nc(x, bsz, seqlen, params)
+
+        causal = params.get("causal", True)
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+
+        q, k, v, g = self.project_qkv(x, params)
+
+        # Optional addend to V tensor (e.g. value embeddings)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
+
+        if self.q_norm:
+            if self.tp_span_heads_norm:
+                # TP-aware path for span_heads=True
+                q, k = self.apply_qk_norms_tp(q, k, params)
+            elif not self.rope or self.q_norm_tensor is None:
+                q = self.q_norm.forward(q, params, out_dtype = torch.half)
+                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor if not self.tp_span_heads_norm else None,
+                self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                self.norm_eps,
+                self.norm_constant_bias,
+                inv_freq,
+                self.post_rope_norm
+            )
+
+        if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
+            max_seqlen = params["max_seqlen"]
+            o = flash_attn_varlen_func(
+                q = q.squeeze(0),
+                k = k.squeeze(0),
+                v = v.squeeze(0),
+                cu_seqlens_q = cu_seqlens,
+                cu_seqlens_k = cu_seqlens,
+                max_seqlen_q = max_seqlen,
+                max_seqlen_k = max_seqlen,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, self.sliding_window),
+                softcap = self.logit_softcapping
+            )
+        else:
+            o = flash_attn_func(
+                q = q,
+                k = k,
+                v = v,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, self.sliding_window),
+                softcap = self.logit_softcapping
+            )
+
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
+
+        o = self.project_o(o, bsz, seqlen, params)
+        return o
+
+
+    def decode_flash_attn(
+        self,
+        x: torch.Tensor,
+        bsz: int,
+        seqlen: int,
+        params: dict,
+    ):
+        cache = params.get("cache")
+        block_table = get_for_device(params, "block_table", self.device)
+        cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        position_ids = get_for_device(params, "position_ids", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        causal = params.get("causal", True)
+        non_causal_spans = params.get("non_causal_spans")
+
+        q, k, v, g = self.project_qkv(x, params)
+
+        # Optional addend to V tensor (e.g. value embeddings)
+        if self.ve_gate:
+            v_addend = params.pop(f"_nc_ve.{self.layer_idx}")
+            v.add_(v_addend)
+
+        # TODO: Add LayerNorm option to fused norm/RoPE kernel
+        if self.q_norm:
+            if self.tp_span_heads_norm:
+                # TP-aware path for span_heads=True
+                q, k = self.apply_qk_norms_tp(q, k, params)
+            elif not self.rope or self.q_norm_tensor is None:
+                q = self.q_norm.forward(q, params, out_dtype = torch.half)
+                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor if not self.tp_span_heads_norm else None,
+                self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                self.norm_eps,
+                self.norm_constant_bias,
+                inv_freq,
+                self.post_rope_norm
+            )
+
+        if self.has_split_cache:
+            cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table)
+        else:
+            cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
+
+        if self.use_bighead_fallback:
+            if q.shape[1] <= 8:
+                fn = self.bighead_attn_paged_fallback
+            elif has_xformers:
+                fn = self.flash_attn_with_kvcache_xformers_fallback
+            else:
+                fn = self.flash_attn_with_kvcache_sdpa_fallback
+        else:
+            fn = flash_attn_with_kvcache
+
+        if not non_causal_spans:
+            o = fn(
+                q = q,
+                k = k,
+                v = v,
+                k_cache = cache_k,
+                v_cache = cache_v,
+                block_table = block_table,
+                cache_seqlens = cache_seqlens,
+                causal = causal,
+                softmax_scale = self.sm_scale,
+                window_size = (self.sliding_window, self.sliding_window),
+                softcap = self.logit_softcapping
+            )
+        else:
+            o = []
+            for a, b, c in non_causal_spans:
+                o_ = fn(
+                    q = q[:, a : b],
+                    k = k[:, a : b],
+                    v = v[:, a : b],
+                    k_cache = cache_k,
+                    v_cache = cache_v,
+                    block_table = block_table,
+                    cache_seqlens = cache_seqlens + a,
+                    causal = not c,
+                    softmax_scale = self.sm_scale,
+                    window_size = (self.sliding_window, self.sliding_window),
+                    softcap = self.logit_softcapping
+                )
+                o.append(o_)
+            o = torch.cat(o, dim = 1)
+
+        if self.has_split_cache:
+            self.tp_cache_lookup[cache].update_kv(cache_seqlens, block_table, cache_k, cache_v, seqlen)
+        else:
+            cache.update_layer(self.layer_idx, cache_seqlens, block_table, cache_k, cache_v, seqlen)
+
+        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
+        if self.interleaved_gate: o *= g.sigmoid()
+
+        o = self.project_o(o, bsz, seqlen, params)
+        return o
+
+
+    @staticmethod
+    def flash_attn_with_kvcache_xformers_fallback(
+        q, k, v,
+        k_cache, v_cache,
+        block_table, cache_seqlens,
+        causal = False,
+        softmax_scale = None,
+        window_size = None,
+        softcap = None,
+        chunk_size = 1024,
+    ):
+        batch, seqlen_q, nheads, headdim = q.shape
+        _, seqlen_new, nheads_k, _ = k.shape
+        block_size = k_cache.shape[1]
+        ngroups = nheads // nheads_k
+
+        outputs = []
+        for b in range(batch):
+            seq_len = cache_seqlens[b].item()
+            total_len = seq_len + seqlen_new
+
+            # Gather pages into contiguous buffer
+            num_blocks_needed = (total_len + block_size - 1) // block_size
+            phys_blocks = block_table[b, :num_blocks_needed]
+            k_buf = k_cache[phys_blocks].view(-1, nheads_k, headdim)
+            v_buf = v_cache[phys_blocks].view(-1, nheads_k, headdim)
+
+            # Write new tokens into buffer
+            k_buf[seq_len:total_len] = k[b]
+            v_buf[seq_len:total_len] = v[b]
+
+            # Prepare for xformers: (1, seq, nheads_k, ngroups, headdim) for GQA
+            k_xf = k_buf[:total_len].unsqueeze(0)  # (1, total_len, nheads_k, headdim)
+            v_xf = v_buf[:total_len].unsqueeze(0)
+
+            if ngroups > 1:
+                q_xf = q[b].unsqueeze(0).view(1, seqlen_q, nheads_k, ngroups, headdim)
+                k_xf = k_xf.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+                v_xf = v_xf.unsqueeze(3).expand(-1, -1, -1, ngroups, -1)
+            else:
+                q_xf = q[b].unsqueeze(0)
+
+            if causal:
+                attn_bias = LowerTriangularFromBottomRightMask()
+            else:
+                attn_bias = None
+
+            def stable_gqa_via_4d(q5, k5, v5, attn_bias = None, scale = None):
+                B, Mq, G, H, K = q5.shape
+                out = torch.empty(B, Mq, G * H, K, device = q5.device, dtype = q5.dtype)
+                for g in range(G):
+                    qg = q5[:, :, g]
+                    kg = k5[:, :, g, :1, :].expand(-1, -1, H, -1)
+                    vg = v5[:, :, g, :1, :].expand(-1, -1, H, -1)
+                    og = xops.memory_efficient_attention(
+                        qg, kg, vg,
+                        attn_bias = attn_bias,
+                        scale = scale,
+                        op = (cutlass.FwOp, None),
+                    )
+                    out[:, :, g * H:(g + 1) * H, :] = og
+                return out
+
+            # Hack required for xformers currently since GQA is broken
+            # https://github.com/facebookresearch/xformers/issues/1392
+            o = stable_gqa_via_4d(
+                q_xf, k_xf, v_xf,
+                attn_bias = attn_bias,
+                scale = softmax_scale,
+            )
+            # o = xops.memory_efficient_attention(
+            #     q_xf, k_xf, v_xf,
+            #     attn_bias = attn_bias,
+            #     scale = softmax_scale,
+            # )
+
+            if ngroups > 1:
+                o = o.reshape(1, seqlen_q, nheads, headdim)
+            outputs.append(o.squeeze(0))
+
+            # Write back affected pages
+            first_block = seq_len // block_size
+            last_block = (total_len - 1) // block_size
+            for block_idx in range(first_block, last_block + 1):
+                phys = phys_blocks[block_idx]
+                blk_start = block_idx * block_size
+                write_start = max(blk_start, seq_len)
+                write_end = min(blk_start + block_size, total_len)
+                off_start = write_start - blk_start
+                off_end = write_end - blk_start
+                src_start = write_start - seq_len
+                src_end = write_end - seq_len
+                k_cache[phys, off_start:off_end] = k[b, src_start:src_end]
+                v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
+
+        return torch.stack(outputs)
+
+
+    @staticmethod
+    def bighead_attn_paged_fallback(
+        q, k, v,
+        k_cache, v_cache,
+        block_table, cache_seqlens,
+        causal = False, softmax_scale = None,
+        window_size = None,
+        softcap = None,
+        kv_chunk_size = 128,
+    ):
+        o = torch.empty_like(q)
+        ext.bighead_attn_paged(
+            q, k, v,
+            k_cache, v_cache,
+            block_table, cache_seqlens,
+            o,
+            kv_chunk_size,
+            causal,
+            softmax_scale
+        )
+        return o
+
+
+    @staticmethod
+    def flash_attn_with_kvcache_sdpa_fallback(
+        q, k, v,
+        k_cache, v_cache,
+        block_table, cache_seqlens,
+        causal = False, softmax_scale = None,
+        window_size = None,
+        softcap = None,
+        chunk_size = 512,
+    ):
+        batch, seqlen_q, nheads, headdim = q.shape
+        _, seqlen_new, nheads_k, _ = k.shape
+        block_size = k_cache.shape[1]
+
+        global has_warned_sdpa_fallback
+        if not has_warned_sdpa_fallback:
+            col_default = "\u001b[0m"
+            col_red = "\u001b[31;1m"
+            print(
+                f"{col_red} !! Warning, using SDPA fallback for large head size. VRAM usage will be high "
+                f"and inference on long sequences will be slow. Consider installing `xformers` to improve "
+                f"performance.{col_default}"
+            )
+            has_warned_sdpa_fallback = True
+
+        outputs = []
+        for b in range(batch):
+            seq_len = cache_seqlens[b].item()
+            total_len = seq_len + seqlen_new
+
+            # Gather this sequence's blocks into a contiguous page-aligned buffer
+            num_blocks_needed = (total_len + block_size - 1) // block_size
+            phys_blocks = block_table[b, :num_blocks_needed]
+            k_buf = k_cache[phys_blocks].reshape(-1, nheads_k, headdim)
+            v_buf = v_cache[phys_blocks].reshape(-1, nheads_k, headdim)
+
+            # In-place copy new tokens into the buffer
+            k_buf[seq_len:total_len] = k[b]
+            v_buf[seq_len:total_len] = v[b]
+
+            # Transpose kv once for all chunks: (1, nheads_k, buf_len, headdim)
+            k_sdpa_full = k_buf.transpose(0, 1).unsqueeze(0)
+            v_sdpa_full = v_buf.transpose(0, 1).unsqueeze(0)
+
+            # Process q in chunks
+            chunk_outputs = []
+            for chunk_start in range(0, seqlen_q, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, seqlen_q)
+                q_chunk = q[b, chunk_start:chunk_end]  # (chunk_len, nheads, headdim)
+                q_sdpa = q_chunk.transpose(0, 1).unsqueeze(0)
+                chunk_len = chunk_end - chunk_start
+
+                if causal:
+                    # This chunk's last query sits at absolute position: (total_len - seqlen_q) + chunk_end - 1
+                    # So it only needs kv up to that position (inclusive)
+                    kv_end = total_len - seqlen_q + chunk_end
+                    k_sdpa = k_sdpa_full[:, :, :kv_end]
+                    v_sdpa = v_sdpa_full[:, :, :kv_end]
+                    attn_mask = causal_lower_right(chunk_len, kv_end)
+                else:
+                    k_sdpa = k_sdpa_full[:, :, :total_len]
+                    v_sdpa = v_sdpa_full[:, :, :total_len]
+                    attn_mask = None
+
+                o = F.scaled_dot_product_attention(
+                    q_sdpa, k_sdpa, v_sdpa,
+                    attn_mask = attn_mask,
+                    scale = softmax_scale,
+                    enable_gqa = True,
+                )
+                chunk_outputs.append(o.squeeze(0).transpose(0, 1))
+
+            outputs.append(torch.cat(chunk_outputs, dim = 0))
+
+            # Write back only the new tokens to the paged cache
+            first_block = seq_len // block_size
+            last_block = (total_len - 1) // block_size
+
+            for block_idx in range(first_block, last_block + 1):
+                phys = phys_blocks[block_idx]
+                blk_start = block_idx * block_size
+                blk_end = blk_start + block_size
+
+                write_start = max(blk_start, seq_len)
+                write_end = min(blk_end, total_len)
+
+                off_start = write_start - blk_start
+                off_end = write_end - blk_start
+
+                src_start = write_start - seq_len
+                src_end = write_end - seq_len
+
+                k_cache[phys, off_start:off_end] = k[b, src_start:src_end]
+                v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
+
+        return torch.stack(outputs)
+
+
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        storage = 0
+        storage += self.q_proj.storage_size()
+        storage += self.k_proj.storage_size()
+        storage += self.v_proj.storage_size()
+        storage += self.o_proj.storage_size()
+        for cl in self.cache_layers:
+            storage += cl.storage_size()
+        overhead_d = 0
+        overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
+        overhead_s = 0
+        for cl in self.cache_layers:
+            overhead_s += cl.overhead_size()
+        overhead_s += 2 * self.num_q_heads * self.head_dim * torch.half.itemsize  # q, o
+        overhead_s += 2 * self.num_kv_heads * self.head_dim * torch.half.itemsize  # k, v
+        recons = max(
+            self.q_proj.recons_size(),
+            self.k_proj.recons_size(),
+            self.v_proj.recons_size(),
+            self.o_proj.recons_size(),
+        )
+        channel_width = 1
+        channels_to_split = self.num_kv_heads
+        while channel_width * self.head_dim < 128:
+            assert channels_to_split % 2 == 0, \
+                "Model's K/V heads cannot divide into 128-channel tensors"
+            channel_width *= 2
+            channels_to_split //= 2
+        assert (channel_width * self.head_dim) % 128 == 0, \
+            "Model's K/V heads cannot divide into 128-channel tensors"
+        # TODO: Account for flash-attn temp VRAM usage
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = channel_width,
+            channel_unit = "heads",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = channels_to_split,
+            limit_key = "attn"
+        )
+        return [tpa]
+
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
+
+        # Check if q_norm uses span_heads
+        q_norm_span_heads = (
+            self.q_norm is not None and
+            isinstance(self.q_norm, RMSNorm) and
+            self.q_norm.span_heads
+        )
+
+        return {
+            "cls": Attention,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "head_dim": self.head_dim,
+                "rope_settings": self.rope_settings,
+                "sm_scale": self.sm_scale,
+                "out_dtype": self.out_dtype,
+                "sliding_window": self.sliding_window,
+                "logit_softcapping": self.logit_softcapping,
+                "post_rope_norm": self.post_rope_norm,
+                "tp_split_norm": self.tp_split_norm,
+            },
+            "num_kv_heads": self.num_kv_heads,
+            **{name: _export(getattr(self, name, None)) for name in (
+                "q_norm",
+                "k_norm",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "kv_proj",
+                "o_proj",
+                "g_proj",
+            )},
+            "device": self.device,
+            "cache_layers": [
+                cl.tp_export(plan) for cl in self.cache_layers
+            ],
+            "n_gqa": self.num_q_heads // self.num_kv_heads,
+            # For TP-aware span_heads norm
+            "q_norm_span_heads": q_norm_span_heads,
+            "q_global_dim": self.num_q_heads * self.head_dim if self.q_norm else 0,
+            "k_global_dim": self.num_kv_heads * self.head_dim if self.k_norm else 0,
+        }
+
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        key = exported["kwargs"]["key"]
+        head_dim = exported["kwargs"]["head_dim"]
+        n_gqa = exported["n_gqa"]
+        device = local_context["device"]
+        tp_split_norm = exported["kwargs"]["tp_split_norm"]
+        first, last, unit = plan[key]
+        assert unit == "heads"
+        num_kv_heads = last - first
+        num_q_heads = num_kv_heads * n_gqa
+
+        q_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        qh_split = (True, first * n_gqa, last * n_gqa) \
+            if num_kv_heads else None
+        kv_split = (True, first * head_dim, last * head_dim) \
+            if num_kv_heads else None
+        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+            if num_kv_heads else None
+        # For span_heads norms, we need element indices (head_idx * head_dim)
+        # For regular norms, we use head indices
+        q_norm_span_heads = exported.get("q_norm_span_heads", False)
+        if q_norm_span_heads:
+            # span_heads=True: norm weight is 1D with shape (num_heads * head_dim,)
+            norm_q_split = (first * head_dim * n_gqa, last * head_dim * n_gqa) \
+                if num_kv_heads else None
+            norm_k_split = (first * head_dim, last * head_dim) \
+                if num_kv_heads else None
+        else:
+            # span_heads=False: norm weight is 2D with shape (num_heads, head_dim)
+            norm_q_split = (first * n_gqa, last * n_gqa) \
+                if num_kv_heads else None
+            norm_k_split = (first, last) \
+                if num_kv_heads else None
+
+        def _import(name):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import(local_context, exported[name], plan) \
+                if exported.get(name) else None
+
+        def _import_split(name, split):
+            nonlocal exported, plan
+            return exported[name]["cls"].tp_import_split(local_context, exported[name], plan, split) \
+                if split and exported.get(name) else None
+
+        module = Attention(
+            config = None,
+            **exported["kwargs"],
+            num_q_heads = num_q_heads,
+            num_kv_heads = num_kv_heads,
+            q_norm = _import_split("q_norm", norm_q_split) if tp_split_norm else _import("q_norm"),
+            k_norm = _import_split("k_norm", norm_k_split) if tp_split_norm else _import("k_norm"),
+            q_proj = _import_split("q_proj", q_split),
+            k_proj = _import_split("k_proj", kv_split),
+            v_proj = _import_split("v_proj", kv_split),
+            kv_proj = _import_split("kv_proj", kv_split),
+            o_proj = _import_split("o_proj", o_split),
+            g_proj = _import_split("g_proj", qh_split),
+        )
+
+        if num_kv_heads:
+            cache_layers = exported["cache_layers"]
+            if len(cache_layers):
+                module.has_split_cache = True
+                for cl in exported["cache_layers"]:
+                    cli = cl["cls"](None, module, **cl["args"])
+                    module.cache_layers.append(cli)
+                    module.tp_cache_lookup[cl["args"]["cache_id"]] = cli
+
+        module.device = device
+        if not kwargs.get("skip_reduction"):
+            module.tp_reduce = True
+
+        # Set up TP-aware span_heads norm if needed
+        if exported.get("q_norm_span_heads", False):
+            module.tp_span_heads_norm = True
+            module.q_global_dim = exported.get("q_global_dim", 0)
+            module.k_global_dim = exported.get("k_global_dim", 0)
+
+        module.load_local(device)
+        torch.cuda.synchronize()
+        return module

@@ -1,0 +1,189 @@
+from __future__ import annotations
+from typing_extensions import override
+import torch
+from torch import nn
+from ..model.config import Config
+from . import Module
+from ..ext import exllamav3_ext as ext
+from ..model.model_tp_alloc import TPAllocation
+
+class RMSNorm(Module):
+
+    def __init__(
+        self,
+        config: Config | None,
+        key: str,
+        rms_norm_eps: float,
+        tensor_weight_suffix: bool = True,
+        out_dtype: torch.dtype | None = None,
+        qmap: str | None = None,
+        constant_bias: float = 0.0,
+        constant_scale: float = 1.0,
+        span_heads: bool = False,
+        unweighted: bool = False
+    ):
+        super().__init__(config, key, None)
+        assert qmap is None, "No quant scheme for RMSNorm"
+        self.module_name = "RMSNorm"
+
+        self.weight = None
+        self.rms_norm_eps = rms_norm_eps
+        self.out_dtype = out_dtype
+        self._numel = None
+        self.constant_bias = constant_bias
+        self.constant_scale = constant_scale
+        self.span_heads = span_heads
+        self.unweighted = unweighted
+
+        self.tensor_key = f"{self.key}.weight" if tensor_weight_suffix else f"{self.key}"
+
+    @override
+    def optimizer_targets(self):
+        return []
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        self.device = device
+        if not self.unweighted:
+            weight = self.config.stc.get_tensor(self.tensor_key, self.device, float2half = True, allow_bf16 = True)
+            self._numel = weight.numel()
+            self.weight = nn.Parameter(weight, requires_grad = False)
+        else:
+            self._numel = 0
+
+    @override
+    def unload(self):
+        self.device = None
+        self.weight = None
+
+    @override
+    def get_tensors(self):
+        return {} if self.unweighted else {
+            self.tensor_key: self.weight.data
+        }
+
+    def forward_torch(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        dtype = x.dtype
+        x = x.float()
+        var = x.pow(2).mean(dim = -1, keepdim = True) + self.rms_norm_eps
+        x = x * torch.rsqrt(var) * self.constant_scale
+        x = x.to(dtype)
+        if not self.unweighted:
+            x = x * self.weight if self.constant_bias == 0.0 else x * (self.weight + self.constant_bias)
+        x = x.to(out_dtype or self.out_dtype)
+        return x
+
+    @override
+    def weights_numel(self):
+        return self._numel
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        dtype = out_dtype or self.out_dtype
+
+        # ext.rms_norm expects row-major 2D inputs for the standard
+        # per-channel RMSNorm path. Flattening keeps results consistent across
+        # chunk/prefill shapes (e.g. [B, T, C] vs [B*T, C]).
+        # TODO: Weight tensor is always contiguous, so this could be handled more efficiently in the extension
+        if not self.span_heads and x.dim() > 2:
+            x_2d = x.view(-1, x.shape[-1]).contiguous()
+            y_2d = torch.empty_like(x_2d, dtype = dtype)
+            ext.rms_norm(
+                x_2d,
+                self.weight,
+                y_2d,
+                self.rms_norm_eps,
+                self.constant_bias,
+                self.constant_scale,
+                self.span_heads,
+            )
+            return y_2d.view_as(x)
+
+        y = torch.empty_like(x, dtype = dtype)
+        ext.rms_norm(
+            x,
+            self.weight,
+            y,
+            self.rms_norm_eps,
+            self.constant_bias,
+            self.constant_scale,
+            self.span_heads,
+        )
+        return y
+
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        if self.unweighted:
+            return []
+        stc = self.config.stc
+        storage = sum(stc.get_tensor_sizes(self.key))
+        overhead = storage // 2 * (self.out_dtype or torch.half).itemsize
+        tpa = TPAllocation(
+            key = self.key,
+            storage_per_device = storage,
+            overhead_per_device = overhead,
+        )
+        return [tpa]
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        return {
+            "cls": RMSNorm,
+            "kwargs": {
+                "key": self.key,
+                "rms_norm_eps": self.rms_norm_eps,
+                "out_dtype": self.out_dtype,
+                "constant_bias": self.constant_bias,
+                "span_heads": self.span_heads,
+            },
+            "weight": producer.send(self.weight),
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        module = RMSNorm(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        w = consumer.recv(exported["weight"], cuda = True)
+        module.weight = nn.Parameter(w) if w is not None else None
+        # span_heads is preserved via kwargs
+        torch.cuda.synchronize()
+        return module
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        first, last = split
+        module = RMSNorm(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+
+        w = consumer.recv(exported["weight"], cuda = True)
+        if w is not None:
+            if w.dim() == 2:
+                w = w[first : last, :]
+            elif w.dim() == 1 and module.span_heads:
+                # 1D weight tensor (e.g., span_heads=True norms)
+                # split contains element indices
+                w = w[first : last]
+            module.weight = nn.Parameter(w.to(module.device).contiguous())
+        # span_heads is preserved via kwargs
+
+        return module

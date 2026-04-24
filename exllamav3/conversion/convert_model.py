@@ -1,0 +1,686 @@
+import argparse
+import torch
+import time
+import sys
+from .. import Config, Model, Tokenizer
+from ..modules import Linear
+from ..modules.quant import LinearFP16, LinearEXL3
+from ..util.progress import ProgressBar
+from ..util.memory import free_mem
+from ..util import Timer, human_time
+from ..util.tensor import save_tensor_image
+from ..util.measures import cosine_error, sqnr
+from .calibration_data import get_default_calibration
+from .compile import compile_model, dsize
+from .allocation import create_q_strategy, print_strategy
+from ..loader.safetensors_alt import save_file, safe_open
+import os, shutil
+import json
+import threading
+from collections import deque
+import re
+
+col_default = "\u001b[0m"
+col_red = "\u001b[31;1m"
+
+torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-i", "--in_dir", type = str, default = None, help = "Input (model) directory")
+parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Working directory")
+parser.add_argument("-o", "--out_dir", type = str, default = None, help = "Output directory")
+parser.add_argument("-ss", "--shard_size", type = int, help = "Max shard size in MB, default: 8192")
+parser.add_argument("-b", "--bits", type = float, help = "Bits per weight")
+parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bits per weight, output (head) layer, default: 6")
+parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
+parser.add_argument("-resume", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
+parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
+parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
+parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 120, help = "Minimum checkpoint interval, in seconds")
+parser.add_argument("-lcpi", "--last_checkpoint_index", type = int, default = None, help = "Last module index to checkpoint (for debug purposes)")
+parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mode")
+parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
+parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
+parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
+parser.add_argument("-cb", "--codebook", type = str, default = "mcg", help = "Codebook: mcg (default), mul1 or 3inst")
+parser.add_argument("-pm", "--parallel_mode", action = "store_true", help = "When possible, use new parallel mode for small tensors (MoE layers especially)")
+
+group = parser.add_mutually_exclusive_group()
+group.add_argument("--out_scales", type = str, default = "always", help = "Enable out channel scales (always/never/auto, default: always)")
+
+parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
+
+num_ref_states = 5
+
+progress_lock = threading.Lock()
+curr_progress = 0
+max_progress = 0
+
+def check_system():
+    if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") is not None:
+        print(
+            "\n"
+            f" !! {col_red}IMPORTANT: The environment variable TORCH_ALLOW_TF32_CUBLAS_OVERRIDE is set!{col_default}\n"
+            f" !! {col_red}This causes Torch to run in reduced precision mode, which is likely to cause this "
+            f"script to fail or result in broken models.{col_default}\n"
+            "\n"
+        )
+
+
+def save_dict(filename, dict_, args):
+    path = os.path.join(args["work_dir"], filename)
+    with open(path, "w", encoding = "utf8") as f:
+        f.write(json.dumps(dict_, indent = 4))
+
+
+def load_dict(filename, args):
+    path = os.path.join(args["work_dir"], filename)
+    with open(path, "r", encoding = "utf8") as f:
+        return json.load(f)
+
+
+def load_tensor(filename, args):
+    path = os.path.join(args["work_dir"], filename)
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        if "tensor" in f.keys():
+            return f.get_tensor("tensor")
+        else:
+            tensors = []
+            i = 0
+            while f"tensor.{i}" in f.keys():
+                tensors.append(f.get_tensor(f"tensor.{i}"))
+                i += 1
+            return tensors
+
+
+def save_tensor(tensor, filename: str, args):
+    path = os.path.join(args["work_dir"], filename)
+    if isinstance(tensor, dict):
+        save_file({
+            k: v for k, v in tensor.items()
+        }, path)
+    elif isinstance(tensor, list):
+        save_file({
+            f"tensor.{i}": t for i, t in enumerate(tensor)
+        }, path)
+    else:
+        save_file({
+            f"tensor": tensor
+        }, path)
+
+
+def prepare_env(args):
+    qtensors_dir = os.path.join(args["work_dir"], "qtensors")
+    ckpt_dir = os.path.join(args["work_dir"], "ckpt")
+    images_dir = os.path.join(args["work_dir"], "images")
+    os.makedirs(args["work_dir"], exist_ok = True)
+    os.makedirs(qtensors_dir, exist_ok = True)
+    os.makedirs(ckpt_dir, exist_ok = True)
+    os.makedirs(images_dir, exist_ok = True)
+
+
+def prepare(args) -> (dict, dict, bool, str):
+    check_system()
+
+    if not args.work_dir:
+        return None, None, False, "Must specify --work_dir"
+    if not args.in_dir and not args.resume:
+        return None, None, False, "Specify either --in_dir to start a new job or --resume to resume an interrupted job"
+    if not args.out_dir and not args.resume:
+        return None, None, False, "Must specify --out_dir or --resume"
+    if args.codebook not in ["mcg", "mul1", "3inst"]:
+        return None, None, False, "Codebook must be 'mcg', 'mul1' or '3inst'"
+    if args.bits is not None and (args.bits > 8 or args.bits < 1):
+        return None, None, False, "--bits must be between 1 and 8"
+    if args.head_bits is not None and (args.head_bits > 8 or args.head_bits < 1) and args.head_bits != 16:
+        return None, None, False, "--head_bits must be between 1 and 8, or 16"
+
+    in_args = { "work_dir": args.work_dir }
+    if args.resume:
+        in_args = load_dict("args.json", in_args)
+        in_args["work_dir"] = args.work_dir
+
+    prepare_env(in_args)
+
+    def override(arg, can_override, default):
+        if (arg not in args or vars(args)[arg] is None) and arg not in in_args:
+            if default is not None:
+                in_args[arg] = default
+            else:
+                raise ValueError(f" ## Missing required argument: {arg}")
+        if arg in args and vars(args)[arg] is not None:
+            if arg in in_args and vars(args)[arg] and in_args[arg] != vars(args)[arg]:
+                if can_override:
+                    print(
+                        f" !! Warning: Overriding {arg} from existing job, was: {in_args[arg]}, "
+                        f"new value: {vars(args)[arg]}"
+                    )
+                else:
+                    raise ValueError(
+                        f" ## Error: Resuming job with {arg} = {in_args[arg]}, "
+                        f"cannot override with new value of {vars(args)[arg]}. "
+                        f"Please start a new job to change this value."
+                    )
+            in_args[arg] = vars(args)[arg]
+
+    for arg_, can_override, default in [
+        ("in_dir", True, None),
+        ("out_dir", True, None),
+        ("shard_size", True, 8192),
+        ("bits", False, None),
+        ("head_bits", False, 6),
+        ("hq", False, False),
+        ("cal_rows", False, 250),
+        ("cal_cols", False, 2048),
+        ("checkpoint_interval", True, None),
+        ("last_checkpoint_index", True, -1),
+        ("devices", True, None),
+        ("device_ratios", True, None),
+        ("codebook", True, "mcg"),
+        ("parallel_mode", True, False),
+    ]:
+        override(arg_, can_override if not args.override_anyway else True, default)
+
+    # Momentary args
+    in_args["image_dump"] = args.image_dump
+    in_args["verbose"] = args.verbose
+    in_args["apply_out_scales"] = {"always": True, "never": False, "auto": None}[args.out_scales]
+
+    if args.resume:
+        job_state = load_dict("ckpt/job.json", in_args)
+        print(f" -- Resuming existing job")
+    else:
+        print(f" -- Creating new job")
+        job_state = {
+            "next_module_idx": 0,
+            "q_strategy": None,
+        }
+        save_dict("args.json", in_args, in_args)
+        save_dict("ckpt/job.json", job_state, in_args)
+
+    warn_experimental = False
+    print(f"    Input directory: {in_args['in_dir']}")
+    print(f"    Output directory: {in_args['out_dir']}")
+    print(f"    Working directory: {in_args['work_dir']}")
+    print(f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns")
+    print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
+    print(f"    Output scales: " + {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]])
+    print(f"    Codebook: {in_args['codebook']}")
+
+    if warn_experimental:
+        print(
+            f" !! {col_red}WARNING, experimental options are selected. The quantized model may not work in future "
+            f"versions of ExLlamaV3 {col_default}"
+        )
+
+    return in_args, job_state, True, None
+
+
+def get_base_model(args):
+    config = Config.from_directory(args["in_dir"])
+    print(f" -- Loaded model config")
+    print(f"    Architecture: {config.architecture}")
+    model = Model.from_config(config)
+    print(f" -- Created model instance:")
+    print(model.get_layout_tree(4))
+    tokenizer = Tokenizer.from_config(config)
+    print(f" -- Loaded tokenizer")
+    print(f"    Vocab size: {tokenizer.actual_vocab_size}")
+    if hasattr(config, "rope_settings"):
+        config.rope_settings.print()
+    return config, model, tokenizer
+
+
+def prepare_state(args, job_state, config, model, tokenizer):
+    idx = job_state["next_module_idx"]
+    if idx == 0:
+        print(f" -- Preparing input state")
+        state = get_default_calibration(args, tokenizer)
+    else:
+        if idx < len(model.modules):
+            print(f" -- Resuming at: {model.modules[idx].key}")
+        else:
+            print(f" -- Resuming after: {model.modules[idx - 1].key}")
+        state = load_tensor("ckpt/state.safetensors", args)
+    return state
+
+
+def get_state_error(x, ref):
+     x = x.view(-1, x.shape[-1]).float()
+     ref = ref.view(-1, ref.shape[-1]).float()
+     err = torch.linalg.norm(x - ref, 'fro') / torch.linalg.norm(ref, 'fro')
+     sq = sqnr(x, ref)
+     cos = cosine_error(x, ref)
+     return err.item(), cos, sq
+
+
+@torch.inference_mode()
+def main(args, job_state):
+    global max_progress, curr_progress
+
+    torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
+
+    torch.set_grad_enabled(False)
+
+    devices = [int(d) for d in args["devices"].split(",")]
+    device = torch.device(devices[0])
+    if args.get("device_ratios"):
+        device_ratios = [int(d) for d in args["device_ratios"].split(",")]
+        assert len(devices) == len(device_ratios), "--devices and --device_ratios must be same length"
+    else:
+        device_ratios = None
+
+    last_checkpoint_time = time.time()
+    timed_blocks = 0
+    eta_window = deque(maxlen = 8)
+
+    # Get model
+    config, model, tokenizer = get_base_model(args)
+
+    # Check caps
+    can_resume_quant = model.caps.get("can_resume_quant", True)
+    if not can_resume_quant:
+        print(" !! Warning, resuming an interrupted quant is not possible for this architecture.")
+        print(" !! Checkpoints will not be saved because they are redundant.")
+        assert job_state["next_module_idx"] == 0, \
+            "Current implementation of this architecture does not support resuming an interrupted quant job."
+
+    # Get initial state or resume state
+    state = prepare_state(args, job_state, config, model, tokenizer)
+    original_input_ids = (
+        state.copy()
+        if job_state["next_module_idx"] == 0 else
+        [{} for _ in range(len(state))]
+    )
+    quant_preserves = [{} for _ in range(len(state))]
+
+    def get_preserve(si, params_):
+        params_.update(quant_preserves[si])
+        params_["quant_preserve"] = quant_preserves[si]
+
+    def put_preserve(si, params_):
+        quant_preserves[si] = params_["quant_preserve"]
+
+    # Get quantization strategy for model @bitrate
+    print(" -- Deciding quantization strategy")
+    hq = args["hq"]
+    strategy, final_bpw = create_q_strategy(model, config, args["bits"], args["head_bits"], hq)
+    args["final_bits"] = round(final_bpw, 2)
+    print(" -- Quantization strategy, summary:")
+    print(print_strategy(strategy))
+    print(f" -- Final bitrate (excluding head): {final_bpw:4.2f}" + (" (--hq enabled)" if hq else ""))
+
+    # Iterate over modules
+    for idx, module in enumerate(model.modules):
+
+        start_module_time = time.time()
+        if idx == model.first_block_idx:
+            timed_blocks = 0
+
+        # If resuming, skip along to checkpoint index
+        if idx < job_state["next_module_idx"]:
+            continue
+
+        # Collect output tensors
+        q_tensors = {}
+
+        # Slice module if necessary
+        slicing = module.num_slices > 1
+        for current_slice in range(module.num_slices):
+
+            # Load current module
+            slice_str = f" (slice {current_slice + 1}/{module.num_slices})" if slicing else ""
+            print(f" -- Loading unquantized module: {module.key}" + slice_str)
+            module.load(
+                torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+                load_slice = current_slice if slicing else None
+            )
+            for m in module:
+                if m.used_alt_key and not slicing:
+                    print(f"     - Cloned {m.key} from {m.alt_key}")
+            module.config.stc.close()
+
+            # Skip modules without quant targets
+            qmaps = module.get_qmaps()
+            if len(qmaps) > 0:
+
+                # Capture calibration input states during forward pass. For block-sparse models, all expert layers
+                # are activated to ensure all down projections capture at least some calibration data. When the
+                # state is advanced later, only selected experts will be used.
+                with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
+                    capture_H = {}
+                    ref_states = []
+                    for i in range(len(state)):
+                        progress.update(i)
+                        params = {
+                            "attn_mode": "flash_attn_nc",
+                            "capture": capture_H,
+                            "activate_all_experts": model.calibration_all_experts,
+                            "input_ids": original_input_ids[i],
+                        }
+                        if slicing:
+                             params["q_mlp_slice"] = current_slice
+                        get_preserve(i, params)
+                        model.per_layer_quant_preamble(params)
+                        rs = module.prepare_for_device(state[i], params)
+                        rs = module.forward(rs, params)
+                        put_preserve(i, params)
+                        if i < num_ref_states:
+                            if model.calibration_all_experts:
+                                # Do not activate all experts for reference state, for error measurement
+                                params = {
+                                    "attn_mode": "flash_attn_nc",
+                                    "input_ids": original_input_ids[i],
+                                }
+                                if slicing:
+                                    params["q_mlp_slice"] = current_slice
+                                get_preserve(i, params)
+                                model.per_layer_quant_preamble(params)
+                                rs = module.prepare_for_device(state[i], params)
+                                rs = module.forward(rs, params)
+                                put_preserve(i, params)
+                            ref_states.append(rs.cpu())
+                        rs = None
+                print(f" -- Captured: {module.key}" + slice_str, flush = True)
+
+                # More feedback
+                if len(capture_H):
+                    hfb_keys = [re.sub(r'\d+', '*', k) for k in capture_H.keys()]
+                    hfb_keys = sorted(list(set(hfb_keys)))
+                    print(f" -- Hessians: " + ", ".join(hfb_keys))
+                else:
+                    print(f" !! Hessians: None")
+
+                # Check for infs or NaNs in H
+                for k, v in capture_H.items():
+                    infs, nans = v["inf_nan"][0].item(), v["inf_nan"][1].item()
+                    if infs or nans:
+                        numel = v["num_total"]
+                        print(f" !! Warning: {k} state has {infs:,} inf values and {nans:,} NaN values (out of {numel:,})")
+
+                # Swap captured H to system RAM
+                for k, v in capture_H.items():
+                    v["H_swap_device"] = v["H"].device
+                    v["H"] = v["H"].cpu()
+
+            # Get submodules to quantize
+            linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
+            for linear in linears:
+                assert linear.key in strategy, \
+                    f" ## Logic error, no quantization strategy for module {linear.key}"
+            assert all(isinstance(linear.inner, LinearFP16) for linear in linears)
+
+            # Write images
+            if args["image_dump"]:
+                for linear in linears:
+                    filename = f"images/{linear.key}.jpg"
+                    print(f" -- Saving image: {filename}")
+                    w = linear.inner.get_weight_tensor()
+                    assert w.dim() == 2
+                    save_tensor_image(w, os.path.join(args["work_dir"], filename))
+
+            # Move original tensors to system RAM (load to GPU one by one when quantizing)
+            for linear in linears:
+                linear.inner.swap_cpu()
+
+            # Decide mode
+            # TODO: Might be useful to compare no. h-tiles per tensor, no. layers and no. SMs across GPUs
+            use_parallel_mode = False
+            if args["parallel_mode"] and len(linears) >= len(devices) and all(b <= 8 for _, b in strategy.items()):
+                use_parallel_mode = True
+
+            # Quantize module, layer parallel
+            if use_parallel_mode:
+                assert not args["image_dump"], "Parallel mode is incompatible with --image_dump"
+
+                # Split workload
+                all_dev_linears = [[] for _ in devices]
+
+                tot_numel = sum(linear.weights_numel() for linear in linears)
+                if device_ratios is None:
+                    dev_numel = [tot_numel // len(devices) for _ in devices]
+                else:
+                    tot_split = sum(device_ratios)
+                    dev_numel = [tot_numel * r // tot_split for _, r in zip(devices, device_ratios)]
+
+                for linear in linears:
+                    l_numel = linear.weights_numel()
+                    fit = [d_numel - l_numel for d_numel in dev_numel]
+                    bestfit = max(range(len(fit)), key = lambda x: fit[x])
+                    dev_numel[bestfit] -= l_numel
+                    all_dev_linears[bestfit].append(linear)
+
+                with progress_lock:
+                    curr_progress = 0
+                    max_progress = len(linears)
+
+                # Worker thread
+                def work_thread(device_idx, dev_linears):
+                    global curr_progress
+
+                    for linear in dev_linears:
+                        quant_args_local = {
+                            "seed": idx,
+                            "K": strategy[linear.key],
+                            "devices": [device_idx],
+                            "apply_out_scales": args["apply_out_scales"],
+                        }
+                        if args["codebook"] == "mcg": quant_args_local.update({ "mcg": True })
+                        elif args["codebook"] == "mul1": quant_args_local.update({ "mul1": True })
+
+                        proxy_err = linear.convert_exl3(
+                            capture_H[linear.qmap],
+                            quant_args = quant_args_local,
+                            verbose = args["verbose"],
+                            save_reg = False,
+                            override_swap_device = device_idx
+                        )
+                        assert isinstance(linear.inner, LinearEXL3)
+                        linear.inner.swap_cpu()
+
+                        flags_local = "o" if quant_args_local["apply_out_scales"] else "."
+                        flags_local += "f" if quant_args_local["q_fallback"] else "."
+                        proxy_err_str_local = (
+                            "(zero)  " if quant_args_local["zeros"] else
+                            "(big)   " if proxy_err >= 9.9 else
+                            f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
+                            "(OoM)   "
+                        )
+                        print(
+                            f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                            f"  bpw: {quant_args_local['K']:5.2f}"
+                            f"  proxy_err: {proxy_err_str_local}"
+                            f"  {flags_local}"
+                            f"  g_sc: {quant_args_local['g_scale']:.6f}"
+                        )
+                        with progress_lock:
+                            curr_progress += 1
+
+                # Launch
+                threads = []
+                for i, device_idx in enumerate(devices):
+                    if len(all_dev_linears[i]):
+                        t = threading.Thread(target = work_thread, args = (device_idx, all_dev_linears[i]))
+                        t.daemon = True
+                        threads.append(t)
+                for t in threads:
+                    t.start()
+
+                try:
+                    with ProgressBar(" -- Quantizing (parallel)", max_progress, transient = True) as progress:
+                        while any(t.is_alive() for t in threads):
+                            progress.update(curr_progress)
+                            time.sleep(0.1)
+                except KeyboardInterrupt as e:
+                    # TODO: This is too hacky
+                    from signal import pthread_kill, SIGTSTP, SIGKILL
+                    for t in threads:
+                        pthread_kill(t.ident, SIGTSTP)
+                        pthread_kill(t.ident, SIGKILL)
+                    print("Aborted.")
+                    sys.exit()
+
+                for t in threads:
+                    t.join(timeout = 0.1)
+
+            # Quantize module, single GPU or tensor split
+            else:
+                for linear in linears:
+                    if strategy[linear.key] == 16:
+                        print(
+                            f" -- Unquantized: {linear.key:{config.stc.max_key_len() + 6}}"
+                            f"  bpw: {16:5.2f}",
+                            flush = True
+                        )
+                    else:
+                        quant_args = {
+                            "seed": idx,
+                            "K": strategy[linear.key],
+                            "devices": devices,
+                            "device_ratios": device_ratios,
+                            "apply_out_scales": args["apply_out_scales"],
+                        }
+                        if args["codebook"] == "mcg": quant_args.update({ "mcg": True })
+                        elif args["codebook"] == "mul1": quant_args.update({ "mul1": True })
+
+                        with Timer() as t:
+                            sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
+                                if args["image_dump"] else None
+                            proxy_err = linear.convert_exl3(
+                                capture_H[linear.qmap],
+                                quant_args = quant_args,
+                                progress_str = f" -- <step>: {linear.key}",
+                                verbose = args["verbose"],
+                                save_reg = sr,
+                            )
+                            assert isinstance(linear.inner, LinearEXL3)
+                            linear.inner.swap_cpu()
+                        flags = "o" if quant_args["apply_out_scales"] else "."
+                        flags += "f" if quant_args["q_fallback"] else "."
+                        proxy_err_str = (
+                            "(zero)  " if quant_args["zeros"] else
+                            "(big)   " if proxy_err >= 9.9 else
+                            f"{proxy_err:8.6f}" if proxy_err >= 0.0 else
+                            "(OoM)   "
+                        )
+                        print(
+                            f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                            f"  bpw: {quant_args['K']:5.2f}"
+                            f"  proxy_err: {proxy_err_str}"
+                            f"  {flags}"
+                            f"  g_sc: {quant_args['g_scale']:.6f}"
+                            f"  [{t.interval:4.2f} s]",
+                            flush = True
+                        )
+
+            # Collect converted module tensors
+            for m in module:
+                q_tensors.update(m.get_tensors())
+
+            # Unload module
+            if not module.caps.get("retain_during_quant"):
+                module.unload()
+            capture_H = None
+            config.stc.close()
+
+        # Save layer tensors to working directory
+        save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
+
+        # Output final bpw for layer
+        num_bytes = dsize(q_tensors)
+        num_bits = num_bytes * 8
+        final_bpw = num_bits / module.weights_numel() if module.weights_numel() else None
+
+        # Reload module from memory
+        config.stc.set_new_tensors(q_tensors)
+        module.load(
+            torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+            source = q_tensors
+        )
+        config.stc.set_new_tensors(None)
+        del q_tensors
+
+        # Advance state
+        error = 0
+        cos_error = 0
+        sqnr_ = 0
+        with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
+            for i in range(len(state)):
+                progress.update(i)
+                params = {
+                    "attn_mode": "flash_attn_nc",
+                    "input_ids": original_input_ids[i],
+                }
+                state[i] = module.prepare_for_device(state[i], params)
+                if i < num_ref_states or idx < len(model.modules) - 1:
+                    get_preserve(i, params)
+                    model.per_layer_quant_preamble(params)
+                    state[i] = module.forward(state[i], params).cpu()
+                    put_preserve(i, params)
+                if i < num_ref_states and len(linears):
+                    ref_states[i] = ref_states[i].to(state[i].device)
+                    rfn, cos, sq = get_state_error(state[i], ref_states[i])
+                    error += rfn
+                    cos_error += cos
+                    sqnr_ += sq
+                    ref_states[i] = None
+        error /= num_ref_states
+        cos_error /= num_ref_states
+        sqnr_ /= num_ref_states
+
+        # Feedback after module
+        module_time = time.time() - start_module_time
+        print(
+            f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
+            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"  no_weights") +
+            (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
+            f"  cos: {cos_error:.6f}"
+            f"  sqnr: {sqnr_:.6f}"
+            f"  [{module_time:.2f} s]",
+            flush = True
+        )
+        if idx >= model.first_block_idx:
+            timed_blocks += 1
+            eta_window.append(module_time)
+            remaining_blocks = max(0, len(model.modules) - idx - 1)
+            if timed_blocks < 3:
+                print(
+                    " -- Estimated remaining time: warming up "
+                    f"({timed_blocks}/3 timed blocks)"
+                )
+            else:
+                avg_block_time = sum(eta_window) / len(eta_window)
+                est_remaining = avg_block_time * remaining_blocks
+                print(
+                    f" -- Estimated remaining time: {human_time(est_remaining)} "
+                    f"(avg over last {len(eta_window)} blocks)"
+                )
+
+        # Unload current module
+        if not module.caps.get("retain_during_quant"):
+            module.unload()
+        # free_mem()
+
+        # Checkpoint
+        job_state["next_module_idx"] = idx + 1
+        if can_resume_quant and \
+            time.time() > last_checkpoint_time + args["checkpoint_interval"] and \
+            (args.get("last_checkpoint_index", -1) < 0 or idx <= args["last_checkpoint_index"]):
+            print(f" -- Saving checkpoint")
+            ckpt_dir = os.path.join(args["work_dir"], "ckpt")
+            ckpt_dir_old = os.path.join(args["work_dir"], "ckpt_old")
+            ckpt_dir_new = os.path.join(args["work_dir"], "ckpt_new")
+            os.makedirs(ckpt_dir_new, exist_ok = True)
+            save_dict("ckpt_new/job.json", job_state, args)
+            save_tensor(state, "ckpt_new/state.safetensors", args)
+            if os.path.exists(ckpt_dir_old):
+                shutil.rmtree(ckpt_dir_old)
+            os.rename(ckpt_dir, ckpt_dir_old)
+            os.rename(ckpt_dir_new, ckpt_dir)
+            last_checkpoint_time = time.time()
+
+    # Compile model
+    compile_model(args, model, config, tokenizer)
+
+    # All done
+    print(" -- All done")

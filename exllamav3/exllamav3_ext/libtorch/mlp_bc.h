@@ -1,0 +1,34 @@
+py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
+(
+    py::init<
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        at::Tensor,
+        int,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        std::shared_ptr<BC_LinearEXL3>,
+        float
+    >(),
+    py::arg("guh"),
+    py::arg("gu"),
+    py::arg("a"),
+    py::arg("gu_ptrs_trellis"),
+    py::arg("gu_ptrs_suh"),
+    py::arg("gu_ptrs_svh"),
+    py::arg("gu_K"),
+    py::arg("gu_mcg"),
+    py::arg("gu_mul1"),
+    py::arg("act_silu"),
+    py::arg("act_gelu"),
+    py::arg("act_relu2"),
+    py::arg("down"),
+    py::arg("act_limit")
+)
+.def("run_bsz1", &BC_GatedMLP::run_bsz1);
