@@ -1,6 +1,10 @@
 
 # <img src="doc/cat.png" width="40"> ExLlamaV3
 
+This is a ROCm beta fork for ExLlamaV3
+
+You may be looking for [ExllamaV3](https://github.com/turboderp-org/exllamav3) by turboderp.
+
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs. Headline features:
 
 - New [EXL3](doc/exl3.md) quantization format based on QTIP
@@ -13,20 +17,20 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 - 2-8 bit cache quantization
 - Multimodal support
 
+Or so it is supposed to have anyway. This should work on CUDA or ROCm... but it is a beta for ROCm specifically.
+
 The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://github.com/theroyallab/tabbyAPI/), which provides an OpenAI-compatible API for local or remote inference, with extended features like HF model downloading, embedding model support and support for HF Jinja2 chat templates.
 
-### ⚠️ Important
+But to use it, you have to uninstall the EXL3 that it pulls, use the venv that they have in TabbyAPI, and then build your ROCm version of this EXL3. But even before that you have to build FlashAttention2 on ROCm first.
 
-- **Qwen3-Next** and **Qwen3.5** can take advantage of [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention), though this requires
-  Triton, and performance can be shaky due to the sporadic JIT compilation it imposes. [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) is
-  supported and recommended but not required.
-- **Qwen3-Next** and **Qwen3.5** currently do not support tensor/expert parallelism.
-- The **Gemma4** implementaion benefits greatly from [xformers](https://github.com/facebookresearch/xformers)
-  (`pip install xformers`) which will be autodetected and used when available. Performance is likely to 
-  improve further with a better head_dim > 256 attention implementation soon. 
-- **Gemma4** does not currently support tensor/expert parallelism.
-- xformers is monkey-patched to force it to run on sm_120 GPUs (seems to work™.) Please open an issue if you experience
-  any problems with this.
+### ⚠️ Important
+ROCm 7.2.1 is an absolute requirement.
+Building FlashAttention2 first on the newest version is also a requirement.
+Triton fallback will likely fail. I haven't gotten it working on this hardware and I think it is due to PyTorch not being on ROCm 7.2.1.
+Some of the normally supported models will not work, I did not test them all.
+Gemma4 does not work.
+Tensor Parallel is disabled for ROCm.
+I have not tested vision capability, this is a beta and I have a GFX1151 Strix Halo, Ryzen 395+ AI Max for dev... so your performance may vary.
 
 ## Architecture support
 
@@ -40,7 +44,6 @@ The official and recommended backend server for ExLlamaV3 is [TabbyAPI](https://
 - **EXAONE 4.0** (Exaone4ForCausalLM)
 - **Gemma 2** (Gemma2ForCausalLM)
 - **Gemma 3** (Gemma3ForCausalLM, Gemma3ForConditionalGeneration) *- multimodal*
-- **Gemma 4** (Gemma3ForConditionalGeneration) *- multimodal*
 - **GLM 4**, **GLM 4.5**, **GLM 4.5-Air**, **GLM 4.6** (Glm4ForCausalLM, Glm4MoeForCausalLM)
 - **GLM 4.1V**, **GLM 4.5V** (Glm4vForConditionalGeneration, Glm4vMoeForConditionalGeneration) *- multimodal*
 - **HyperCLOVAX** (HyperCLOVAXForCausalLM, HCXVisionV2ForCausalLM) *- multimodal*
@@ -74,60 +77,32 @@ Always adding more, stay tuned.
 Currently on the to-do list:
 
 - LoRA support
-- ROCm support
 
-As for what is implemented, expect that some things may be a little broken at first. Please be patient, raise issues and/or contribute. 👉👈 
+As for what is implemented, expect that some things may be a VERY broken at first. Please be patient, raise issues and/or contribute. 👉👈 
 
 
 ## How to?
 
+[PyTorch](https://github.com/pytorch/pytorch) needs to be installed using ROCm 7.2.
+I have no reason to believe this will work on windows and if you got ROCm 7.2.1 on Windows with pytorch working, you know what you are doing and more power to you. I'd love to know if it works.
+
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+
+[FlashAttention](https://github.com/Dao-AILab/flash-attention)
+You are going ot have to build this on your system in the venv you are testing it in.
+
+If you use TabbyAPI, you are going to have to go into its venv that it installed exllamav3 in and uninstlal it and flash-attn. The build your flash-attn and this rocm_exl3.
 [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) has a startup script that manages and installs prerequisites if you want to get started quickly with inference in an OAI-compatible client. 
-
-Otherwise, start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later) since the Torch dependency is not automatically handled by `pip`. Then pick a method below:
-
-### Method 1: Installing from prebuilt wheel (recommended if you're unsure)
-
-Pick a wheel from the [releases page](https://github.com/turboderp-org/exllamav3/releases), then e.g.:
-
-```sh
-pip install https://github.com/turboderp-org/exllamav3/releases/download/v0.0.6/exllamav3-0.0.6+cu128.torch2.8.0-cp313-cp313-linux_x86_64.whl
-```
-
-### Method 2: Installing from PyPi:
-
-```sh
-pip install exllamav3
-```
-Note that the PyPi package does not contain a prebuilt extension and requires the CUDA toolkit and build prerequisites (i.e. VS Build Tools on Windows, gcc on Linux, `python-dev` headers etc.).    
-
-### Method 3: Building from source
-
-```sh
-# Clone the repo
-git clone https://github.com/turboderp-org/exllamav3
-cd exllamav3
-
-# (Optional) switch to dev branch for latest in-progress features
-git checkout dev
-
-# Install requirements (make sure you install Torch separately)
-pip install -r requirements.txt
-```
-
-At this point you should be able to run the conversion, eval and example scripts from the main repo directory, e.g. `python convert.py -i ...`
 
 To install the library for the active venv, run from the repo directory:
 
 ```sh
-pip install .
+pip install . --no-build-isolation
 ```
 
-Relevant env variables for building:
-- `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
-- `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
-
-
 ## Conversion
+
+I would love to know if this can convert well using ROCm. It should by all accounts. If not submit a bug report and I will get to it at some point
 
 To convert a model to EXL3 format, use:
 
@@ -200,6 +175,7 @@ A selection of EXL3-quantized models is available [here](https://huggingface.co/
 
 This project owes its existence to a wonderful community of FOSS developers and some very generous supporters (🐈❤️!) The following projects in particular deserve a special mention:
 
+- [ExLlamaV3](https://github.com/turboderp-org/exllamav3) 
 - [TabbyAPI](https://github.com/theroyallab/tabbyAPI/)
 - [PyTorch](https://github.com/pytorch/pytorch)
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention)
