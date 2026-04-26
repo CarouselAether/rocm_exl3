@@ -91,6 +91,79 @@ if precompile and torch:
         # substituted). The custom HIPBuildExtension below compiles every
         # .cu/.hip with hipcc unchanged.
         # -----------------------------------------------------------------
+
+        # Supported GPU architectures. Aligns with flash-attention's
+        # allowed_archs: RDNA3+ (gfx11+, gfx12+) and CDNA2+ (gfx90a, gfx94x,
+        # gfx95x). Pre-RDNA3 (gfx1030 etc.) and pre-CDNA2 (gfx906 etc.) lack
+        # the WMMA / matrix-core ISA the kernels depend on and will either
+        # fail to compile or produce kernels that crash at runtime.
+        SUPPORTED_GPU_ARCHS = {
+            "gfx90a", "gfx942", "gfx950",
+            "gfx1100", "gfx1101", "gfx1102",
+            "gfx1150", "gfx1151",
+            "gfx1200", "gfx1201",
+        }
+
+        def _resolve_offload_archs():
+            """Return list of --offload-arch values to compile for.
+
+            GPU_ARCHS env var: explicit semicolon-separated list. Validated
+            against SUPPORTED_GPU_ARCHS; unsupported entries hard-fail.
+
+            Otherwise auto-detect via rocminfo and filter to supported. On
+            mixed-generation systems this excludes pre-RDNA3 GPUs with a
+            warning rather than letting hipcc try to build for them.
+            """
+            env = os.environ.get("GPU_ARCHS", "").strip()
+            if env:
+                requested = [a.strip().lower() for a in env.split(";") if a.strip()]
+                bad = [a for a in requested if a not in SUPPORTED_GPU_ARCHS]
+                if bad:
+                    raise RuntimeError(
+                        f"GPU_ARCHS contains unsupported arch(s): {bad}. "
+                        f"Supported: {sorted(SUPPORTED_GPU_ARCHS)}. "
+                        f"Pre-RDNA3 / pre-CDNA2 GPUs lack the matrix-core ISA "
+                        f"this kernel suite requires."
+                    )
+                return requested
+
+            # Auto-detect: parse rocminfo for all installed gfx archs.
+            try:
+                ri = subprocess.check_output(
+                    ["/opt/rocm/bin/rocminfo"], text=True, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                # No rocminfo (e.g. CI sysroot build). Let hipcc auto-detect
+                # at runtime; the per-call --offload-arch will just be omitted.
+                return []
+
+            detected = set()
+            for line in ri.splitlines():
+                line = line.strip()
+                # rocminfo prints lines like "  Name:                    gfx1151"
+                if line.startswith("Name:") and "gfx" in line:
+                    arch = line.split()[1].strip().lower()
+                    detected.add(arch)
+
+            supported = sorted(detected & SUPPORTED_GPU_ARCHS)
+            unsupported = sorted(detected - SUPPORTED_GPU_ARCHS)
+            if unsupported:
+                print(
+                    f"[setup.py] WARNING: ignoring unsupported GPU arch(s): "
+                    f"{unsupported}. Building only for: {supported or '(none)'}.",
+                    file=sys.stderr,
+                )
+            if not supported:
+                raise RuntimeError(
+                    f"No supported GPU arch detected by rocminfo. Detected: "
+                    f"{sorted(detected) or '(empty)'}. Supported: "
+                    f"{sorted(SUPPORTED_GPU_ARCHS)}. Set GPU_ARCHS explicitly "
+                    f"to override."
+                )
+            return supported
+
+        OFFLOAD_ARCHS = _resolve_offload_archs()
+
         class HIPExtension(Extension):
             pass
 
@@ -164,24 +237,29 @@ if precompile and torch:
                         "-Wno-deprecated-declarations",
                         "-Wno-unused-variable",
                         "-Wno-unused-function",
+                        "-Wno-unused-value",  # nodiscard hipError_t in void ctx
                         "-Wno-missing-field-initializers",
                         "-Wno-#pragma-messages",
                         "-Wno-pass-failed",
                     ]
                 )
                 cxx_flags = ["-O3", "-fPIC", "-std=c++17", "-Wno-register"] + quiet_warnings
+                # Pin --offload-arch explicitly to the supported, detected list.
+                # Without this, hipcc tries to build for every installed GPU,
+                # which on mixed-generation rigs (e.g. 7900 XTX + older card)
+                # fails on the unsupported arch.
+                offload_arch_flags = [f"--offload-arch={a}" for a in OFFLOAD_ARCHS]
+
                 hip_flags = [
                     "-O3", "-fPIC", "-std=c++17",
                     # Relocatable device code — needed for cooperative kernel
-                    # launches in exl3_moe. hipcc auto-detects --offload-arch
-                    # from the installed GPU; we intentionally do not pin it
-                    # so the same source builds on any gfx11+ target.
+                    # launches in exl3_moe.
                     "-fgpu-rdc",
                     # Upstream attention.cu uses C++17-deprecated `register`
                     # declarations; upstream treats the warning as harmless,
                     # hipcc treats it as an error by default.
                     "-Wno-register",
-                ] + quiet_warnings
+                ] + offload_arch_flags + quiet_warnings
                 include_args = [f"-I{d}" for d in include_dirs]
 
                 obj_files = []
