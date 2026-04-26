@@ -120,6 +120,15 @@ As for what is implemented, expect that some things may be a VERY broken at firs
 
 ## How to?
 
+I tried to make it super easy mode:
+```
+git clone https://github.com/CarouselAether/rocm_exl3/
+cd exllamav3
+bash scripts/install_rocm.sh
+```
+
+Manually:
+
 [PyTorch](https://github.com/pytorch/pytorch) needs to be installed using ROCm 7.2.
 I have no reason to believe this will work on windows and if you got ROCm 7.2.1 on Windows with pytorch working, you know what you are doing and more power to you. I'd love to know if it works.
 
@@ -133,7 +142,7 @@ If you use TabbyAPI, you are going to have to go into its venv that it installed
 
 To install the library for the active venv, run from the repo directory:
 
-```sh
+```
 pip install . --no-build-isolation
 ```
 
