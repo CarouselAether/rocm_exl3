@@ -8,39 +8,39 @@ You may be looking for [ExllamaV3](https://github.com/turboderp-org/exllamav3) b
 The environment I am working with is the following:
 GMK-Tek Evo2 Ryzen 395+ AI Max (128GB)
 
-## Host OS & toolchain
-Distro: Ubuntu 24.04.4 LTS
-Kernel: Linux 6.17.0-1017-oem (Ubuntu OEM kernel)
-glibc: 2.39
-gcc / g++: 13.3.0
-amdgpu kernel driver: 6.16.13 (DKMS, version 1:6.16.13.30300100-2303411.24.04)
+### Host OS & toolchain
+- Distro: Ubuntu 24.04.4 LTS
+- Kernel: Linux 6.17.0-1017-oem (Ubuntu OEM kernel)
+- glibc: 2.39
+- gcc / g++: 13.3.0
+- amdgpu kernel driver: 6.16.13 (DKMS, version 1:6.16.13.30300100-2303411.24.04)
 
-## ROCm
-Version: 7.2.1 (/opt/rocm-7.2.1)
-HIP: 7.2.53211-e1a6bc5663
-AMD clang: 22.0.0git, roc-7.2.1 branch, commit f58b06dce1f9c15707c5f808fd002e18c2accf7e
-HSA Runtime: 1.18.0
+### ROCm
+- Version: 7.2.1 (/opt/rocm-7.2.1)
+- HIP: 7.2.53211-e1a6bc5663
+- AMD clang: 22.0.0git, roc-7.2.1 branch, commit f58b06dce1f9c15707c5f808fd002e18c2accf7e
+- HSA Runtime: 1.18.0
 
-## Key ROCm packages:
-hip-runtime-amd 7.2.53211.70201-81~24.04
-hipblas 3.2.0, hipblaslt 1.2.2, hipblas-common-dev 1.4.0
-hiprand 3.1.0, hipsolver 3.2.0, hipsparse 4.2.0
-miopen-hip 3.5.1, hsa-rocr 1.18.0, comgr 3.0.0
-rocblas, rocfft, rocrand, rocsolver, rocsparse all 7.2.x train
-Python venv (~/rocm_llm, Python 3.12.3)
+### Key ROCm packages:
+- hip-runtime-amd 7.2.53211.70201-81~24.04
+- hipblas 3.2.0, hipblaslt 1.2.2, hipblas-common-dev 1.4.0
+- hiprand 3.1.0, hipsolver 3.2.0, hipsparse 4.2.0
+- miopen-hip 3.5.1, hsa-rocr 1.18.0, comgr 3.0.0
+- rocblas, rocfft, rocrand, rocsolver, rocsparse all 7.2.x train
+- Python venv (~/rocm_llm, Python 3.12.3)
 
-## Critical pinned versions:
+### Critical pinned versions:
 
-torch==2.11.0+rocm7.2          # built against HIP 7.2.26015
-triton==3.5.1
-xformers==0.0.35
-flash_attn==2.8.4              # built natively from in-tree flash-attention/ via CK backend
-numpy==2.4.0rc1
-safetensors==0.7.0
-tokenizers==0.22.1
-setuptools==78.1.0
-ninja==1.13.0
-pybind11==3.0.3
+- torch==2.11.0+rocm7.2          # built against HIP 7.2.26015
+- triton==3.5.1
+- xformers==0.0.35
+- flash_attn==2.8.4              # built natively from in-tree flash-attention/ via CK backend
+- numpy==2.4.0rc1
+- safetensors==0.7.0
+- tokenizers==0.22.1
+- setuptools==78.1.0
+- ninja==1.13.0
+- pybind11==3.0.3
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs. Headline features:
 
