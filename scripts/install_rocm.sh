@@ -53,13 +53,62 @@ if ! lsmod | grep -q '^amdgpu'; then
     warn "amdgpu kernel module not loaded. GPU work will fail."
 fi
 
-# rocminfo + arch detection
-command -v /opt/rocm/bin/rocminfo >/dev/null || die "rocminfo missing. Install rocm-dev/rocminfo."
-DETECTED_ARCH="$(/opt/rocm/bin/rocminfo 2>/dev/null \
-    | awk '/Name:[[:space:]]+gfx/ {print $2; exit}')"
-[[ -n "$DETECTED_ARCH" ]] || die "No gfx-arch detected by rocminfo. GPU not visible?"
-GPU_ARCHS="${GPU_ARCHS:-$DETECTED_ARCH}"
-ok "gfx arch: $GPU_ARCHS"
+# ROCm dev-package check. Building FA + exllamav3 needs the dev-side headers
+# and libraries, not just the runtime meta-package. Without rocm-dev (or
+# equivalent), the build fails with "no such file" on hip/hip_runtime.h or
+# undefined reference at link time. Probe a representative subset.
+REQUIRED_DEV_PROBES=(
+    "/opt/rocm/bin/hipcc"                              # hipcc / hip-runtime-amd
+    "/opt/rocm/bin/rocminfo"                           # rocminfo
+    "/opt/rocm/include/hip/hip_runtime.h"              # hip-dev
+    "/opt/rocm/include/hipblas/hipblas.h"              # hipblas-dev
+    "/opt/rocm/include/hiprand/hiprand.hpp"            # hiprand-dev
+    "/opt/rocm/lib/libhipblas.so"                      # hipblas
+    "/opt/rocm/lib/libamdhip64.so"                     # hip-runtime-amd
+)
+MISSING_DEV=()
+for p in "${REQUIRED_DEV_PROBES[@]}"; do
+    [[ -e "$p" ]] || MISSING_DEV+=("$p")
+done
+if (( ${#MISSING_DEV[@]} > 0 )); then
+    printf '%s\n' "${MISSING_DEV[@]}" | sed 's/^/  missing: /' >&2
+    die "ROCm dev packages incomplete. Install with:
+       sudo apt install rocm-dev
+   or the equivalent for your distribution. The runtime-only ROCm meta-package
+   does not include the headers + libs needed to build flash-attn / exllamav3."
+fi
+ok "ROCm dev-tools present"
+
+# Detect ALL installed gfx archs (multi-GPU systems) and filter to the supported
+# set. RDNA3+ (gfx11+/gfx12+) and CDNA2+ (gfx90a/gfx94x/gfx95x) only — earlier
+# GPUs lack the matrix-core ISA the kernels need.
+SUPPORTED_ARCHS=(gfx90a gfx942 gfx950 gfx1100 gfx1101 gfx1102 gfx1150 gfx1151 gfx1200 gfx1201)
+mapfile -t DETECTED_ARCHS < <(
+    /opt/rocm/bin/rocminfo 2>/dev/null \
+        | awk '/Name:[[:space:]]+gfx/ {print $2}' \
+        | sort -u
+)
+[[ ${#DETECTED_ARCHS[@]} -gt 0 ]] || die "No gfx-arch detected by rocminfo. GPU not visible?"
+
+if [[ -z "${GPU_ARCHS:-}" ]]; then
+    SUPPORTED=()
+    UNSUPPORTED=()
+    for a in "${DETECTED_ARCHS[@]}"; do
+        if [[ " ${SUPPORTED_ARCHS[*]} " == *" $a "* ]]; then
+            SUPPORTED+=("$a")
+        else
+            UNSUPPORTED+=("$a")
+        fi
+    done
+    if (( ${#UNSUPPORTED[@]} > 0 )); then
+        warn "ignoring unsupported GPU arch(s): ${UNSUPPORTED[*]} (pre-RDNA3 / pre-CDNA2)"
+    fi
+    if (( ${#SUPPORTED[@]} == 0 )); then
+        die "No supported GPU detected. Found: ${DETECTED_ARCHS[*]}. Need one of: ${SUPPORTED_ARCHS[*]}"
+    fi
+    GPU_ARCHS="$(IFS=';'; echo "${SUPPORTED[*]}")"
+fi
+ok "gfx arch(s): $GPU_ARCHS"
 
 # flash-attention source — clone if missing. Pinned to a commit that's been
 # verified to build cleanly against ROCm 7.2.1 + torch 2.11+rocm7.2.
@@ -179,7 +228,7 @@ echo "  Plan for nothing-else-running about now. Grab coffee."
 if [[ "${EXLLAMAV3_VERBOSE_BUILD:-0}" == "1" ]]; then
     QUIET_FLAGS=""
 else
-    QUIET_FLAGS="-Wno-unused-command-line-argument -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-missing-field-initializers -Wno-#pragma-messages -Wno-pass-failed"
+    QUIET_FLAGS="-Wno-unused-command-line-argument -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-unused-value -Wno-missing-field-initializers -Wno-#pragma-messages -Wno-pass-failed"
 fi
 
 pushd "$REPO_ROOT/flash-attention" >/dev/null
@@ -202,7 +251,10 @@ ok "flash-attn native CK build complete"
 # 5. Build exllamav3 extension
 # -----------------------------------------------------------------------------
 say "Building exllamav3 C++/HIP extension"
-MAX_JOBS="$MAX_JOBS" python setup.py build_ext --inplace
+GPU_ARCHS="$GPU_ARCHS" \
+MAX_JOBS="$MAX_JOBS" \
+HIPCC_COMPILE_FLAGS_APPEND="-parallel-jobs=${HIPCC_PARALLEL_JOBS} ${QUIET_FLAGS}" \
+    python setup.py build_ext --inplace
 ok "exllamav3 extension built"
 
 # -----------------------------------------------------------------------------
