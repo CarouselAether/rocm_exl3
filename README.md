@@ -21,14 +21,6 @@ GMK-Tek Evo2 Ryzen 395+ AI Max (128GB)
 - AMD clang: 22.0.0git, roc-7.2.1 branch, commit f58b06dce1f9c15707c5f808fd002e18c2accf7e
 - HSA Runtime: 1.18.0
 
-### Key ROCm packages:
-- hip-runtime-amd 7.2.53211.70201-81~24.04
-- hipblas 3.2.0, hipblaslt 1.2.2, hipblas-common-dev 1.4.0
-- hiprand 3.1.0, hipsolver 3.2.0, hipsparse 4.2.0
-- miopen-hip 3.5.1, hsa-rocr 1.18.0, comgr 3.0.0
-- rocblas, rocfft, rocrand, rocsolver, rocsparse all 7.2.x train
-- Python venv (~/rocm_llm, Python 3.12.3)
-
 ### Critical pinned versions:
 
 - torch==2.11.0+rocm7.2          # built against HIP 7.2.26015
@@ -63,10 +55,7 @@ But to use it, you have to uninstall the EXL3 that it pulls, use the venv that t
 ### ⚠️ Important
 ROCm 7.2.1 is an absolute requirement.
 Building FlashAttention2 first on the newest version is also a requirement.
-Building FA2 requires rocm develeper tools
-- Ubuntu  ```sudo amdgpu-install --usecase=hiplibsdk,rocm```
-- Fedora  ```sudo dnf install rocm-developer-tools rocm-hip-devel rocm-ml-libraries```
-- SUSE  ```sudo zypper install rocm-devel rocm-hip-devel hipblas-devel rocblas-devel rocfft-devel rocrand-devel rocsolver-devel rocsparse-devel rocprim-devel rocthrust-devel hipcub-devel```
+Building FA2 requires rocm develeper tools. If it detects you missing any tools, it should recommend them to you.
 
 Triton fallback will likely fail. I haven't gotten it working on this hardware and I think it is due to PyTorch not being on ROCm 7.2.1.
 
