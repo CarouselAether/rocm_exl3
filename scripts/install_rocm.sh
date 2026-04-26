@@ -71,11 +71,37 @@ for p in "${REQUIRED_DEV_PROBES[@]}"; do
     [[ -e "$p" ]] || MISSING_DEV+=("$p")
 done
 if (( ${#MISSING_DEV[@]} > 0 )); then
+    # Distro-aware install hint. Reads /etc/os-release ID and ID_LIKE to pick
+    # the right package manager. AMD packages are named consistently across
+    # distros for the rocm-dev meta-package.
+    DISTRO_ID=""
+    DISTRO_LIKE=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        DISTRO_ID="$(. /etc/os-release && echo "${ID:-}")"
+        DISTRO_LIKE="$(. /etc/os-release && echo "${ID_LIKE:-}")"
+    fi
+
+    case "$DISTRO_ID $DISTRO_LIKE" in
+        *ubuntu*|*debian*)
+            INSTALL_HINT="sudo apt install rocm-dev" ;;
+        *fedora*|*rhel*|*centos*|*rocky*|*almalinux*)
+            INSTALL_HINT="sudo dnf install rocm-dev" ;;
+        *suse*|*sles*|*opensuse*)
+            INSTALL_HINT="sudo zypper install rocm-dev" ;;
+        *arch*)
+            INSTALL_HINT="sudo pacman -S rocm-hip-sdk rocm-device-libs" ;;
+        *)
+            INSTALL_HINT="(your distro: install the rocm-dev / ROCm SDK meta-package)" ;;
+    esac
+
     printf '%s\n' "${MISSING_DEV[@]}" | sed 's/^/  missing: /' >&2
     die "ROCm dev packages incomplete. Install with:
-       sudo apt install rocm-dev
-   or the equivalent for your distribution. The runtime-only ROCm meta-package
-   does not include the headers + libs needed to build flash-attn / exllamav3."
+       $INSTALL_HINT
+   AMD's universal installer also works on all supported distros:
+       sudo amdgpu-install --usecase=rocm,rocmdev
+   The runtime-only ROCm meta-package does not include the headers + libs
+   needed to build flash-attn / exllamav3."
 fi
 ok "ROCm dev-tools present"
 
