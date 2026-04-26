@@ -148,7 +148,28 @@ if precompile and torch:
                     f"-DTORCH_EXTENSION_NAME={ext.name}",
                 ]
 
-                cxx_flags = ["-O3", "-fPIC", "-std=c++17", "-Wno-register"]
+                # Quiet noise from upstream code paths we don't own. These are
+                # the warnings that fire by the thousand on a clean build:
+                #   - unused-command-line-argument: PyTorch/HIP shim flags that
+                #     clang doesn't understand for a given source.
+                #   - deprecated-declarations: CUDA APIs we shim via hip_compat.
+                #   - unused-variable / unused-function: heavy template code.
+                #   - missing-field-initializers: PyTorch ATen structs.
+                #   - pragma-messages: hipBLAS_V2 transition pragmas.
+                # Set EXLLAMAV3_VERBOSE_BUILD=1 to keep all warnings visible.
+                quiet_warnings = (
+                    [] if os.environ.get("EXLLAMAV3_VERBOSE_BUILD") == "1" else
+                    [
+                        "-Wno-unused-command-line-argument",
+                        "-Wno-deprecated-declarations",
+                        "-Wno-unused-variable",
+                        "-Wno-unused-function",
+                        "-Wno-missing-field-initializers",
+                        "-Wno-#pragma-messages",
+                        "-Wno-pass-failed",
+                    ]
+                )
+                cxx_flags = ["-O3", "-fPIC", "-std=c++17", "-Wno-register"] + quiet_warnings
                 hip_flags = [
                     "-O3", "-fPIC", "-std=c++17",
                     # Relocatable device code — needed for cooperative kernel
@@ -160,7 +181,7 @@ if precompile and torch:
                     # declarations; upstream treats the warning as harmless,
                     # hipcc treats it as an error by default.
                     "-Wno-register",
-                ]
+                ] + quiet_warnings
                 include_args = [f"-I{d}" for d in include_dirs]
 
                 obj_files = []
