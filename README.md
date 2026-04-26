@@ -63,11 +63,20 @@ But to use it, you have to uninstall the EXL3 that it pulls, use the venv that t
 ### ⚠️ Important
 ROCm 7.2.1 is an absolute requirement.
 Building FlashAttention2 first on the newest version is also a requirement.
+Building FA2 requires rocm develeper tools
+- Ubuntu  ```sudo amdgpu-install --usecase=hiplibsdk,rocm```
+- Fedora  ```sudo dnf install rocm-developer-tools rocm-hip-devel rocm-ml-libraries```
+- SUSE  ```sudo zypper install rocm-devel rocm-hip-devel hipblas-devel rocblas-devel rocfft-devel rocrand-devel rocsolver-devel rocsparse-devel rocprim-devel rocthrust-devel hipcub-devel```
+
 Triton fallback will likely fail. I haven't gotten it working on this hardware and I think it is due to PyTorch not being on ROCm 7.2.1.
+
 Some of the normally supported models will not work, I did not test them all.
+
 Gemma4 does not work.
+
 Tensor Parallel is disabled for ROCm.
-I have not tested vision capability, this is a beta and I have a GFX1151 Strix Halo, Ryzen 395+ AI Max for dev... so your performance may vary.
+
+I have not tested vision capability, this is a beta and I have a GFX1151 Strix Halo, Ryzen 395+ AI Max for dev... so your performance may vary
 
 ## Architecture support
 
