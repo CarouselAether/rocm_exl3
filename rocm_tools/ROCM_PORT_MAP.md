@@ -166,15 +166,26 @@ Blackwell tile config off `get_device_capability()[0] >= 10`. gfx1151 reports
 `>= 10` is true and prefill takes the Blackwell tile). Measured on gfx1151,
 head_dim 128, 32/8 heads — `rocm_tools/bench_prefill_tiles.py`:
 
-| q_len | ctx | block_n=32 ("Blackwell") | block_n=64 ("intended") |
-|---|---|---|---|
-| 512 | 0 | 11.18 TF/s | 9.64 TF/s |
-| 2048 | 0 | 13.06 TF/s | 11.67 TF/s |
-| 4096 | 0 | 12.39 TF/s | 10.93 TF/s |
-| 2048 | 2048 | **16.86 TF/s** | 13.62 TF/s |
+Advantage of `block_n=32` over `block_n=64`, three independent runs:
 
-The misdetected config is **1–19% faster**. Correcting the capability check
-without re-tuning would make prefill slower.
+| q_len | ctx | run 1 | run 2 | run 3 | verdict |
+|---|---|---|---|---|---|
+| 512 | 0 | −7.5% | **+3.0%** | −7.3% | noise |
+| 1024 | 0 | **+0.7%** | −5.2% | −4.7% | noise |
+| 2048 | 0 | −9.3% | −8.8% | −10.1% | real |
+| 4096 | 0 | −12.2% | −12.1% | −11.6% | **real** |
+| 2048 | 2048 | −12.4% | −11.9% | −12.0% | **real** |
+
+(negative = the narrow tile is faster)
+
+The misdetected config is **~12% faster at long prefill**, reproducing to under
+1% across runs. Correcting the capability check without re-tuning would make
+prefill slower. Short prefill (≤1024) is noise — too short to be compute-bound.
+
+Measured noise floor on this hardware: **4.7% spread, 1.6% stdev** over 8 repeats
+of one config, with the first run reading high (clock ramp). Any claimed gain
+below ~5% needs repeat measurement before it means anything — see the decode
+split-K note below for one that did not survive.
 
 Why: upstream sizes these tiles for "~100 KB of smem", a Hopper/Blackwell
 assumption. RDNA 3.5 has 64 KB LDS per workgroup, so the narrow kv tile fits
@@ -199,11 +210,29 @@ Best measured: `(128, 16, 8)` at 16.29 TF/s with context, `(64, 64, 4)` at
 13.27 TF/s without. Upstream's accidental default `(128, 32, 8)` lands at 15.94
 and 13.12 — within ~2% of optimal in both cases.
 
-**Conclusion:** leave it alone, but replace the accidental capability check with
-an explicit RDNA branch that selects narrow tiles for the stated reason (LDS
-budget), so a future upstream change to the Blackwell heuristic cannot silently
-regress it. The tuning upside is ~2%; the real compute-bound headroom is in the
-GEMM kernels, not attention tiles.
+**Applied:** `triton_paged.py` now selects the narrow tile explicitly via
+`_is_rocm`, rather than inheriting it from a misfiring capability test, so an
+upstream change to the Blackwell heuristic cannot silently regress RDNA. Behaviour
+is unchanged on gfx1151; the point is that it is now deliberate.
+
+Further tuning upside is ~2% — not worth chasing. The real compute-bound headroom
+is in the GEMM kernels, not attention tiles.
+
+### Decode split-K: investigated, NOT changed
+
+`multi_processor_count` reports **WGPs** on ROCm, not CUs — gfx1151 returns 20 for
+a 40-CU part — so the decode split target (`2 * count`) is half what the same code
+assumes on NVIDIA, and decode under-splits when `programs` is small (bsz=1).
+
+Doubling it looked like a 6–7% win at ctx 1024–4096. It did not survive:
+
+- repeat measurement put the decode step's run-to-run spread at 4.7%
+- a second full sweep showed the "fixed" version *slower* at ctx=1024
+- isolating split counts 4..16 showed everything in 5..12 landing within ~2%
+
+So the observation is real but the lever is not. Reverted, with a note in the
+source. `rocm_tools/bench_decode_splits.py` re-checks it on other parts, where the
+CU/WGP ratio or CU count may make it matter.
 
 ## The shim boundary: inline PTX
 

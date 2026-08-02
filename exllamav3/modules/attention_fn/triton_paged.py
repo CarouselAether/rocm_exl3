@@ -3,6 +3,10 @@ import os
 
 import torch
 
+# ROCm/HIP backend. Read once at import: it never changes within a process, and the
+# prefill tile selection consults it per call.
+_is_rocm = getattr(torch.version, "hip", None) is not None
+
 try:
     import triton
     import triton.language as tl
@@ -1159,6 +1163,13 @@ def paged_attn_triton_decode(
         dev = q.device.index
         if dev not in _decode_sm_count:
             _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
+        # NOTE for RDNA: multi_processor_count reports work-group processors here, not
+        # compute units -- gfx1151 returns 20 for a 40-CU part -- so this target is half
+        # what the same code assumes on NVIDIA. Doubling it was tried and REVERTED: the
+        # apparent 6-7% gain at bsz=1 did not survive repeat measurement. The decode step
+        # has a ~4.7% run-to-run spread on this hardware (1.6% stdev), and split counts
+        # anywhere in 5..12 land within ~2% of each other at ctx 1024-4096. See
+        # rocm_tools/bench_decode_splits.py to re-check on other parts.
         target = 2 * _decode_sm_count[dev]
         num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
     split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
@@ -1776,9 +1787,22 @@ def paged_attn_triton_prefill(
 
     # Tile configs by head_dim, sized for ~100 KB of smem with two pipeline stages. Blackwell
     # prefers narrower kv tiles (measured: 167 vs 153 TFLOPS on RTX 5090 at BN 32 vs 64)
-    blackwell = torch.cuda.get_device_capability(q.device)[0] >= 10
+    #
+    # RDNA also wants the narrow tile, for an unrelated reason: the ~100 KB smem budget above
+    # is a Hopper/Blackwell assumption, while RDNA 3.5 has 64 KB of LDS per workgroup, so the
+    # wide kv tile costs occupancy. gfx1151 measures 13.06 vs 11.67 TFLOP/s (q_len 2048) and
+    # 16.86 vs 13.62 (q_len 2048 + 2048 ctx) in favour of BN 32 -- see
+    # rocm_tools/bench_prefill_tiles.py.
+    #
+    # Selected explicitly rather than via get_device_capability(), which on ROCm returns the
+    # gfx major (gfx1151 -> (11, 5)) and so trips the >= 10 test by accident. Relying on that
+    # would let an upstream change to the Blackwell heuristic silently regress RDNA.
+    #
+    # If retuning these for RDNA, hold block_m / num_warps == 16 (one WMMA 16x16 fragment row
+    # per warp). Off-ratio configs measured up to 4x slower.
+    narrow_kv = _is_rocm or torch.cuda.get_device_capability(q.device)[0] >= 10
     if head_dim <= 128:
-        cfg = (128, 32, 8, 2) if blackwell else (128, 64, 8, 2)
+        cfg = (128, 32, 8, 2) if narrow_kv else (128, 64, 8, 2)
     elif head_dim <= 256:
         cfg = (64, 32, 8, 2)
     else:

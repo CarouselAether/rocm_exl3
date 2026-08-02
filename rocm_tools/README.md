@@ -20,9 +20,9 @@ rocm_tools/hipcc_probe.sh --all          # all ROCm-built sources
 GPU_ARCH=gfx1100 rocm_tools/hipcc_probe.sh --all   # another card
 ```
 
-Current baseline on gfx1151 / ROCm 7.2.4: **43 of 50 pass**. The 7 failures are
-the 6 inline-PTX files plus `rope.cu` — see ROCM_PORT_MAP.md. A number lower than
-43 after a toolchain change means the shim needs attention.
+Current baseline on gfx1151 / ROCm 7.2.4: **44 of 50 pass**. The 6 failures are
+exactly the inline-PTX files -- see ROCM_PORT_MAP.md. A number below 44 after a
+toolchain change means the shim needs attention.
 
 ## `phase2_attn_check.py`
 
@@ -81,3 +81,27 @@ python rocm_tools/bench_prefill_tiles.py # tile choice still right?
 Anything in `exllamav3_ext/rocm/hip_compat.hip.h` commented as "absent from HIP"
 should be re-grepped against `$ROCM_PATH/include` and deleted if HIP has since
 grown it.
+
+## `bench_decode_splits.py`
+
+Sweeps decode split-K against the shipped heuristic.
+
+```bash
+python rocm_tools/bench_decode_splits.py
+```
+
+Exists because `multi_processor_count` reports WGPs on ROCm rather than CUs
+(gfx1151: 20 for a 40-CU part), so the split target is half what the same code
+assumes on NVIDIA. Doubling it was tried and reverted — the apparent 6-7% gain
+did not survive repeat measurement. Kept so the question can be re-answered on
+parts with a different CU count or CU/WGP ratio.
+
+## On measurement noise
+
+The decode step has a **4.7% run-to-run spread** (1.6% stdev over 8 repeats) on
+gfx1151, with the first measurement reading high as clocks ramp. Anything under
+~5% needs repeating before it means anything — one apparent decode win in this
+port evaporated under that test, while the prefill tile result held at ~12%
+across three runs with under 1% spread.
+
+Both benchmarks are cheap. Run them several times before acting on a result.

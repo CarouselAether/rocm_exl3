@@ -60,9 +60,12 @@ compile_one() {
 if [[ "${1:-}" == "--all" ]]; then
   echo "arch: $GPU_ARCH   torch: $(dirname "$TORCH_INC")"
   # Mirrors setup.py ROCM_EXCLUDE: parallel/ is CUDA IPC + inline PTX,
-  # quant/comp_units/ is replaced by the RDNA instantiations.
-  mapfile -t SRCS < <(find "$E" -name '*.cu' -o -name '*.cpp' \
-      | grep -vE "/(parallel|comp_units|rocm)/" | sort)
+  # quant/comp_units/ is replaced by the RDNA instantiations, rope.cu by
+  # rocm/rope_rdna.hip. ROCm-only .hip sources under rocm/ are included; the
+  # headers there (cuda_shim/, hip_compat) are not compiled directly.
+  mapfile -t SRCS < <( { find "$E" -name '*.cu' -o -name '*.cpp' \
+        | grep -vE "/(parallel|comp_units)/|/rocm/|/rope\.cu$"
+      find "$E/rocm" -name '*.hip' 2>/dev/null; } | sort)
   pass=0; fail=0; declare -a FAILED=()
   for s in "${SRCS[@]}"; do
     if log=$(compile_one "$s"); then

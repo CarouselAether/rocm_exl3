@@ -75,6 +75,9 @@ ROCM_EXCLUDE = (
     # NOTE: until that port lands, a ROCm build links but has no EXL3 quant
     # kernels -- exllamav3 will import and run unquantized paths only.
     "quant/comp_units/",
+    # Replaced by rocm/rope_rdna.hip, which differs by one line: `half2 x = {}`
+    # is ambiguous against HIP's assignment overloads. Same exported symbols.
+    "rope.cu",
 )
 
 def _collect_sources():
