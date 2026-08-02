@@ -105,3 +105,10 @@ port evaporated under that test, while the prefill tile result held at ~12%
 across three runs with under 1% spread.
 
 Both benchmarks are cheap. Run them several times before acting on a result.
+
+## Phase 4
+
+See [PHASE4.md](PHASE4.md) for the kernel-port handoff: current state, the
+findings that must not be re-derived (WMMA operand order, `sudot4` vs `sdot4`,
+the `block_m/num_warps == 16` constraint, the measurement noise floor), and the
+recommended order of work.
