@@ -1,0 +1,259 @@
+// ROCm/HIP compatibility layer for exllamav3.
+//
+// Force-injected into every translation unit on the ROCm backend via
+// `hipcc -include rocm/hip_compat.hip.h`, so upstream .cu/.cuh sources compile
+// unmodified. Header redirection for `#include <cuda_*.h>` and the ATen/c10 CUDA
+// headers is handled separately by rocm/cuda_shim/ on the include path.
+//
+// Design rule: upstream sources are never edited. Anything CUDA-shaped that does
+// not exist on HIP is bridged here or in cuda_shim/, never at the call site.
+//
+// Written against ROCm 7.2.4 / HIP 7.2.53211 on gfx1151 (RDNA 3.5, wave32).
+// Every claim below was probed against the installed headers rather than carried
+// over from an older port -- ROCm changed substantially across 7.1 -> 7.2.
+
+#pragma once
+
+#ifndef USE_ROCM
+#error "hip_compat.hip.h is ROCm-only; it must not be force-included on the CUDA backend"
+#endif
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+
+// ---------------------------------------------------------------------------
+// Runtime API: CUDA spellings -> HIP
+// ---------------------------------------------------------------------------
+// HIP is API-compatible here, so plain aliases suffice. Types are `using` rather
+// than #define so they interact correctly with templates and overload resolution.
+
+using cudaStream_t       = hipStream_t;
+using cudaEvent_t        = hipEvent_t;
+using cudaError_t        = hipError_t;
+using cudaDeviceProp     = hipDeviceProp_t;
+using cudaMemcpyKind     = hipMemcpyKind;
+using cudaFuncAttributes = hipFuncAttributes;
+
+#define cudaSuccess                         hipSuccess
+#define cudaErrorInvalidValue               hipErrorInvalidValue
+
+#define cudaGetLastError                    hipGetLastError
+#define cudaPeekAtLastError                 hipPeekAtLastError
+#define cudaGetErrorString                  hipGetErrorString
+#define cudaDeviceSynchronize               hipDeviceSynchronize
+#define cudaStreamSynchronize               hipStreamSynchronize
+#define cudaGetDevice                       hipGetDevice
+#define cudaSetDevice                       hipSetDevice
+#define cudaGetDeviceCount                  hipGetDeviceCount
+#define cudaGetDeviceProperties             hipGetDeviceProperties
+#define cudaDeviceGetAttribute              hipDeviceGetAttribute
+
+#define cudaMalloc                          hipMalloc
+#define cudaFree                            hipFree
+#define cudaMemcpy                          hipMemcpy
+#define cudaMemcpyAsync                     hipMemcpyAsync
+#define cudaMemset                          hipMemset
+#define cudaMemsetAsync                     hipMemsetAsync
+#define cudaMemcpyHostToDevice              hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost              hipMemcpyDeviceToHost
+#define cudaMemcpyDeviceToDevice            hipMemcpyDeviceToDevice
+
+#define cudaFuncSetAttribute                hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize \
+        hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncAttributePreferredSharedMemoryCarveout \
+        hipFuncAttributePreferredSharedMemoryCarveout
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor \
+        hipOccupancyMaxActiveBlocksPerMultiprocessor
+
+// Events
+using cudaEvent = hipEvent_t;
+#define cudaEventCreate                     hipEventCreate
+#define cudaEventCreateWithFlags            hipEventCreateWithFlags
+#define cudaEventDestroy                    hipEventDestroy
+#define cudaEventRecord                     hipEventRecord
+#define cudaEventSynchronize                hipEventSynchronize
+#define cudaEventElapsedTime                hipEventElapsedTime
+#define cudaEventDisableTiming              hipEventDisableTiming
+
+// Pinned / mapped host memory
+#define cudaHostRegister                    hipHostRegister
+#define cudaHostUnregister                  hipHostUnregister
+#define cudaHostGetDevicePointer            hipHostGetDevicePointer
+#define cudaHostRegisterMapped              hipHostRegisterMapped
+#define cudaHostRegisterPortable            hipHostRegisterPortable
+#define cudaHostAlloc                       hipHostMalloc
+#define cudaFreeHost                        hipHostFree
+
+// Device attributes
+using cudaDeviceAttr = hipDeviceAttribute_t;
+#define cudaDevAttrL2CacheSize              hipDeviceAttributeL2CacheSize
+#define cudaDevAttrMultiProcessorCount      hipDeviceAttributeMultiprocessorCount
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin \
+        hipDeviceAttributeSharedMemPerBlockOptin
+#define cudaDevAttrMaxThreadsPerBlock       hipDeviceAttributeMaxThreadsPerBlock
+#define cudaDevAttrWarpSize                 hipDeviceAttributeWarpSize
+
+// ---------------------------------------------------------------------------
+// Driver API
+// ---------------------------------------------------------------------------
+// exllamav3 reaches the driver API to load and launch Triton-generated modules
+// (graph.cu, cuda_drv.cpp, triton_kernel.cpp). HIP mirrors it under hipModule*.
+//
+// NOTE: hipStreamWaitValue32 / hipStreamWriteValue32 are the closest analogues of
+// cuStreamWaitValue32 / cuStreamWriteValue32, but their availability is
+// device/driver dependent on ROCm. The call sites belong to the multi-GPU
+// synchronisation path, which is excluded from the ROCm build (setup.py
+// ROCM_EXCLUDE "parallel/"), so these mappings are for completeness only and are
+// not exercised. Verify before enabling tensor-parallel on ROCm.
+
+using CUmodule    = hipModule_t;
+using CUfunction  = hipFunction_t;
+using CUstream    = hipStream_t;
+using CUresult    = hipError_t;
+using CUdeviceptr = hipDeviceptr_t;
+using CUgraphExec = hipGraphExec_t;
+using CUgraphNode = hipGraphNode_t;
+
+#define CUDA_SUCCESS                        hipSuccess
+#define cuModuleLoadData                    hipModuleLoadData
+#define cuModuleGetFunction                 hipModuleGetFunction
+#define cuModuleUnload                      hipModuleUnload
+#define cuLaunchKernel                      hipModuleLaunchKernel
+#define cuFuncSetAttribute                  hipFuncSetAttribute
+#define CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES \
+        hipFuncAttributeMaxDynamicSharedMemorySize
+#define cuStreamWaitValue32                 hipStreamWaitValue32
+#define cuStreamWriteValue32                hipStreamWriteValue32
+#define CU_STREAM_WAIT_VALUE_GEQ            hipStreamWaitValueGte
+
+// ---------------------------------------------------------------------------
+// CUDA graph API
+// ---------------------------------------------------------------------------
+// graph.cuh captures kernel launches into a replayable graph. HIP mirrors the
+// runtime graph API one-to-one.
+//
+// CUDA_KERNEL_NODE_PARAMS is the *driver*-API struct; upstream uses it for nodes
+// captured from Triton cubins, which the runtime API cannot read back. HIP has no
+// separate driver-side struct -- hipKernelNodeParams serves both -- so both CUDA
+// spellings map onto it. The driver-API accessors likewise fold onto the runtime
+// ones. Triton-on-ROCm emits code objects rather than cubins, so this path is not
+// expected to be exercised; if graph capture is enabled on ROCm it needs testing.
+
+using cudaGraph_t             = hipGraph_t;
+using cudaGraphExec_t         = hipGraphExec_t;
+using cudaGraphNode_t         = hipGraphNode_t;
+using cudaKernelNodeParams    = hipKernelNodeParams;
+using CUDA_KERNEL_NODE_PARAMS = hipKernelNodeParams;
+using cudaGraphNodeType       = hipGraphNodeType;
+
+#define cudaGraphNodeTypeKernel             hipGraphNodeTypeKernel
+#define cudaStreamBeginCapture              hipStreamBeginCapture
+#define cudaStreamEndCapture                hipStreamEndCapture
+#define cudaStreamCaptureModeGlobal         hipStreamCaptureModeGlobal
+#define cudaStreamCaptureModeThreadLocal    hipStreamCaptureModeThreadLocal
+#define cudaStreamCaptureModeRelaxed        hipStreamCaptureModeRelaxed
+#define cudaGraphInstantiate                hipGraphInstantiate
+#define cudaGraphLaunch                     hipGraphLaunch
+#define cudaGraphDestroy                    hipGraphDestroy
+#define cudaGraphExecDestroy                hipGraphExecDestroy
+#define cudaGraphGetNodes                   hipGraphGetNodes
+#define cudaGraphNodeGetType                hipGraphNodeGetType
+#define cudaGraphKernelNodeGetParams        hipGraphKernelNodeGetParams
+#define cudaGraphExecKernelNodeSetParams    hipGraphExecKernelNodeSetParams
+#define cuGraphKernelNodeGetParams          hipGraphKernelNodeGetParams
+#define cuGraphExecKernelNodeSetParams      hipGraphExecKernelNodeSetParams
+
+// ---------------------------------------------------------------------------
+// half2 min/max
+// ---------------------------------------------------------------------------
+// ROCm 7.2.4 ships __hmin2 / __hmax2 for __hip_bfloat162 only (amd_hip_bf16.h),
+// with no __half2 overloads -- verified by grep over /opt/rocm/include/hip.
+// Upstream uses the __half2 forms, so provide them. Still required as of 7.2.4;
+// re-check on future ROCm bumps and delete if HIP grows native versions.
+
+__device__ __forceinline__ __half2 __hmin2(const __half2 a, const __half2 b)
+{
+    return __half2{__hlt(a.x, b.x) ? a.x : b.x,
+                   __hlt(a.y, b.y) ? a.y : b.y};
+}
+
+__device__ __forceinline__ __half2 __hmax2(const __half2 a, const __half2 b)
+{
+    return __half2{__hgt(a.x, b.x) ? a.x : b.x,
+                   __hgt(a.y, b.y) ? a.y : b.y};
+}
+
+// ---------------------------------------------------------------------------
+// bfloat16 conversions with explicit rounding mode
+// ---------------------------------------------------------------------------
+// ROCm 7.2.4 ships only __float2bfloat16 (round-to-nearest-even, via the
+// __hip_bfloat16 float ctor). CUDA's _rn / _rz spellings are absent -- verified
+// by grep over amd_hip_bf16.h. Every other conversion intrinsic exllamav3 uses
+// (__float2half_rn, __float2half2_rn, __int2half_rn, __halves2bfloat162,
+// __bfloat1622float2, __float22bfloat162_rn, __half2half2) is already present.
+
+__BF16_HOST_DEVICE_STATIC__ __hip_bfloat16 __float2bfloat16_rn(const float f)
+{
+    return __float2bfloat16(f);   // HIP's default rounding is round-to-nearest-even
+}
+
+__BF16_HOST_DEVICE_STATIC__ __hip_bfloat16 __float2bfloat16_rz(const float f)
+{
+    // Round toward zero. For bfloat16 that is exactly truncation of the fp32
+    // significand, i.e. keep the high 16 bits and drop the rest. Implemented
+    // directly rather than aliased to __float2bfloat16, which rounds to nearest
+    // and would change results in the last bit.
+    unsigned int u;
+    __builtin_memcpy(&u, &f, sizeof(u));
+    return __hip_bfloat16(__hip_bfloat16_raw{static_cast<unsigned short>(u >> 16)});
+}
+
+// ---------------------------------------------------------------------------
+// Warp-sync primitives (wave32)
+// ---------------------------------------------------------------------------
+// HIP 7.2.4 *does* declare __shfl_*_sync / __ballot_sync / __syncwarp in
+// amd_detail/amd_warp_sync_functions.h, templated on the mask type -- so the
+// "they don't exist" rationale from the 7.1-era port no longer holds.
+//
+// They are still bridged here for a different reason: upstream passes 32-bit
+// literal masks (0xffffffff) while HIP's declarations take a 64-bit mask, and
+// RDNA is wave32 with all lanes active in every kernel we build. Dropping the
+// mask entirely is both correct for these kernels and avoids the literal-width
+// mismatch. The build defines HIP_DISABLE_WARP_SYNC_BUILTINS=1 so these macros
+// are the single source of truth rather than racing HIP's own declarations.
+//
+// NOTE: correct *because* every exllamav3 kernel has all lanes converged at
+// these call sites. A future kernel with divergent lanes would need the real
+// masked forms.
+
+#define __shfl_sync(mask, var, srcLane, ...)      __shfl(var, srcLane, ##__VA_ARGS__)
+#define __shfl_up_sync(mask, var, delta, ...)     __shfl_up(var, delta, ##__VA_ARGS__)
+#define __shfl_down_sync(mask, var, delta, ...)   __shfl_down(var, delta, ##__VA_ARGS__)
+#define __shfl_xor_sync(mask, var, laneMask, ...) __shfl_xor(var, laneMask, ##__VA_ARGS__)
+#define __ballot_sync(mask, pred)                 __ballot(pred)
+#define __activemask()                            __ballot(1)
+#define __syncwarp(...)                           __builtin_amdgcn_wave_barrier()
+
+// ---------------------------------------------------------------------------
+// Integer dot-product intrinsic
+// ---------------------------------------------------------------------------
+// HIP has no __dp4a (verified: no hits under /opt/rocm/include). exllamav3 uses
+// it only in the unsigned form -- codebook.cuh and exl3_gemv_kernel.cuh pass
+// uint32_t lanes against 0x01010101u to byte-sum -- so it maps onto
+// __builtin_amdgcn_udot4.
+//
+// Deliberately NOT __builtin_amdgcn_sdot4: that requires target feature
+// dot1-insts, which gfx1151 does not have (probed -- it is a hard compile
+// error). The unsigned builtin is available. If a signed __dp4a call ever
+// appears upstream it will need a manual expansion rather than this builtin.
+
+__device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c)
+{
+    return __builtin_amdgcn_udot4(a, b, c, false);
+}
+
+// NOTE: rsqrtf needs no shim. HIP declares a host+device form that resolves
+// correctly for `rsqrtf((float) dim)` in attention.cu -- an earlier host-only
+// fallback here was itself the cause of the "no matching function" error.
