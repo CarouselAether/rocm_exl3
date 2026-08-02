@@ -1,0 +1,83 @@
+# rocm_tools
+
+Verification and measurement tools for the ROCm backend. Every claim in
+[ROCM_PORT_MAP.md](ROCM_PORT_MAP.md) is reproducible with one of these — they
+exist so the port's conclusions can be re-checked after a ROCm bump or on a
+different RDNA card, rather than trusted.
+
+All scripts resolve paths relative to the repo, use the active virtualenv's
+torch, and detect the GPU via `rocminfo`. Nothing is hardcoded to one machine.
+
+## `hipcc_probe.sh`
+
+Compiles `exllamav3_ext` sources with the ROCm shim, using the same flags
+`setup.py`'s `HIPBuildExtension` will. Much faster than a full build for
+iterating on shim gaps.
+
+```bash
+rocm_tools/hipcc_probe.sh norm.cu        # one file
+rocm_tools/hipcc_probe.sh --all          # all ROCm-built sources
+GPU_ARCH=gfx1100 rocm_tools/hipcc_probe.sh --all   # another card
+```
+
+Current baseline on gfx1151 / ROCm 7.2.4: **43 of 50 pass**. The 7 failures are
+the 6 inline-PTX files plus `rope.cu` — see ROCM_PORT_MAP.md. A number lower than
+43 after a toolchain change means the shim needs attention.
+
+## `phase2_attn_check.py`
+
+Checks upstream's in-tree Triton paged attention against an independent fp32
+reference across decode/prefill/longq/paged, MHA and GQA, batched, head_dim
+64/128/256.
+
+```bash
+python rocm_tools/phase2_attn_check.py
+```
+
+This is the gate that made the port viable: it establishes that FlashAttention
+is not required, because upstream's own Triton kernels are numerically correct on
+RDNA. Expected: **18/18**, max abs error ~1e-5 (fp16 rounding). Deliberately does
+not import the compiled extension, so it runs before any kernel work.
+
+## `bench_prefill_tiles.py`
+
+Measures prefill throughput for the "Blackwell" tile config against the intended
+non-Blackwell one.
+
+```bash
+python rocm_tools/bench_prefill_tiles.py
+```
+
+Exists because `triton_paged.py` selects tiles from
+`get_device_capability()[0] >= 10`, which gfx1151 trips (it reports `(11, 5)`).
+The measured result is counter-intuitive and worth re-checking on new hardware:
+the misdetected narrow-kv config is *faster* on RDNA, because upstream sizes
+tiles for ~100 KB of smem and RDNA 3.5 has 64 KB of LDS.
+
+## `scrape_rocm_docs.py`
+
+Pulls HIP and ROCm programming-guide docs into `rocm_docs/` as markdown, so the
+whole corpus greps in one pass.
+
+```bash
+python rocm_tools/scrape_rocm_docs.py all
+```
+
+URLs are pinned to `docs-7.2.4`; edit `SITES` when moving to a new ROCm. Requires
+`html2text`.
+
+## Re-verifying after a ROCm upgrade
+
+ROCm changed substantially between 7.1 and 7.2 — several workarounds in the
+original fork became unnecessary, and at least one intrinsic changed
+availability. Assume nothing carries over:
+
+```bash
+rocm_tools/hipcc_probe.sh --all          # shim still complete?
+python rocm_tools/phase2_attn_check.py   # attention still correct?
+python rocm_tools/bench_prefill_tiles.py # tile choice still right?
+```
+
+Anything in `exllamav3_ext/rocm/hip_compat.hip.h` commented as "absent from HIP"
+should be re-grepped against `$ROCM_PATH/include` and deleted if HIP has since
+grown it.
