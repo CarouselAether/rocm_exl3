@@ -23,6 +23,24 @@
 #include <hip/hip_bf16.h>
 
 // ---------------------------------------------------------------------------
+// __CUDA_ARCH__ during the device pass
+// ---------------------------------------------------------------------------
+// Upstream uses __CUDA_ARCH__ two ways: as a plain "am I compiling device code?"
+// test (cache/lmq.cuh:6 picks device min/max vs a host helper), and as an SM
+// version comparison (== 860, > 890, >= 800, < 750). HIP never defines it, so
+// the device pass takes the *host* branch and then calls a __host__ function
+// from device code.
+//
+// Defining it to 1 fixes the presence tests while leaving every SM-gated fast
+// path disabled -- 1 fails ==860, >890 and >=800, which is exactly right for
+// RDNA. compat.cuh's `< 750` branch is already selected by USE_ROCM.
+//
+// Scoped to the device pass so host code is unaffected.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__CUDA_ARCH__)
+#define __CUDA_ARCH__ 1
+#endif
+
+// ---------------------------------------------------------------------------
 // Runtime API: CUDA spellings -> HIP
 // ---------------------------------------------------------------------------
 // HIP is API-compatible here, so plain aliases suffice. Types are `using` rather
@@ -37,6 +55,18 @@ using cudaFuncAttributes = hipFuncAttributes;
 
 #define cudaSuccess                         hipSuccess
 #define cudaErrorInvalidValue               hipErrorInvalidValue
+#define cudaErrorHostMemoryAlreadyRegistered \
+        hipErrorHostMemoryAlreadyRegistered
+#define cudaErrorNotSupported               hipErrorNotSupported
+#define cudaErrorPeerAccessAlreadyEnabled   hipErrorPeerAccessAlreadyEnabled
+
+#define cudaStreamNonBlocking               hipStreamNonBlocking
+#define cudaStreamDefault                   hipStreamDefault
+#define cudaStreamCreate                    hipStreamCreate
+#define cudaStreamCreateWithFlags           hipStreamCreateWithFlags
+#define cudaStreamDestroy                   hipStreamDestroy
+#define cudaStreamWaitEvent                 hipStreamWaitEvent
+#define cudaStreamQuery                     hipStreamQuery
 
 #define cudaGetLastError                    hipGetLastError
 #define cudaPeekAtLastError                 hipPeekAtLastError
@@ -59,11 +89,30 @@ using cudaFuncAttributes = hipFuncAttributes;
 #define cudaMemcpyDeviceToHost              hipMemcpyDeviceToHost
 #define cudaMemcpyDeviceToDevice            hipMemcpyDeviceToDevice
 
-#define cudaFuncSetAttribute                hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize \
         hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncAttributePreferredSharedMemoryCarveout \
         hipFuncAttributePreferredSharedMemoryCarveout
+
+// cudaFuncSetAttribute is templated in CUDA and accepts a typed kernel pointer.
+// hipFuncSetAttribute takes a strict `const void*`, so call sites passing a
+// kernel symbol fail overload resolution. Wrap rather than alias.
+template <typename FuncT>
+static inline hipError_t exl3_hip_func_set_attribute(FuncT* func, hipFuncAttribute attr, int value)
+{
+    return hipFuncSetAttribute(reinterpret_cast<const void*>(func), attr, value);
+}
+#define cudaFuncSetAttribute                exl3_hip_func_set_attribute
+
+// Cooperative launch. Same const void* issue as above.
+template <typename FuncT>
+static inline hipError_t exl3_hip_launch_coop(FuncT* func, dim3 grid, dim3 block,
+                                              void** args, size_t shmem, hipStream_t stream)
+{
+    return hipLaunchCooperativeKernel(reinterpret_cast<const void*>(func),
+                                      grid, block, args, shmem, stream);
+}
+#define cudaLaunchCooperativeKernel         exl3_hip_launch_coop
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor \
         hipOccupancyMaxActiveBlocksPerMultiprocessor
 
@@ -85,6 +134,9 @@ using cudaEvent = hipEvent_t;
 #define cudaHostRegisterPortable            hipHostRegisterPortable
 #define cudaHostAlloc                       hipHostMalloc
 #define cudaFreeHost                        hipHostFree
+#define cudaMallocHost                      hipHostMalloc
+#define cudaErrorHostMemoryNotRegistered    hipErrorHostMemoryNotRegistered
+#define cudaErrorCudartUnloading            hipErrorDeinitialized
 
 // Device attributes
 using cudaDeviceAttr = hipDeviceAttribute_t;
@@ -127,6 +179,20 @@ using CUgraphNode = hipGraphNode_t;
 #define cuStreamWaitValue32                 hipStreamWaitValue32
 #define cuStreamWriteValue32                hipStreamWriteValue32
 #define CU_STREAM_WAIT_VALUE_GEQ            hipStreamWaitValueGte
+
+#define cudaLaunchKernel                    hipLaunchKernel
+
+// __nanosleep is a CUDA (sm_70+) intrinsic used in the ptx.cuh spin barrier.
+// The AMD analogue is s_sleep, whose operand counts in units of 64 clocks and
+// saturates well below CUDA's nanosecond argument -- so this backs off by a
+// comparable order of magnitude rather than an equal duration. Only used for
+// spin-wait pacing, where exact timing does not affect correctness.
+#ifdef __HIP_DEVICE_COMPILE__
+__device__ __forceinline__ void __nanosleep(unsigned int)
+{
+    __builtin_amdgcn_s_sleep(1);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // CUDA graph API
@@ -254,6 +320,35 @@ __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, u
     return __builtin_amdgcn_udot4(a, b, c, false);
 }
 
-// NOTE: rsqrtf needs no shim. HIP declares a host+device form that resolves
-// correctly for `rsqrtf((float) dim)` in attention.cu -- an earlier host-only
-// fallback here was itself the cause of the "no matching function" error.
+// ---------------------------------------------------------------------------
+// Host-side rsqrtf
+// ---------------------------------------------------------------------------
+// HIP declares rsqrtf as __device__ only (__clang_hip_math.h:671). attention.cu
+// calls it from host code to compute the softmax scale, which fails overload
+// resolution with "call to __device__ function from __host__ function".
+//
+// Declared __host__ and NOT guarded on __HIP_DEVICE_COMPILE__: clang parses host
+// function bodies during the device pass too, so a host-pass-only definition
+// still leaves the device pass unable to resolve the call. HIP allows __host__
+// and __device__ overloads of one name, so this coexists with HIP's device form
+// and each pass picks the right one.
+#include <cmath>
+__host__ inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }
+
+// ---------------------------------------------------------------------------
+// LM_CLAMP_IDX
+// ---------------------------------------------------------------------------
+// cache/lmq.cuh defines this macro behind `#ifndef LM_CLAMP_IDX`, choosing
+// device min/max when __CUDA_ARCH__ is set and a `static inline` host helper
+// otherwise. Even with __CUDA_ARCH__ defined above, the *host* pass still takes
+// the host branch and then expands it inside __device__ functions -- nvcc
+// tolerates that, clang does not.
+//
+// Pre-defining the macro here (force-include runs first) makes lmq.cuh's own
+// guard skip the whole block. A __host__ __device__ helper keeps single
+// evaluation of the arguments.
+__host__ __device__ __forceinline__ int exl3_lm_clamp(int x, int lo, int hi)
+{
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+#define LM_CLAMP_IDX(idx, lo, hi) exl3_lm_clamp((idx), (lo), (hi))
