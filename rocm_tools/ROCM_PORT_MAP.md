@@ -8,16 +8,24 @@ Measured against:
 - upstream: `exllamav3` @ `0b9745c`, **v1.3.0**
 - target: ROCm **7.2.4** / HIP 7.2.53211 / torch 2.13.0+rocm7.2, gfx1151
 
-## Working tree layout
+## Layout
 
-| Directory | Role |
+| Path | Role |
 |---|---|
+| `exllamav3/exllamav3_ext/rocm/` | RDNA siblings, the compat shim and `cuda_shim/`. All C++/HIP divergence lives here |
+| `exllamav3/rocm_py/` | Python divergence, applied as monkeypatches at import |
+| `rocm_tools/` | Verification harnesses and benchmarks |
+
+The Python package stays named `exllamav3` so the build is a drop-in replacement
+for TabbyAPI and anything else importing it. Only the repo is `rocm_exl3`.
+
+---|---|
 | `rocm_exl3/` | **The deliverable.** Upstream v1.3.0 + `exllamav3_ext/rocm/`, branch `main`. `origin` → CarouselAether/rocm_exl3, `upstream` → turboderp-org/exllamav3 |
 | `rocm_exl3_legacy/` | The original v0.0.29 fork. Kernel reference for Phase 4; not built |
 | `exllamav3/` | Pristine upstream, `master`. Diff reference only |
 | `tabbyAPI/` | Editable install for end-to-end testing |
 | `rocm_docs/` | ISA + programming guide PDFs, plus 53 scraped markdown pages |
-| `rocm_tools/` | `hipcc_probe.sh`, `phase2_attn_check.py`, `scrape_rocm_docs.py` |
+| `rocm_tools/` | `hipcc_probe.sh`, `attn_check.py` |
 
 The Python package stays named `exllamav3` so the build is a drop-in replacement
 for TabbyAPI and anything else importing it. Only the repo is `rocm_exl3`.
@@ -134,25 +142,40 @@ is on the quantization path, which the fork never validated.
 
 ## Part D — Python-level guards
 
-| Fork guard | Recommendation |
+The v0.0.29 fork patched five upstream Python modules in place. This port keeps
+none of those edits: the divergences live in `exllamav3/rocm_py/` and are applied
+as monkeypatches at import.
+
+| Fork guard | Outcome |
 |---|---|
-| `attn.py` — skip `MultiLinear` K/V fusion on ROCm | Retest. Upstream attention was rewritten (`attention_fn/`), so the original justification may not apply |
-| `mlp.py` — skip gate/up fusion, `BC_GatedMLP` | Retest on 7.2.4 |
-| `block_sparse_mlp.py` — force `is_quantized = False` | Keep until `exl3_moe_kernel_rdna` is validated |
-| `exl3.py` — `EXLLAMAV3_FORCE_TORCH_MODE` | Keep; useful diagnostic |
-| `arch_list.py` — early-return on ROCm | Keep; still correct |
+| `attn.py` — skip `MultiLinear` K/V fusion | Retired. `exl3_mgemm` works; the NaNs blamed on it were two split-K defects, since fixed |
+| `mlp.py` — skip gate/up fusion, `BC_GatedMLP` | Retired, same cause |
+| `block_sparse_mlp.py` — force `is_quantized = False` | Retired, and it was actively harmful: at v1.3.0 it reroutes to a path that cannot handle quantized weights and emits all-NaN |
+| `exl3.py` — `EXLLAMAV3_FORCE_TORCH_MODE` | Superseded by `EXL3_ROCM_FORCE_TORCH`. Upstream restructured that forward around `AUTO_RECONSTRUCT_THRESHOLD`, so the fork's variable name has no effect here |
+| `arch_list.py` — early-return on ROCm | Carried into `rocm_py`; hipcc takes `PYTORCH_ROCM_ARCH`, not `TORCH_CUDA_ARCH_LIST` |
+
+`rocm_py` also carries default-off bisect switches (`EXL3_ROCM_MGEMM`,
+`EXL3_ROCM_MOE_TORCH`, `EXL3_ROCM_ROUTING_TORCH`, `EXL3_ROCM_FORCE_TORCH`), each
+documented at its own patch.
 
 Also new in upstream and **not** in the fork: `triton_paged.py:1779` keys a
 Blackwell tile config off `get_device_capability()[0] >= 10`. gfx1151 reports
 `(11, 5)` — measured — so it misfires. Attention is still numerically correct
-(18/18 in `rocm_tools/phase2_attn_check.py`), so this costs no accuracy. Measured impact on prefill throughput: see the tile-config section above -- the misdetection is in fact beneficial on gfx1151.
+(18/18 in `rocm_tools/attn_check.py`), so this costs no accuracy. Measured impact on prefill throughput: see the tile-config section above -- the misdetection is in fact beneficial on gfx1151.
 
 ---
 
-## Part E — Reversible / questionable fork decisions
+## Part E — Decisions carried from the v0.0.29 fork, and their status
 
-| Item | Finding |
+| Item | Status |
 |---|---|
+| `hgemm.cu` → `at::mm` swap | **Not carried.** The fork's own probes showed `hipblasHgemm` works, and this port modifies no upstream `.cu` at all |
+| `rope.cu` warp-store guard | The fork's version made output strictly worse and it reverted. This port's `rope_rdna.hip` guards the store to lane 0, which is the correct form — see `rocm/RDNA_NOTES.md` |
+| `__shfl_*_sync` mask stripping | Carried, but the reason changed. HIP 7.x provides the `_sync` variants default-on, so the override is a deliberate wave32 simplification rather than a missing-function workaround |
+| Tensor parallel disabled | Still the case — `parallel/` is CUDA IPC plus inline PTX with no HIP port |
+| Python guards (`MultiLinear`, fused MoE) | **Retired.** Both were disabling working kernels; the failures they blamed were two defects in the split-K path, since fixed |
+
+---|---|
 | `hgemm.cu` → `at::mm` swap | Fork's own probes showed `hipblasHgemm` works on 7.2.1. Likely cosmetic; revert once the port is stable |
 | `rope.cu` warp-store guard | Already reverted by the fork — made output strictly worse. Do not reintroduce |
 | `__shfl_*_sync` mask stripping | Still wanted, but the *reason* changed. HIP 7.x provides `_sync` variants (default-on since ROCm 7.0); the override is now a deliberate wave32 simplification, not a missing-function workaround |
@@ -289,36 +312,3 @@ Note the trap: the obvious choice `sdot4` is *absent* on gfx1151; the mixed-sign
 
 This matters because int8 GEMV is the single-token decode path — the one that
 most affects interactive throughput on a bandwidth-limited APU.
-
-## Open shim gaps (Phase 3, in progress)
-
-19 of 50 sources still failing, in clusters:
-
-| Gap | Files | Fix |
-|---|---|---|
-| `cuda/atomic` (libcu++) | 6 | Needs a minimal `cuda::atomic_ref` shim over HIP atomics |
-| `curandStatePhilox4_32_10_t` etc. | 4 | Name aliases onto hipRAND |
-| `cudaStreamNonBlocking`, `cudaErrorHostMemoryAlreadyRegistered` | 3 | Enum aliases |
-| `hipFuncSetAttribute` signature | 2 | HIP takes a typed function pointer where CUDA takes `const void*` |
-| `cudaLaunchCooperativeKernel` | 1 | Alias |
-| `rsqrtf` in `attention.cu` | 1 | Under investigation |
-| `lm_clamp_` in `q_cache.cu` | 1 | Likely half2 operator resolution |
-| `half2 x = {}` in `rope.cu:141` | 1 | **Not shimmable** — ambiguous on HIP either way. Needs a one-token upstream edit or a build-time patch |
-
----
-
-## Suggested order for Phase 4
-
-1. `exl3_dq_rdna` — free, 0 drift
-2. `rdna_wmma` — free, re-verified
-3. `codebook_rdna`, `exl3_gemm_kernel_rdna`, `reconstruct_rdna` — low drift
-4. `exl3_gemv_rdna` + `exl3_gemv_kernel_rdna` — moderate; this is the path with
-   actual evidence behind it (single-token inference worked)
-5. `exl3_kernel_map_rdna` — restructured upstream
-6. `exl3_gemm_inner_rdna` — **the big one**, re-derive against v1.3.0
-7. `comp_units_rdna` — decide per family; codebook axis is new
-8. MoE + quantize_tiles — unproven territory, lowest confidence
-
-Validate in the same order the fork's evidence supports: model load → coherent
-tokens → perplexity → quantization. The last of those has never worked and
-should not be assumed.

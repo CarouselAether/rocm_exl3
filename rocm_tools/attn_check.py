@@ -12,7 +12,7 @@ Deliberately does NOT import the compiled exllamav3_ext: this tests attention on
 it runs before any kernel porting work.
 
 Usage:
-    rocm_tools/phase2_attn_check.py [--repo PATH]
+    rocm_tools/attn_check.py [--repo PATH]
 """
 
 import argparse

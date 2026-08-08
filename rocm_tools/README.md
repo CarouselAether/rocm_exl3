@@ -24,14 +24,14 @@ Current baseline on gfx1151 / ROCm 7.2.4: **44 of 50 pass**. The 6 failures are
 exactly the inline-PTX files -- see ROCM_PORT_MAP.md. A number below 44 after a
 toolchain change means the shim needs attention.
 
-## `phase2_attn_check.py`
+## `attn_check.py`
 
 Checks upstream's in-tree Triton paged attention against an independent fp32
 reference across decode/prefill/longq/paged, MHA and GQA, batched, head_dim
 64/128/256.
 
 ```bash
-python rocm_tools/phase2_attn_check.py
+python rocm_tools/attn_check.py
 ```
 
 This is the gate that made the port viable: it establishes that FlashAttention
@@ -54,18 +54,6 @@ The measured result is counter-intuitive and worth re-checking on new hardware:
 the misdetected narrow-kv config is *faster* on RDNA, because upstream sizes
 tiles for ~100 KB of smem and RDNA 3.5 has 64 KB of LDS.
 
-## `scrape_rocm_docs.py`
-
-Pulls HIP and ROCm programming-guide docs into `rocm_docs/` as markdown, so the
-whole corpus greps in one pass.
-
-```bash
-python rocm_tools/scrape_rocm_docs.py all
-```
-
-URLs are pinned to `docs-7.2.4`; edit `SITES` when moving to a new ROCm. Requires
-`html2text`.
-
 ## Re-verifying after a ROCm upgrade
 
 ROCm changed substantially between 7.1 and 7.2 — several workarounds in the
@@ -74,7 +62,7 @@ availability. Assume nothing carries over:
 
 ```bash
 rocm_tools/hipcc_probe.sh --all          # shim still complete?
-python rocm_tools/phase2_attn_check.py   # attention still correct?
+python rocm_tools/attn_check.py   # attention still correct?
 python rocm_tools/bench_prefill_tiles.py # tile choice still right?
 ```
 
@@ -106,9 +94,9 @@ across three runs with under 1% spread.
 
 Both benchmarks are cheap. Run them several times before acting on a result.
 
-## Phase 4
+## Hardware and kernel notes
 
-See [PHASE4.md](PHASE4.md) for the kernel-port handoff: current state, the
-findings that must not be re-derived (WMMA operand order, `sudot4` vs `sdot4`,
-the `block_m/num_warps == 16` constraint, the measurement noise floor), and the
-recommended order of work.
+The measured facts these tools exist to protect — WMMA operand order and fragment
+layout, `sudot4` vs `sdot4`, the 64 KB LDS budget, the noise floor, and why each
+RDNA sibling differs from the upstream file it replaces — are in
+[`exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md`](../exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md).
