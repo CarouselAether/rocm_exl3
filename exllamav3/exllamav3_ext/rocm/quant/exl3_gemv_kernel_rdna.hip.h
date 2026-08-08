@@ -1,0 +1,346 @@
+#pragma once
+
+// =============================================================================
+// RDNA 3.5 GEMV kernel -- fdot2 dot-product form
+// =============================================================================
+//
+// Carried forward from the working ROCm fork
+// (rocm_exl3_legacy/.../quant/exl3_gemv_rdna.hip, where kernel and host dispatch
+// lived in one file). The kernel body is unchanged apart from the hadamard
+// helpers, which are re-pointed at upstream v1.3.0's templated
+// had_*_r_128_inner signature (see below). Every comment about measured
+// behaviour is from the fork and is not re-derivable from upstream.
+//
+// This is NOT a port of upstream's quant/exl3_gemv_kernel.cuh. That kernel is
+// built on m16n8k16 mma.sync (locally defined as mma_ab_h, which is why grepping
+// for ptx.cuh's named wrappers missed it) plus cp_async and a cooperative
+// grid.sync. It has no RDNA equivalent, and the mechanical include-swapped copy
+// that used to sit at this path did not compile.
+//
+// The fork also carries a WMMA GEMV at quant/exl3_gemv_kernel_rdna.hip.h (three
+// kernels: a split-K form with atomics whose fp16 store its own comments mark as
+// wrong, a k % 256 single-pass form, and exl3_gemv_kernel<bits, c_fp32, cb,
+// k_split>). It is **superseded as the m == 1 path**: only quant/exl3_gemv.cu
+// includes it, that entry point is a hardcoded bits=4 / cb=0 / K_SPLIT=1 stub,
+// and nothing on the ROCm path ever called it -- exl3_gemv_rdna handled every
+// m == 1 matmul.
+//
+// It is not worthless, though, and it is the reason this file does not claim
+// m > 1. The third kernel pads M to 16 and would cover 2 <= m <= 8, which is
+// upstream's envelope and which this kernel cannot reach. It has never been
+// numerically validated on this hardware and it stages through a stride-17 LDS
+// tile (see SH_STRIDE below for why that is the wrong stride). Evaluating it
+// needs its own correctness harness; until then m > 1 falls through to the
+// cooperative GEMM.
+//
+// Shape: one warp per 16-wide output tile, 16 active lanes each accumulating one
+// output element in fp32. B is staged quantized through LDS, dequantized in
+// registers, unswizzled to row-major in LDS, then consumed by V_DOT2_F32_F16.
+//
+// Handles bits 1-8, cb 0 (default) / 1 (mcg) / 2 (mul1), fp16 or fp32 C, and
+// m == 1 only. Larger m falls through to the cooperative GEMM.
+// =============================================================================
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+#include "exl3_dq_rdna.hip.h"
+#include "../../quant/hadamard_inner.cuh"
+
+// -----------------------------------------------------------------------------
+// LDS geometry -- ONE definition, used by the kernel and by the host launch
+// -----------------------------------------------------------------------------
+// SH_STRIDE = 18: pads the 16-column tile to 18 halves (36 bytes = 9 dwords) per
+// row so the write pattern spreads across all 32 LDS banks. At 17 the adjacent
+// active-lane groups (0-3 vs 16-19, 8-11 vs 24-27) collide on banks 2,3,10,11
+// etc, measured at ~24% LDS stall time by PMC. 9 is coprime with 32, so
+// (row * 9 + col / 2) mod 32 covers every bank.
+//
+// The quantized staging area is sized for the widest bitwidth (8) rather than
+// per-instantiation, so one host-side figure covers every kernel.
+//
+// Keep the host size and the kernel's indexing derived from these constants and
+// nothing else. An LDS figure that drifted out of step in the GEMM presented as
+// a kernel bug, not as a launch bug, and cost real time.
+#define EXL3_GEMV_SH_STRIDE 18
+#define EXL3_GEMV_SH_QUANT_U16 (16 * 8)
+
+static inline size_t exl3_gemv_smem_bytes(int warps_per_block)
+{
+    return (size_t) warps_per_block *
+           (16 * EXL3_GEMV_SH_STRIDE * sizeof(half) +
+            EXL3_GEMV_SH_QUANT_U16 * sizeof(uint16_t));
+}
+
+// =============================================================================
+// Dot-product GEMV kernel -- templated on WARPS_PER_BLOCK
+// =============================================================================
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
+__global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_dot_kernel
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    void* __restrict__ C,
+    const int size_k,
+    const int size_n
+)
+{
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    // Each warp handles one N-tile (16 outputs)
+    const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int n_tiles = size_n / 16;
+
+    if (tile_n >= n_tiles) return;
+
+    // Dynamic shared memory -- layout mirrors exl3_gemv_smem_bytes() above
+    extern __shared__ char shared_mem[];
+
+    constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
+
+    half* sh_b_dq = (half*) shared_mem;
+    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
+
+    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
+    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
+
+    // Each lane 0-15 accumulates one output element
+    float accum = 0.0f;
+
+    const int num_k_tiles = size_k / 16;
+    const int tile_elements = 16 * bits;
+
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++)
+    {
+        const int k_offset = k_tile * 16;
+
+        // =====================================================================
+        // Step 1: Load quantized B tile
+        // =====================================================================
+        const uint16_t* gl_b = B + (k_tile * n_tiles + tile_n) * tile_elements;
+
+        #pragma unroll
+        for (int i = lane; i < tile_elements; i += 32)
+            my_sh_b_quant[i] = gl_b[i];
+
+        __syncwarp();
+
+        // =====================================================================
+        // Step 2: Dequantize
+        // =====================================================================
+        const uint32_t* b_quant = (const uint32_t*) my_sh_b_quant;
+
+        FragB frag0, frag1;
+        dq_dispatch<bits, cb>(b_quant, lane << 3, frag0, frag1);
+
+        // Unswizzle (shuffle by 4 within warp + combine low/high halves)
+        uint32_t v0 = *reinterpret_cast<uint32_t*>(&frag0[0]);
+        uint32_t v1 = *reinterpret_cast<uint32_t*>(&frag0[1]);
+        uint32_t v2 = *reinterpret_cast<uint32_t*>(&frag1[0]);
+        uint32_t v3 = *reinterpret_cast<uint32_t*>(&frag1[1]);
+
+        uint32_t s0 = __shfl_down(v0, 4, 32);
+        uint32_t s1 = __shfl_down(v1, 4, 32);
+        uint32_t s2 = __shfl_down(v2, 4, 32);
+        uint32_t s3 = __shfl_down(v3, 4, 32);
+
+        half2 n0 = *reinterpret_cast<half2*>(&s0);
+        half2 n1 = *reinterpret_cast<half2*>(&s1);
+        half2 n2 = *reinterpret_cast<half2*>(&s2);
+        half2 n3 = *reinterpret_cast<half2*>(&s3);
+
+        if (!(lane & 4))
+        {
+            // VGPR-pressure reduction: the previous implementation built 8
+            // intermediate half2's (m0..m7) and then extracted their halves
+            // to store. Each __halves2half2(X, Y) followed by __low/high2half
+            // just gives back X and Y, so the m_i's were round-trip no-ops
+            // consuming VGPRs. Storing the halves directly removes 8 VGPRs of
+            // unnecessary live state per lane. Writes are also reordered so
+            // each (frag, n) pair is fully consumed before the next, giving
+            // the compiler a cleaner signal about which values can die early.
+            const int r0 = (lane % 4) * 2;
+            const int r1 = r0 + 1;
+            const int r2 = r0 + 8;
+            const int r3 = r0 + 9;
+            const int c0 = (lane / 8) * 2;
+            const int c1 = c0 + 8;
+
+            #define B_IDX(row, col) ((row) * SH_STRIDE + (col))
+
+            // Group 1: frag0[0] + n0  ->  (r0, c0), (r1, c0) at cols c0, c0+1
+            my_sh_b[B_IDX(r0, c0)]     = __low2half (frag0[0]);
+            my_sh_b[B_IDX(r0, c0 + 1)] = __low2half (n0);
+            my_sh_b[B_IDX(r1, c0)]     = __high2half(frag0[0]);
+            my_sh_b[B_IDX(r1, c0 + 1)] = __high2half(n0);
+
+            // Group 2: frag0[1] + n1  ->  (r2, c0), (r3, c0)
+            my_sh_b[B_IDX(r2, c0)]     = __low2half (frag0[1]);
+            my_sh_b[B_IDX(r2, c0 + 1)] = __low2half (n1);
+            my_sh_b[B_IDX(r3, c0)]     = __high2half(frag0[1]);
+            my_sh_b[B_IDX(r3, c0 + 1)] = __high2half(n1);
+
+            // Group 3: frag1[0] + n2  ->  (r0, c1), (r1, c1)
+            my_sh_b[B_IDX(r0, c1)]     = __low2half (frag1[0]);
+            my_sh_b[B_IDX(r0, c1 + 1)] = __low2half (n2);
+            my_sh_b[B_IDX(r1, c1)]     = __high2half(frag1[0]);
+            my_sh_b[B_IDX(r1, c1 + 1)] = __high2half(n2);
+
+            // Group 4: frag1[1] + n3  ->  (r2, c1), (r3, c1)
+            my_sh_b[B_IDX(r2, c1)]     = __low2half (frag1[1]);
+            my_sh_b[B_IDX(r2, c1 + 1)] = __low2half (n3);
+            my_sh_b[B_IDX(r3, c1)]     = __high2half(frag1[1]);
+            my_sh_b[B_IDX(r3, c1 + 1)] = __high2half(n3);
+
+            #undef B_IDX
+        }
+
+        __syncwarp();
+
+        // =====================================================================
+        // Step 3: Dot product -- lane L computes output column L
+        //
+        // Optimized with V_DOT2_F32_F16 (RDNA 3.5 ISA packed-math op,
+        // VOP3P, 1 cycle): __builtin_amdgcn_fdot2(a, b, c, clamp) computes
+        //   c + a.x * b.x + a.y * b.y   (all fp16 inputs, fp32 accumulate)
+        // This halves the instruction count of the inner loop: 8 dot2 ops
+        // instead of 16 f16->f32 converts + 16 FMAs per lane per k-tile.
+        //
+        // A is contiguous in k -> single half2 aligned load per pair.
+        // B is strided (rows 18 halves apart in LDS) -> pack two scalar LDS
+        // reads into a half2 manually. All lanes read A[k_offset + k] for
+        // the SAME k -- the compiler lifts that to a scalar broadcast load,
+        // which is materially faster than a per-lane vector load. Splitting
+        // K across lanes 0-15/16-31 breaks this broadcast and regresses
+        // kernel time, so we stay with the 16-active-lane design.
+        // =====================================================================
+        if (lane < 16)
+        {
+            #pragma unroll
+            for (int k = 0; k < 16; k += 2)
+            {
+                half2 a2 = *reinterpret_cast<const half2*>(&A[k_offset + k]);
+                half2 b2 = __halves2half2(
+                    my_sh_b[k * SH_STRIDE + lane],
+                    my_sh_b[(k + 1) * SH_STRIDE + lane]
+                );
+                accum = __builtin_amdgcn_fdot2(a2, b2, accum, false);
+            }
+        }
+
+        __syncwarp();
+    }
+
+    // =========================================================================
+    // Step 4: Write output
+    // =========================================================================
+    if (lane < 16)
+    {
+        const int out_idx = tile_n * 16 + lane;
+        if constexpr (c_fp32)
+            ((float*) C)[out_idx] = accum;
+        else
+            ((half*) C)[out_idx] = __float2half(accum);
+    }
+}
+
+// =============================================================================
+// Hadamard helper kernels (m == 1 forms)
+// =============================================================================
+//
+// The cooperative GEMM folds SUH/SVH into the matmul kernel around grid.sync().
+// This path is a plain launch, so the transforms are separate kernels either
+// side of it -- as in the fork.
+//
+// Upstream v1.3.0 changed the inner helpers' signature: pre/post scaling is now
+// a template pair with a single scale pointer, where v0.0.29 (what the fork was
+// written against) took both scale pointers as runtime args. The calls below are
+// updated accordingly; the arithmetic is identical.
+//
+// Note the helpers index the scale array as ((half4*) scale)[blockIdx.y * 32 + t].
+// These grids are 1-D, so blockIdx.y == 0 and the per-warp offset has to be
+// folded into the pointer -- which is what upstream's own GEMM call sites do
+// (suh + (this_warp * 128) % size_k).
+
+__global__
+__launch_bounds__(256)
+void exl3_gemv_rdna_had_in_kernel
+(
+    const half* __restrict__ input,
+    half* __restrict__ output,
+    const half* __restrict__ scales,
+    const int size
+)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int total_warps = size / 128;
+
+    if (warp_id < total_warps)
+    {
+        int offset = warp_id * 128;
+        had_hf_r_128_inner<true, false>
+        (
+            input + offset,
+            output + offset,
+            scales + offset,
+            0.088388347648f  // 1/sqrt(128)
+        );
+    }
+}
+
+__global__
+__launch_bounds__(256)
+void exl3_gemv_rdna_had_out_half_kernel
+(
+    const half* __restrict__ input,
+    half* __restrict__ output,
+    const half* __restrict__ scales,
+    const int size
+)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int total_warps = size / 128;
+
+    if (warp_id < total_warps)
+    {
+        int offset = warp_id * 128;
+        had_hf_r_128_inner<false, true>
+        (
+            input + offset,
+            output + offset,
+            scales + offset,
+            0.088388347648f  // 1/sqrt(128)
+        );
+    }
+}
+
+__global__
+__launch_bounds__(256)
+void exl3_gemv_rdna_had_out_float_kernel
+(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const half* __restrict__ scales,
+    const int size
+)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int total_warps = size / 128;
+
+    if (warp_id < total_warps)
+    {
+        int offset = warp_id * 128;
+        had_ff_r_128_inner<false, true>
+        (
+            input + offset,
+            output + offset,
+            scales + offset,
+            0.088388347648f  // 1/sqrt(128)
+        );
+    }
+}

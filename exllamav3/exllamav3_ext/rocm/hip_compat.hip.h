@@ -187,12 +187,19 @@ using CUgraphNode = hipGraphNode_t;
 // saturates well below CUDA's nanosecond argument -- so this backs off by a
 // comparable order of magnitude rather than an equal duration. Only used for
 // spin-wait pacing, where exact timing does not affect correctness.
-#ifdef __HIP_DEVICE_COMPILE__
+//
+// The declaration must be visible in the *host* pass too, not just the device
+// pass: clang parses __device__ function bodies during host compilation, so
+// guarding the whole function on __HIP_DEVICE_COMPILE__ makes every host-pass
+// use an undeclared-identifier error. Only the builtin call is device-only.
+// (This went unnoticed until cpu/moe_handoff.cu became the first compiling TU
+// to reach a __nanosleep call site.)
 __device__ __forceinline__ void __nanosleep(unsigned int)
 {
+#ifdef __HIP_DEVICE_COMPILE__
     __builtin_amdgcn_s_sleep(1);
-}
 #endif
+}
 
 // ---------------------------------------------------------------------------
 // CUDA graph API
@@ -293,14 +300,36 @@ __BF16_HOST_DEVICE_STATIC__ __hip_bfloat16 __float2bfloat16_rz(const float f)
 // NOTE: correct *because* every exllamav3 kernel has all lanes converged at
 // these call sites. A future kernel with divergent lanes would need the real
 // masked forms.
+//
+// __syncwarp has a SECOND half to its contract that lane convergence does not
+// cover: CUDA's __syncwarp() also orders shared-memory accesses within the warp.
+// __builtin_amdgcn_wave_barrier() alone is a *scheduling* barrier -- it
+// constrains instruction motion and emits no s_waitcnt -- so a bare mapping
+// silently drops the memory ordering. That breaks cross-lane communication
+// through LDS, where the write and the read use different addresses and the
+// compiler therefore has no dependency to wait on:
+//
+//     src_lane_map[dest] = lane_id;     // routing.cu warp_radixsort_*
+//     __syncwarp(active);
+//     int src = src_lane_map[myrank];   // dest != myrank -- no wait inserted
+//
+// The wavefront-scope release/acquire pair restores it. This is the legacy
+// fork's __hip_syncwarp_nomask() verbatim; the bare-barrier form was a
+// regression introduced when hip_compat was rewritten for this port.
+__device__ __forceinline__ void __exl3_rdna_syncwarp()
+{
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
 
 #define __shfl_sync(mask, var, srcLane, ...)      __shfl(var, srcLane, ##__VA_ARGS__)
 #define __shfl_up_sync(mask, var, delta, ...)     __shfl_up(var, delta, ##__VA_ARGS__)
 #define __shfl_down_sync(mask, var, delta, ...)   __shfl_down(var, delta, ##__VA_ARGS__)
 #define __shfl_xor_sync(mask, var, laneMask, ...) __shfl_xor(var, laneMask, ##__VA_ARGS__)
-#define __ballot_sync(mask, pred)                 __ballot(pred)
-#define __activemask()                            __ballot(1)
-#define __syncwarp(...)                           __builtin_amdgcn_wave_barrier()
+#define __ballot_sync(mask, pred)                 ((unsigned) __ballot(pred))
+#define __activemask()                            ((unsigned) __ballot(1))
+#define __syncwarp(...)                           __exl3_rdna_syncwarp()
 
 // ---------------------------------------------------------------------------
 // Integer dot-product intrinsic
@@ -312,8 +341,15 @@ __BF16_HOST_DEVICE_STATIC__ __hip_bfloat16 __float2bfloat16_rz(const float f)
 //
 // Deliberately NOT __builtin_amdgcn_sdot4: that requires target feature
 // dot1-insts, which gfx1151 does not have (probed -- it is a hard compile
-// error). The unsigned builtin is available. If a signed __dp4a call ever
-// appears upstream it will need a manual expansion rather than this builtin.
+// error). The unsigned builtin is available, because gfx1151 does have
+// dot8-insts. The failure mode to watch for is that sdot4 not compiling reads
+// like "gfx1151 has no int8 dot product" when in fact it has one.
+//
+// Signed and mixed-sign forms are reachable when needed, via sudot4 rather
+// than a manual expansion: __builtin_amdgcn_sudot4(sign_a, a, sign_b, b, c,
+// clamp). quant/exl3_gemv_int8_kernel.cuh's `dp4a.u32.s32` is exactly
+// sudot4(false, a, true, b, c, false). No such overload is declared here
+// because nothing upstream calls __dp4a in a signed form today.
 
 __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c)
 {
@@ -352,3 +388,35 @@ __host__ __device__ __forceinline__ int exl3_lm_clamp(int x, int lo, int hi)
     return x < lo ? lo : (x > hi ? hi : x);
 }
 #define LM_CLAMP_IDX(idx, lo, hi) exl3_lm_clamp((idx), (lo), (hi))
+
+// ---------------------------------------------------------------------------
+// Cache-hint loads: __ldcs / __ldcg
+// ---------------------------------------------------------------------------
+// Both are CUDA intrinsics with no HIP equivalent. They are NOT the same kind
+// of thing, and mapping them alike would introduce a subtle bug.
+//
+// __ldcs ("cache streaming", evict-first) is a pure performance hint. Dropping
+// it is always semantically safe. quant/exl3_gemv_kernel.cuh uses it for the
+// weight prefetch ring on the decode path, which is memory-bound, so it is
+// worth preserving: __builtin_nontemporal_load is the RDNA equivalent.
+//
+// __ldcg ("cache global") bypasses L1 and reads at L2. On NVIDIA, L1 is not
+// coherent across SMs, so this is load-bearing wherever a kernel reads values
+// another block wrote -- which is exactly how quant/exl3_gemv_int8_kernel.cuh
+// uses it ("Reads bypass L1: the contributions arrived from other blocks").
+// RDNA has the same hazard: L0 is per-CU, L2 is the device-coherent point. A
+// plain load would be free to hit a stale L0 line, so this maps to a relaxed
+// atomic load at agent scope, which forces the read to the coherent level.
+// Same reasoning as ldg_cv_u32 in rocm/rdna_wmma.hip.h.
+
+template <typename T>
+__device__ __forceinline__ T __ldcs(const T* p)
+{
+    return __builtin_nontemporal_load(p);
+}
+
+template <typename T>
+__device__ __forceinline__ T __ldcg(const T* p)
+{
+    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}

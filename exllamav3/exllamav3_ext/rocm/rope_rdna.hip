@@ -1,5 +1,35 @@
 // RDNA/ROCm port of rope.cu.
 //
+// EXL3_RDNA_NORM_LANE0 -- fused RMS norm: guard the sums[] write to lane 0
+// ------------------------------------------------------------------------
+// apply_norm()/apply_norm_uw() do:
+//
+//     sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
+//
+// warp_reduce_sum_f is a __shfl_down reduction, so only lane 0 holds the warp
+// total -- yet all 32 lanes execute that store to the same address. The value
+// that survives is whichever lane wins the race, and that differs by vendor.
+// Measured on gfx1151 with lane values 0..31 (true sum 496):
+//
+//     __shfl_down : lane0=496  lane1=512  lane16=752  lane31=992
+//     __shfl_xor  : every lane 496
+//     unguarded store lands 992   <- lane 31 wins on RDNA
+//
+// On NVIDIA lane 0 wins, so upstream is correct there by accident. Here the
+// slot got a partial sum, making the RMS scale wrong by a constant factor per
+// head -- q/k norm silently corrupted, attention garbage, and a model that
+// loads and generates a single repeated token. pytest tests/test_rope.py showed
+// 56 of 58 use_norm=True cases failing while every use_norm=False case passed.
+//
+// The fix matches what norm.cu already does for the same reduction
+// (`if (lane_id == 0) sums[warp_id] = sum;`), and rope.cu even has the
+// `int lane_id` line present but commented out. Guarding the store is the
+// minimal change; switching warp_reduce_sum_f to __shfl_xor would also work and
+// would fix every other caller, but that is a shared header and out of scope
+// for a sibling.
+//
+// This is an upstream latent bug, not a porting artifact -- worth reporting.
+//
 // Byte-identical to upstream rope.cu except for one line: the half2 zero-init in
 // load_head(). `((half2*)p)[t] = {}` compiles on CUDA but is ambiguous against
 // HIP's __half2 assignment overloads, and no amount of shimming reaches it --
@@ -216,7 +246,9 @@ void rope_kernel
         auto apply_norm = [&] ()
         {
             half2 *tptr = (half2*)(sh_head + t * 2);
-            // int lane_id = threadIdx.x % 32;
+            // EXL3_RDNA_NORM_LANE0: see the header block. warp_reduce_sum_f is a
+            // __shfl_down reduction, so ONLY lane 0 ends up with the warp total.
+            int lane_id = threadIdx.x % 32;
             int warp_id = threadIdx.x / 32;
             int warps = blockDim.x / 32;
 
@@ -225,7 +257,8 @@ void rope_kernel
             float v1 = __low2float(v);
             float v2 = __high2float(v);
             float sum = v1 * v1 + v2 * v2;
-            sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
+            float warp_sum = warp_reduce_sum_f(sum);
+            if (lane_id == 0) sums[warps * t_head + warp_id] = warp_sum;
             __syncthreads();
 
             sum = sums[warps * t_head];
@@ -264,7 +297,9 @@ void rope_kernel
         auto apply_norm_uw = [&] ()
         {
             half2 *tptr = (half2*)(sh_head + t * 2);
-            // int lane_id = threadIdx.x % 32;
+            // EXL3_RDNA_NORM_LANE0: see the header block. warp_reduce_sum_f is a
+            // __shfl_down reduction, so ONLY lane 0 ends up with the warp total.
+            int lane_id = threadIdx.x % 32;
             int warp_id = threadIdx.x / 32;
             int warps = blockDim.x / 32;
 
@@ -273,7 +308,8 @@ void rope_kernel
             float v1 = __low2float(v);
             float v2 = __high2float(v);
             float sum = v1 * v1 + v2 * v2;
-            sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
+            float warp_sum = warp_reduce_sum_f(sum);
+            if (lane_id == 0) sums[warps * t_head + warp_id] = warp_sum;
             __syncthreads();
 
             sum = sums[warps * t_head];
