@@ -10,10 +10,15 @@ ROCm 7.2.4 / HIP 7.2.53211 / torch 2.13.0+rocm7.2.
 ## Selecting a backend
 
 ```bash
-pip install .                  # auto-detects from the installed torch
-EXL3_BACKEND=rocm pip install . # force ROCm
-EXL3_BACKEND=cuda pip install . # force CUDA
+pip install --no-build-isolation .                  # auto-detects from installed torch
+EXL3_BACKEND=rocm pip install --no-build-isolation . # force ROCm
+EXL3_BACKEND=cuda pip install --no-build-isolation . # force CUDA
 ```
+
+`--no-build-isolation` is required: pip otherwise builds in an isolated
+environment containing no torch, and a torch C++ extension must be compiled
+against the same torch it will run against. Without it the build stops with an
+explanation rather than installing a package with no extension in it.
 
 Auto-detection reads `torch.version.hip` / `torch.version.cuda`. An explicit
 `EXL3_BACKEND` always wins.
@@ -83,26 +88,87 @@ lanes at a shuffle would need the real masked forms.
 
 - `parallel/` (8 files) — CUDA IPC + inline PTX. Tensor-parallel is unavailable
   on ROCm.
-- `quant/comp_units/` (66 files) — cooperative-launch EXL3 GEMM instantiations
-  that stall `grid.sync()` on RDNA WGP pairing. Replaced by
-  `rocm/quant/comp_units_rdna/`.
+- `quant/comp_units/` (66 files) — EXL3 GEMM instantiations that reach the inline
+  PTX in `ptx.cuh`. Replaced by `rocm/quant/comp_units_rdna/` (24 GEMM slots,
+  8 bitwidths x 3 codebooks; MoE slots pending).
+
+  An earlier version of this note said these "stall `grid.sync()` on RDNA WGP
+  pairing". That is wrong, and it has now been tested rather than argued about:
+  `rocm_tools/gemm_coop_check.hip` runs the cooperative kernel across 13 shape /
+  bitwidth / codebook / grid-size combinations and every one matches the
+  non-cooperative decomposition exactly.
+
+  `SMEM_MAX` on every launch is still the wrong thing to pass on a 64 KB part,
+  but not because of deadlock — an oversubscribed cooperative grid is *refused*
+  by the runtime ("too many blocks in cooperative launch"), not hung. The real
+  costs are halved occupancy (2 blocks/CU becomes 1 at the shapes that fit two)
+  and no headroom for `exl3_mgemm`, whose `dim3(num_sms, 1, concurrency)` grid
+  would be rejected outright once concurrency > 1.
+  `rocm/quant/exl3_gemm_rdna.hip` passes the shape's actual requirement — see
+  EXL3_RDNA_SMEM there.
+
+- `quant/exl3_gemv.cu` — PTX `mma.sync` (locally defined as `mma_ab_h`, not one
+  of `ptx.cuh`'s named wrappers) plus `cp_async` and a cooperative grid.
+  Replaced by `rocm/quant/exl3_gemv_rdna.hip`, which is the fork's fdot2
+  dot-product kernel behind upstream's API. m == 1 only; larger m falls through
+  to the GEMM.
+
+- `quant/exl3_gemv_int8.cu` — inline `dp4a.u32.s32` and `cp_async`.
+  **Not ported.** `rocm/quant/exl3_gemv_int8_rdna.hip` defines the interface
+  with the path disabled so the build links and every caller uses the fp16
+  kernels. The int8 WMMA wrappers it would need (`mma_sync_i8`) are implemented
+  and validated in `rocm/rdna_wmma.hip.h`.
+
+## LDS budget on non-Strix RDNA parts
+
+Strix Halo (gfx1151) has **64 KB** of LDS per workgroup, measured. Other RDNA
+parts tolerate upstream's 90 KB figure, so this is a build-time knob rather than
+a constant:
+
+```bash
+hipcc -DEXL3_RDNA_SMEM_MAX=92160 ...    # 90 KB parts
+# default is 64 * 1024
+```
+
+It is deliberately **not** selected with an arch macro. `__gfx1151__` exists only
+during the device pass, while the value is also needed by host code (shape
+admission, launch sizing) — an `#if` would give the two passes different numbers
+in one build. A multi-arch fat binary must use the smallest target's value,
+since the shape table and kernel instantiations are shared across archs.
+
+Whatever the build-time value, `exl3_rdna_smem_budget()` clamps it to the
+device's real `sharedMemPerBlock` at runtime and every shape-admission test uses
+the clamped figure. So an over-large build-time value costs availability of some
+shapes, never a failed launch. Verified with
+`rocm_tools/gemm_coop_check --smem`.
 
 ## Status
 
 - [x] Upstream sources compile unmodified under hipcc via the shim
 - [x] Dual-backend `setup.py` with `EXL3_BACKEND` selection
-- [ ] RDNA kernel port (`comp_units_rdna/`, WMMA, GEMV) — **in progress**
+- [x] RDNA GEMM kernel + 24 instantiations — numerically validated, links
+- [x] RDNA GEMV — numerically validated (`rocm_tools/gemv_check.hip`)
+- [x] Cooperative launch — **verified on gfx1151** (`rocm_tools/gemm_coop_check.hip`),
+      13 differential cases exact, and an oversubscribed grid is refused by the
+      runtime rather than deadlocking
+- [x] MoE kernel + 20 instantiations — builds and links, **not yet executed**
+- [x] `quantize` + 8 tile instantiations — builds and links, **not yet executed**
+- [x] `ROCM_EXCLUDE` covers every replaced source (verified: setup.py keeps 102
+      sources, the probe compiles 102, no upstream twins remain)
+- [ ] int8 GEMV — currently a disabled stub
 - [ ] End-to-end validation (perplexity, TabbyAPI)
 
-Until the kernel port lands, a ROCm build links but has no EXL3 quant kernels.
+`ROCM_EXCLUDE` and `rocm_tools/hipcc_probe.sh`'s exclusion regex are the same
+statement written twice — keep them in step. Every `_rdna` sibling is only
+correct if its upstream twin is excluded; building both is a duplicate-symbol
+link failure.
 
 ## Re-verifying against a new ROCm
 
 The claims above are checkable, not folklore:
 
 ```bash
-tools/hipcc_probe.sh --all          # compile every source with the shim
-tools/scrape_rocm_docs.py all       # refresh rocm_docs/ (edit the pinned URLs)
+rocm_tools/hipcc_probe.sh --all     # compile every source with the shim
 ```
 
 Anything in `hip_compat.hip.h` marked as "absent from HIP" should be re-grepped

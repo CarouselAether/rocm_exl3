@@ -1,5 +1,100 @@
 
-# <img src="doc/cat.png" width="40"> ExLlamaV3
+# <img src="doc/cat.png" width="40"> ExLlamaV3 — ROCm / RDNA fork
+
+This is a **ROCm fork of [ExLlamaV3](https://github.com/turboderp-org/exllamav3)** by turboderp, tracking
+upstream v1.3.0. If you are on NVIDIA, you want [the upstream repo](https://github.com/turboderp-org/exllamav3) —
+this one builds for CUDA too, but adds nothing there.
+
+The Python package is still named `exllamav3`, so it is a drop-in replacement (including for TabbyAPI).
+Only the repository is renamed.
+
+### What this fork changes
+
+The CUDA kernels that cannot compile for RDNA are replaced with hand-written HIP/WMMA siblings under
+`exllamav3_ext/rocm/`, reached through a compat shim and include-path redirection. Python divergences live in
+`exllamav3/rocm_py/` and are applied as monkeypatches at import.
+
+**No upstream C++ or CUDA source is modified — not one.** Verify it yourself:
+
+```sh
+git diff --stat v1.3.0 -- '*.cu' '*.cuh' '*.cpp' '*.h' ':(exclude)exllamav3/exllamav3_ext/rocm'
+# (empty)
+```
+
+Outside `rocm/` and `rocm_py/`, exactly four upstream files differ from v1.3.0:
+
+| file | change |
+|---|---|
+| `setup.py` | ROCm backend selector and `hipcc` builder. All ROCm behaviour is inside `HIPBuildExtension`, so a CUDA build is untouched upstream code. |
+| `exllamav3/__init__.py` | Six lines calling `rocm_py.apply()`. Returns immediately when `torch.version.hip` is `None`, so it is inert on CUDA. |
+| `exllamav3/modules/attention_fn/triton_paged.py` | Selects the narrow-KV prefill tile explicitly on RDNA instead of relying on `get_device_capability()` accidentally reporting `(11, 5)`, plus measured notes on decode split counts. |
+| `README.md` | This section. |
+
+```sh
+git diff --stat v1.3.0 -- . ':(exclude)exllamav3/exllamav3_ext/rocm' ':(exclude)exllamav3/rocm_py' ':(exclude)rocm_tools'
+```
+
+That is the whole surface. Rebasing onto a new upstream means re-applying four files, none of them kernels.
+
+### Requirements
+
+| | |
+|---|---|
+| ROCm | **7.2.4 or newer** — the build hard-fails below this |
+| GPU | RDNA3 / RDNA3.5 / RDNA4: `gfx1100`, `gfx1101`, `gfx1102`, `gfx1150`, `gfx1151`, `gfx1200`, `gfx1201` |
+| Python | 3.10+ (whatever the ROCm torch index publishes a wheel for) |
+| Torch | ROCm build, from `download.pytorch.org/whl/rocmX.Y` — see below |
+
+You do **not** need FlashAttention. Upstream v1.3.0 uses Triton paged attention, so the FA2 dependency that
+earlier ROCm forks required is gone.
+
+### Install
+
+```sh
+git clone https://github.com/CarouselAether/rocm_exl3
+cd rocm_exl3
+
+# 1. ROCm torch + triton-rocm + everything else.
+#    Do NOT use requirements.txt on ROCm -- it resolves torch from PyPI, which is the CUDA build.
+pip install -r requirements_rocm.txt
+
+# 2. Build and install the extension against that torch.
+pip install --no-build-isolation .
+```
+
+`--no-build-isolation` is required, not optional: pip otherwise builds in an isolated environment with no
+torch in it, and a torch C++ extension has to be compiled against the same torch it will run against.
+Building without it fails with an explanation rather than silently installing an empty package.
+
+The build compiles ~100 sources with `hipcc` in parallel (`MAX_JOBS` to limit it, e.g. on a low-memory
+machine).
+
+### Tested
+
+Developed on a Ryzen AI Max 395+ (Strix Halo, **gfx1151**, 128 GB unified) — Ubuntu 24.04, ROCm 7.2.4,
+torch 2.13.0+rocm7.2, triton-rocm 3.7.1, Python 3.12. Verified end to end with GLM-4.6V (MoE, 3.55 bpw) and
+Gemma-4-31B (dense). The other architectures in the supported list above should work but are untested —
+reports welcome.
+
+### Known limitations on ROCm
+
+- **Tensor-parallel is not available.** The `parallel/` kernels are excluded from the ROCm build.
+- **Vision/multimodal is untested.** Text generation is what has been verified.
+- Kernel behaviour can be bisected at runtime with the `EXL3_ROCM_*` environment switches — see
+  `exllamav3/rocm_py/__init__.py`, which documents each one and why it exists.
+
+### Using with TabbyAPI
+
+TabbyAPI's `start.py` offers only `cu12` / `cu13` GPU options and will install a **CUDA** `exllamav3` wheel
+straight over this one. Use `--nowheel`, which skips the extras entirely:
+
+```sh
+python start.py --nowheel
+```
+
+Install this fork *after* TabbyAPI, or re-install it if `start.py` has already clobbered it.
+
+---
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs. Headline features:
 
@@ -77,6 +172,10 @@ As for what is implemented, expect that some things may be a little broken at fi
 
 ## How to?
 
+**On ROCm, see [Install](#install) at the top of this file** — the methods below are upstream's CUDA
+instructions and are kept for the CUDA path. There is no prebuilt ROCm wheel yet, so building from source
+is currently the only ROCm route.
+
 [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) has a startup script that manages and installs prerequisites if you want to get started quickly with inference in an OAI-compatible client. 
 
 Otherwise, start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later) since the Torch dependency is not automatically handled by `pip`. Then pick a method below:
@@ -125,6 +224,18 @@ pip install .
 Relevant env variables for building:
 - `MAX_JOBS`: by default ninja may launch too many processes and run out of system memory for compilation. Set this to a reasonable value like 4 in that case.  
 - `EXLLAMA_NOCOMPILE`: set to install the library without compiling the C++/CUDA extension. Torch will build/load it at runtime instead.
+
+ROCm-specific build variables:
+- `EXL3_BACKEND`: `cuda` or `rocm`, forcing the backend. Otherwise it follows the installed torch.
+- `MAX_JOBS`: also honoured by the ROCm builder, which drives `hipcc` directly. It defaults to a value
+  bounded by both core count and RAM (~2.5 GB budgeted per job), so lower it if you still run out of memory.
+- `PYTORCH_ROCM_ARCH` / `GPU_ARCHS`: semicolon-separated `gfx` list to build for. Defaults to what `rocminfo` reports, filtered against the supported list. `PYTORCH_ROCM_ARCH` takes precedence.
+- `EXL3_RDNA_SMEM_MAX`: LDS budget in bytes. Defaults to the device's `sharedMemPerBlock` (64 KB on RDNA).
+- `EXL3_RDNA_MOE_TILESIZE_K`: `32` (default) or `16`. 16 forces the MoE GEMMs onto the single-K path — the
+  tile geometry every RDNA shape is validated on — at a cost of roughly 1.4–1.6× MoE throughput. It is the
+  first thing to try if fused MoE output ever looks wrong.
+- `EXL3_SKIP_ROCM_VERSION_CHECK`: bypass the ROCm >= 7.2.4 requirement. Not advised — older ROCm builds this
+  extension successfully and then computes wrong results.
 
 
 ## Conversion
