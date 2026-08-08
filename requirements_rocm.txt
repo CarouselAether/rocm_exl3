@@ -1,0 +1,61 @@
+# ROCm requirements. Bring ROCm 7.2.x; this brings everything else.
+#
+#   pip install -r requirements_rocm.txt
+#   pip install .
+#
+# Do NOT use requirements.txt on ROCm: it resolves torch from PyPI, and PyPI's
+# torch is the CUDA build. setup.py drops `torch` from install_requires on ROCm
+# for the same reason, so `pip install .` will not pull it either -- this file is
+# where the real torch dependency lives.
+#
+# Why --extra-index-url is enough (verified, not assumed): pip merges candidates
+# from every index and picks the highest version, and the ROCm wheel carries a
+# PEP 440 local segment -- 2.13.0+rocm7.2 sorts ABOVE PyPI's plain 2.13.0. A
+# --dry-run resolve here selects torch-2.13.0+rocm7.2 and pulls triton-rocm with
+# it. If a future PyPI torch ever has a higher BASE version than the ROCm index
+# offers, that ordering flips; pin explicitly then:
+#
+#   pip install --index-url https://download.pytorch.org/whl/rocm7.2 torch
+#
+# Match rocmX.Y below to the system ROCm minor version. This port requires
+# ROCm >= 7.2.4 -- setup.py hard-fails below that, because older ROCm builds the
+# extension successfully and then computes wrong results.
+#
+# Python version: nothing here pins one. pip matches the wheel tag to the running
+# interpreter (cp312 on 3.12, cp313 on 3.13, ...), so this file works on any
+# Python the ROCm index publishes a torch wheel for. If it does not publish one
+# for yours -- most likely on a very new release -- pip reports
+# "No matching distribution found for torch", which means the interpreter is
+# unsupported by ROCm torch, not that this file is wrong. Use a Python the index
+# covers.
+#
+# Deliberately NOT pinning wheels by direct URL. That form is exact but hardcodes
+# one cp3XX tag and one platform per line, so it needs a line per Python version
+# (see TabbyAPI's pyproject.toml, which carries eight for exllamav3 alone) and
+# breaks the moment someone uses an interpreter nobody listed.
+#
+# torchvision / torchaudio are NOT listed: nothing in this package imports them,
+# and torchvision pins its own torch version, which is a good way to have pip
+# quietly replace the torch you just installed.
+
+--extra-index-url https://download.pytorch.org/whl/rocm7.2
+
+torch>=2.6.0
+
+# Pulled in automatically by the ROCm torch wheel; listed so the requirement is
+# visible rather than incidental. The stock `triton` wheel on PyPI is CUDA-only.
+triton-rocm>=3.7.0
+
+tokenizers>=0.21.1
+numpy>=2.1.0
+rich
+typing_extensions
+safetensors>=0.3.2
+ninja
+pillow
+pyyaml
+marisa_trie
+kbnf>=0.4.2
+pydantic
+formatron>=0.5.0
+flash-linear-attention>=0.5.0

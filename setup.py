@@ -1,10 +1,12 @@
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
+import concurrent.futures
 import importlib.util
 import os
 import subprocess
 import sys
 import sysconfig
+import threading
 
 if torch := importlib.util.find_spec("torch") is not None:
     from torch.utils import cpp_extension
@@ -17,8 +19,48 @@ verbose = "EXLLAMA_VERBOSE" in os.environ
 ext_debug = "EXLLAMA_EXT_DEBUG" in os.environ
 
 if precompile and not torch:
-    print("Cannot precompile unless torch is installed.")
-    print("To explicitly JIT install run EXLLAMA_NOCOMPILE= pip install <xyz>")
+    # Upstream prints and continues, which produces a SUCCESSFUL install
+    # containing no extension at all (setup_kwargs is empty without torch) that
+    # then fails at the first import. On ROCm it is worse: the backend probe
+    # reads torch to decide, so a torch-less build also silently announces and
+    # configures itself as CUDA.
+    #
+    # That is escalated to a hard failure for ROCm ONLY. A CUDA build keeps
+    # upstream's exact behaviour -- this port's changes to shared code paths
+    # should be invisible to anyone not building for ROCm.
+    #
+    # Detected without torch (which is the thing that is missing): an explicit
+    # EXL3_BACKEND, or ROCm being installed on the machine at all.
+    #
+    # The usual cause is pip's build isolation: there is no pyproject.toml here,
+    # but modern pip still builds in an isolated env by default, and torch is not
+    # in it. Hence --no-build-isolation, which needs torch already installed in
+    # the target env (true by construction on ROCm -- see requirements_rocm.txt).
+    _rocm_intended = (
+        os.environ.get("EXL3_BACKEND", "").strip().lower() == "rocm"
+        or os.path.isdir(os.environ.get("ROCM_PATH", "/opt/rocm"))
+    )
+    if not _rocm_intended:
+        print("Cannot precompile unless torch is installed.")
+        print("To explicitly JIT install run EXLLAMA_NOCOMPILE= pip install <xyz>")
+    else:
+        raise SystemExit(
+            "exllamav3: torch is not importable, so no extension would be built\n"
+            "and the install would succeed with nothing in it.\n"
+            "\n"
+            "ROCm was detected on this machine. Install torch from the ROCm index\n"
+            "first, then build against it:\n"
+            "\n"
+            "    pip install -r requirements_rocm.txt\n"
+            "    pip install --no-build-isolation .\n"
+            "\n"
+            "--no-build-isolation is required: pip otherwise builds in an isolated\n"
+            "environment that has no torch, and a torch extension must be compiled\n"
+            "against the same torch it will run against.\n"
+            "\n"
+            "To deliberately install the Python package without the extension, set\n"
+            "EXLLAMA_NOCOMPILE=1."
+        )
 
 windows = os.name == "nt"
 
@@ -46,7 +88,13 @@ def _resolve_backend():
         "CUDA nor HIP. Install a CUDA or ROCm torch build, or set EXL3_BACKEND."
     )
 
-BACKEND = _resolve_backend() if precompile else "cuda"
+# Resolved unconditionally, NOT gated on `precompile`. It used to read
+# `_resolve_backend() if precompile else "cuda"`, which made EXLLAMA_NOCOMPILE
+# silently override both EXL3_BACKEND and the installed torch -- a ROCm machine
+# would configure and announce itself as a CUDA build. The gate was also
+# redundant: _resolve_backend() already returns "cuda" when torch is missing,
+# which is the only case it could have been guarding.
+BACKEND = _resolve_backend()
 IS_ROCM = BACKEND == "rocm"
 print(f"exllamav3: building for backend = {BACKEND}")
 
@@ -78,6 +126,30 @@ ROCM_EXCLUDE = (
     # Replaced by rocm/rope_rdna.hip, which differs by one line: `half2 x = {}`
     # is ambiguous against HIP's assignment overloads. Same exported symbols.
     "rope.cu",
+
+    # --- sources with an _rdna sibling under rocm/ ---
+    #
+    # Each of these reaches inline PTX by *relative quoted* include (ptx.cuh
+    # directly, or codebook.cuh through exl3_dq.cuh), which -I cannot intercept,
+    # so they cannot be shimmed in place. The sibling is built instead and
+    # exports the same symbols. Excluding them is not optional: building both
+    # the upstream source and its sibling is a duplicate-symbol link failure.
+    #
+    # Keep in step with the exclusion regex in rocm_tools/hipcc_probe.sh --
+    # the two are the same statement written twice.
+    "quant/exl3_gemm.cu",        # -> rocm/quant/exl3_gemm_rdna.hip
+    "quant/exl3_gemv.cu",        # -> rocm/quant/exl3_gemv_rdna.hip
+    "quant/exl3_gemv_int8.cu",   # -> rocm/quant/exl3_gemv_int8_rdna.hip (disabled stub)
+    "quant/exl3_kernel_map.cu",  # -> rocm/quant/exl3_kernel_map_rdna.hip
+    "quant/reconstruct.cu",      # -> rocm/quant/reconstruct_rdna.hip
+    "quant/quantize.cu",         # -> rocm/quant/quantize_rdna.hip
+    "cpu/moe_handoff.cu",        # -> rocm/cpu/moe_handoff_rdna.hip
+    # Compiles and links unmodified, but READS SMEM_MAX (via exl3_moe_common.cuh's
+    # 90 KB default) to size the MoE launch, which fails on a 64 KB part.
+    "quant/exl3_moe.cu",         # -> rocm/quant/exl3_moe_rdna.hip
+    # dlopen's libcuda.so.1 by name to resolve the driver API used by the Triton
+    # attention kernels. Only the library name differs on ROCm; see the sibling.
+    "cuda_drv.cpp",              # -> rocm/cuda_drv_rdna.cpp
 )
 
 def _collect_sources():
@@ -110,10 +182,122 @@ if verbose:
 # ROCm build
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Minimum ROCm
+# ---------------------------------------------------------------------------
+# 7.2.4 is a hard floor, not a recommendation. ROCm changed materially between
+# 7.1 and 7.2 in ways this port now depends on -- notably __shfl_*_sync exists
+# and is default-on (rocm/hip_compat.hip.h overrides them rather than defining
+# them, and sets HIP_DISABLE_WARP_SYNC_BUILTINS to win the race), and hipBLAS
+# hgemm is usable. On an older ROCm those overrides land differently and the
+# result compiles but computes the wrong thing, which is the worst failure mode
+# available. Fail the build instead.
+#
+# Parsed from ROCM_PATH/.info/version, which is a bare "7.2.4". hipcc --version
+# reports the HIP runtime version ("7.2.53211") on a different numbering, and
+# torch.version.hip reports that same runtime number, so neither is comparable
+# against a ROCm release version without a mapping table.
+def _build_jobs():
+    """Parallel hipcc jobs. MAX_JOBS overrides, matching torch/flash-attn convention.
+
+    Bounded by RAM as well as cores: hipcc on these template-heavy TUs peaks around
+    2 GB, and -fgpu-rdc keeps device IR live to link time, so a 32-thread machine
+    with 16 GB would OOM long before it ran out of cores. Budgeting ~2.5 GB per job
+    makes the default safe on small machines without throttling large ones.
+    """
+    env = os.environ.get("MAX_JOBS", "").strip()
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            raise SystemExit(f"MAX_JOBS must be an integer, got {env!r}")
+    cpu = os.cpu_count() or 1
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        by_mem = max(1, int(total / (2.5 * 1024 ** 3)))
+    except (ValueError, OSError, AttributeError):
+        by_mem = cpu
+    return max(1, min(cpu, by_mem, 32))
+
+
+MIN_ROCM = (7, 2, 4)
+
+def _rocm_version(rocm_path):
+    info = os.path.join(rocm_path, ".info", "version")
+    try:
+        with open(info, encoding="utf8") as fp:
+            raw = fp.read().strip()
+    except OSError:
+        return None, None
+    # "7.2.4" or "7.2.4-12345"; take the numeric head
+    head = raw.split("-")[0].strip()
+    parts = head.split(".")
+    try:
+        return tuple(int(p) for p in parts[:3]), raw
+    except ValueError:
+        return None, raw
+
+def _check_rocm_version():
+    rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+    ver, raw = _rocm_version(rocm_path)
+    if ver is None:
+        # Unreadable rather than old: warn and continue. Refusing to build on a
+        # layout we simply do not recognise would be worse than letting a
+        # knowledgeable user proceed.
+        print(
+            f"exllamav3: WARNING -- could not read a ROCm version from "
+            f"{rocm_path}/.info/version"
+            + (f" (found {raw!r})" if raw else "")
+            + f"; this port requires ROCm >= {'.'.join(map(str, MIN_ROCM))}. "
+            "Set EXL3_SKIP_ROCM_VERSION_CHECK=1 to silence.",
+            file=sys.stderr,
+        )
+        return
+    if ver < MIN_ROCM and not os.environ.get("EXL3_SKIP_ROCM_VERSION_CHECK"):
+        raise SystemExit(
+            f"exllamav3: ROCm {'.'.join(map(str, ver))} found at {rocm_path}, but this "
+            f"port requires >= {'.'.join(map(str, MIN_ROCM))}.\n"
+            "Older ROCm builds this extension successfully and then computes wrong "
+            "results (the warp-sync intrinsic overrides in rocm/hip_compat.hip.h "
+            "assume 7.2 semantics), so the build stops here rather than shipping "
+            "silently-wrong kernels.\n"
+            "Set EXL3_SKIP_ROCM_VERSION_CHECK=1 to override at your own risk."
+        )
+    print(f"exllamav3: ROCm {'.'.join(map(str, ver))}")
+
+
 SUPPORTED_GPU_ARCHS = {
     # RDNA3 / RDNA3.5 / RDNA4 consumer + APU parts this port targets.
     "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
 }
+
+# LDS (shared memory) per workgroup the EXL3 kernels may assume, per arch.
+#
+# The APUs are the odd ones out: Strix / Strix Halo report sharedMemPerBlock =
+# 65536 (measured on gfx1151), while the discrete parts take upstream's 90 KB.
+# Getting this wrong is not a correctness bug -- exl3_rdna_smem_budget() clamps
+# to the device's real sharedMemPerBlock at runtime and shape admission uses the
+# clamped value -- but too high a figure costs a failed shape selection and too
+# low costs the wider tiles.
+GPU_ARCH_SMEM = {
+    "gfx1100": 92160, "gfx1101": 92160, "gfx1102": 92160,
+    "gfx1150": 65536, "gfx1151": 65536,   # Strix / Strix Halo APUs
+    "gfx1200": 92160, "gfx1201": 92160,
+}
+DEFAULT_ARCH_SMEM = 65536   # unknown arch: assume the smaller budget
+
+
+def _resolve_smem_max(archs):
+    """LDS budget for a build targeting `archs`.
+
+    A fat binary shares one shape table and one set of kernel instantiations
+    across every arch in it, so the budget has to satisfy the *smallest* target.
+    Empty list = hipcc auto-detect, where the targets are unknown at configure
+    time, so take the conservative value.
+    """
+    if not archs:
+        return DEFAULT_ARCH_SMEM
+    return min(GPU_ARCH_SMEM.get(a, DEFAULT_ARCH_SMEM) for a in archs)
 
 def _resolve_offload_archs():
     """Pin --offload-arch so hipcc does not try to build for every installed GPU."""
@@ -179,11 +363,23 @@ class HIPBuildExtension(build_ext):
         ext_path = self.get_ext_fullpath(ext.name)
         os.makedirs(os.path.dirname(ext_path), exist_ok=True)
 
+        # Before anything is compiled: an old ROCm builds this fine and then
+        # computes wrong results, so the failure has to happen here.
+        _check_rocm_version()
+
         archs = _resolve_offload_archs()
+        smem_max = _resolve_smem_max(archs)
         print(f"exllamav3: offload archs = {archs or '(hipcc auto-detect)'}")
+        print(f"exllamav3: LDS budget = {smem_max} bytes ({smem_max // 1024} KB)")
 
         defines = [
             "-DUSE_ROCM=1",
+            # Applied to BOTH compiler passes deliberately. This cannot be an
+            # arch macro: __gfx1151__ and friends exist only in the device pass,
+            # and the value is also needed by host code (shape admission, launch
+            # sizing), so an #if would give the two passes different budgets in
+            # one build. See EXL3_RDNA_SMEM_MAX in rocm/quant/exl3_kernel_map_rdna.hip.h.
+            f"-DEXL3_RDNA_SMEM_MAX={smem_max}",
             "-D__HIP_PLATFORM_AMD__=1",
             "-DHIPBLAS_V2",
             "-DHIPBLAS_USE_HIP_HALF",
@@ -198,6 +394,27 @@ class HIPBuildExtension(build_ext):
             "-DTORCH_API_INCLUDE_EXTENSION_H",
             f"-DTORCH_EXTENSION_NAME={ext.name}",
         ]
+
+        # MoE tile-K. Default (32, upstream's value) lives in
+        # rocm/quant/exl3_moe_shape_rdna.hip.h. Like EXL3_RDNA_SMEM_MAX it must
+        # reach BOTH passes: the device pass compiles the kernel with it, and the
+        # host pass derives blockDim from it, so a define that reached only one
+        # would produce a silently mismatched launch rather than a compile error.
+        #
+        # 16 forces the single-K path -- the tile geometry every RDNA GEMM shape is
+        # validated on. Split-K held two defects (both fixed 2026-08-07) that were
+        # invisible at TILEBLOCKS_K == 1, so this is the first bisect step if fused
+        # MoE output ever looks wrong again. It costs ~1.4-1.6x MoE throughput.
+        moe_tk = os.environ.get("EXL3_RDNA_MOE_TILESIZE_K", "").strip()
+        if moe_tk:
+            if moe_tk not in ("16", "32"):
+                raise SystemExit(
+                    f"EXL3_RDNA_MOE_TILESIZE_K must be 16 or 32, got {moe_tk!r}"
+                )
+            if moe_tk == "16":
+                print("exllamav3: MoE tile-K forced to 16 (single-K path, "
+                      "~1.4-1.6x slower MoE -- bisect setting)")
+            defines.append(f"-DEXL3_RDNA_MOE_TILESIZE_K={moe_tk}")
 
         # Warnings from code we do not own, which otherwise fire by the thousand.
         quiet = [] if os.environ.get("EXLLAMA_VERBOSE_BUILD") == "1" else [
@@ -244,18 +461,58 @@ class HIPBuildExtension(build_ext):
         # Host sources also go through hipcc: hip_compat.hip.h transitively pulls
         # <hip/hip_bf16.h>, which uses clang __builtin_elementwise_* intrinsics
         # that g++ does not implement.
+        #
+        # Compiled in parallel. The CUDA path gets this free from ninja via
+        # torch's BuildExtension; this builder drives hipcc directly and so has to
+        # do it itself. Serially this is ~25 min for ~100 sources on a 32-thread
+        # box with 31 threads idle -- the single largest cost of a source install.
+        #
+        # Threads, not processes: each task is a subprocess.run that blocks on an
+        # external compiler, so the GIL is released for essentially the whole task.
+        jobs = _build_jobs()
+        work = []
         for group, flags, label in ((cpp_sources, common, "cpp"), (gpu_sources, hip_flags, "hip")):
             for src in group:
                 obj = os.path.join(build_temp, src.replace(os.sep, "_") + ".o")
                 os.makedirs(os.path.dirname(obj), exist_ok=True)
-                cmd = ["hipcc", "-c", src, "-o", obj] + flags + includes + defines
+                work.append((label, src, obj, ["hipcc", "-c", src, "-o", obj] + flags + includes + defines))
+
+        # Object order is fixed here rather than by completion order, so the link
+        # line is identical run to run regardless of how the pool interleaves.
+        objs = [w[2] for w in work]
+        print(f"exllamav3: compiling {len(work)} sources with {jobs} parallel job(s)", flush=True)
+
+        done = [0]
+        lock = threading.Lock()
+
+        def _compile(item):
+            label, src, obj, cmd = item
+            proc = subprocess.run(cmd, capture_output = True, text = True)
+            with lock:
+                done[0] += 1
                 if verbose:
-                    print(f"[{label}] {src}")
+                    print(f"[{label}] ({done[0]}/{len(work)}) {src}")
                     print("  " + " ".join(cmd))
                 else:
-                    print(f"[{label}] {src}", flush=True)
-                subprocess.check_call(cmd)
-                objs.append(obj)
+                    print(f"[{label}] ({done[0]}/{len(work)}) {src}", flush=True)
+                # Warnings are captured too, so surface them next to their source
+                # rather than interleaved with whatever else was in flight.
+                if proc.stderr and (verbose or proc.returncode != 0):
+                    sys.stderr.write(proc.stderr)
+            if proc.returncode != 0:
+                raise RuntimeError(f"hipcc failed on {src}")
+
+        if jobs > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers = jobs) as pool:
+                futures = [pool.submit(_compile, w) for w in work]
+                errors = [f.exception() for f in concurrent.futures.as_completed(futures)]
+            errors = [e for e in errors if e]
+            if errors:
+                # One line, not a stack of tracebacks from every worker that died.
+                raise SystemExit(f"exllamav3: build failed -- {errors[0]}")
+        else:
+            for w in work:
+                _compile(w)
 
         lib_args = [
             f"-L{os.path.join(self._torch_path, 'lib')}",
@@ -331,6 +588,30 @@ else:
         "cmdclass": {"build_ext": cpp_extension.BuildExtension},
     }
 
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+# On ROCm, "torch" is dropped from install_requires. PyPI's torch is the CUDA
+# build; ROCm torch comes from download.pytorch.org/whl/rocmX.Y and carries the
+# same version string. A plain `pip install .` would therefore see the
+# requirement as satisfiable from PyPI and could pull the CUDA wheel straight
+# over a working ROCm install -- turning a build into a broken environment.
+#
+# Dropping it is safe here in a way it would not be generally: a ROCm build
+# cannot even be configured without torch already importable (setup.py imports
+# it for the include paths and the backend probe), so the dependency is
+# structurally guaranteed rather than merely declared.
+#
+# requirements_rocm.txt carries the real ROCm install line, index URL included.
+def _install_requires(reqs):
+    if not IS_ROCM:
+        return reqs
+    kept = [r for r in reqs if not r.split(">=")[0].split("==")[0].strip() == "torch"]
+    print("exllamav3: ROCm build -- 'torch' omitted from install_requires "
+          "(see requirements_rocm.txt); install ROCm torch first")
+    return kept
+
+
 version_py = {}
 with open("exllamav3/version.py", encoding="utf8") as fp:
     exec(fp.read(), version_py)
@@ -361,11 +642,28 @@ setup(
         "exllamav3.cache",
         "exllamav3.loader",
         "exllamav3.util",
+        # Shipped on BOTH backends, deliberately. It is pure Python whose first
+        # act is `if not is_rocm(): return`, so it costs a CUDA install one inert
+        # import and nothing else. Making it ROCm-only would mean the
+        # `from .rocm_py import apply` in exllamav3/__init__.py has to become
+        # conditional -- i.e. a second upstream file carrying a permanent ROCm
+        # edit, to save ~8 KB. The build side is where the backends genuinely
+        # separate: _collect_sources() drops the whole rocm/ tree and every .hip
+        # file on CUDA, and none of the ROCm flags, include paths or the
+        # hip_compat force-include exist outside the HIPBuildExtension branch.
+        "exllamav3.rocm_py",
     ],
     url="https://github.com/turboderp-org/exllamav3",
     license="MIT",
     author="turboderp",
-    install_requires=[
+    # Declared so an unsupported interpreter fails here, with a message naming
+    # Python, rather than later as "No matching distribution found for torch" --
+    # which is what a user on an interpreter the ROCm wheel index does not yet
+    # publish for actually hits, and which reads like a broken requirements file.
+    # The floor is upstream's; the practical ceiling is whatever
+    # download.pytorch.org/whl/rocmX.Y has a cp3XX wheel for.
+    python_requires=">=3.10",
+    install_requires=_install_requires([
         "torch>=2.6.0",
         "tokenizers>=0.21.1",
         "numpy>=2.1.0",
@@ -379,7 +677,7 @@ setup(
         "pydantic",
         "llguidance>=1.7.0",
         "flash-linear-attention>=0.5.0",
-    ],
+    ]),
     include_package_data=True,
     package_data={
         "": ["py.typed"],
