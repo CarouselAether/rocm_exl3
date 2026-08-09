@@ -215,7 +215,20 @@ and it is not register pressure, not dequant, and not bandwidth:
 |---|---|---|---|---|
 | 1 (N=128) | 144 | 481.5 us | 12.16% | 46.40% |
 | 4 (N=512, selected) | 248 | 251.2 us | 11.88% | 25.89% |
-| 3 (N=384) | 256 | 211.8 us | 11.66% | 32.05% |
+| 3 (N=384) | 256 | ~~211.8 us~~ INVALID | 11.66% | 32.05% |
+
+**Shape 3's timings in these tables are truncation artifacts, discovered after
+they were first written up.** The inner kernel floors `size_n / TILESIZE_N`
+with no remainder pass, and 1024 % 384 != 0, so a forced shape 3 computed 768
+of 1024 columns per expert -- 75% of the work in 84% of the time, i.e. *slower*
+per useful byte than shape 4. The occupancy/MemUnitBusy counters are still
+valid (the kernel that ran, ran at ~12%); the duration and any GB/s derived
+from it are not comparable. Forced shapes that do not divide the problem are
+now rejected outright (`select_exl3_*gemm_kernel`), the selector's
+compatibility check is per-matrix (it was computed on the bszm-scaled width,
+which admits tiles that truncate every matrix, e.g. N=1024 x 3 experts for the
+384 tile), and `bench_mgemm.py` NaN-fills C and verifies coverage before
+timing anything.
 
 Occupancy is ~12% at VGPR 144, 248 **and** 256, so registers are not the cap.
 `Grid_Size` is 5120 *threads* = 20 workgroups of 256, which is exactly
@@ -237,9 +250,14 @@ Two waves per SIMD is far too few to keep loads in flight, which is why
 `MemUnitBusy` sits at 26-32% and the achieved rate is 55-66 GB/s against the
 206 GB/s roofline.
 
-**`force_num_sms` is inert in the mgemm path** -- `num_sms = tiles` overwrites it
-unconditionally. Sweeping it 20/40/80/160/320 changes nothing. Do not use it as a
-diagnostic here; it looks like a knob and is not one.
+**`force_num_sms` in the mgemm path** used to be inert -- `num_sms = tiles`
+overwrote it unconditionally, so sweeping it 20/40/80/160/320 changed nothing
+and looked like evidence the grid size did not matter. It is honoured now
+(exactly as given; an oversubscribed value gets the runtime's cooperative-launch
+refusal, which is the informative outcome a sweep wants). Measured after the
+fix: the default sizing (grid 4x5 for 10 experts) beats every forced value
+tried (0: 282.6 us; 5: 341.8; 10: 315.7; 20: 407.2), consistent with the
+co-residency ceiling being the binding constraint.
 
 **The grid cannot simply be widened.** `EXL3_RDNA_SMS_MULT` (added for this
 experiment, default 1 = no change) multiplies `total_sms`. At 2 the runtime
@@ -251,19 +269,26 @@ VGPR use allows only one workgroup per WGP. The lighter shapes do accept it:
 |---|---|---|---|
 | 1 (N=128) | 29.1 GB/s | 45.2 GB/s | 1.55x |
 | 2 (N=256) | 44.7 GB/s | 61.7 GB/s | 1.38x |
-| 3 (N=384) | **66.2 GB/s** | refused | best overall |
-| 4 (N=512) | 55.5 GB/s | refused | what the selector picks |
+| 3 (N=384) | ~~66.2 GB/s~~ INVALID | refused | truncation artifact, see above |
+| 4 (N=512) | 55.5 GB/s | refused | what the selector picks -- correctly |
 
 So 20 blocks is the genuine co-residency limit, not a WGP-vs-CU miscount.
 
-**Two conclusions.** First, a cheap one: the shape selector picks N=512 at m == 1
-where N=384 is 19% faster (237.8 vs 283.6 us). Narrower is *not* monotonically
-better -- N=128 is the worst of the four -- so this needs a measured rule, not a
-heuristic. Second, the structural one: **the cooperative GEMM cannot exceed ~1/3
-of roofline at m == 1 on this part, because it cannot oversubscribe.** Tuning
-inside it is worth ~19%; the rest requires a plain-launch path. The RDNA GEMV is
-exactly that and reaches 203 GB/s (the roofline) on lm_head, so the target is a
-non-cooperative multi-matrix GEMV for m == 1, not a better-tuned cooperative GEMM.
+**One conclusion, not two.** The write-up originally drew a second, cheap
+conclusion here -- "the selector picks N=512 where N=384 is 19% faster, worth
+~8% of decode" -- which is dead: the shape-3 numbers were truncation artifacts
+(see above), and among the shapes that actually compute the full output the
+selector's pick was the fastest all along (55.7 vs 44.1 vs 30.0 GB/s for
+shapes 4/2/1, re-measured under the coverage check). What survives is the
+structural conclusion, now with nothing left to soften it: **the cooperative
+GEMM cannot exceed ~1/3 of roofline at m == 1 on this part, because it cannot
+oversubscribe, and there is no tuning inside it worth having.** The RDNA GEMV
+is a plain launch and reaches 203 GB/s (the roofline) on lm_head, so the fix is
+the non-cooperative multi-matrix GEMV for m == 1 -- implemented as
+`quant/exl3_mgemv_rdna.hip`, see its header comment for the design (plain-
+launch pipeline of four kernels, expert axis on grid.y, graph patching through
+a prologue-published device parameter block, cooperative-identical packing and
+reduction semantics).
 
 ## Profiling on this machine
 
