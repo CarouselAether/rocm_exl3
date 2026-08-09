@@ -290,6 +290,46 @@ launch pipeline of four kernels, expert axis on grid.y, graph patching through
 a prologue-published device parameter block, cooperative-identical packing and
 reduction semantics).
 
+## The barrier-free dot-tile core (2026-08-08, second session)
+
+Two findings from profiling dense Gemma-4-31B decode after the split-K session:
+
+- **Decode runs ZERO cooperative kernels on a dense model.** Every coop call in
+  a 24-token profile belonged to the prompt's prefill. The previous handoff's
+  theory — that Gemma sat flat at 4.7 t/s because fused q/k/v with per-matrix
+  width lists (`size_n_list`/`c_ptrs`) declines to the cooperative kernel — was
+  wrong: Gemma's fused qg/kv/gate-up mgemm calls pass **no** lists (the lists
+  form is used only by DS4's `bc_dsa.py` fan/fan2 sites). Gemma was already
+  fully on the GEMV paths.
+- What actually capped it: **the LDS dot-tile core ran 129–148 GB/s** on
+  Gemma's mid shapes while the identical core hit 207 GB/s on the lm_head
+  shape. The per-k-tile round trip (stage quantized → dq → `__shfl_down`
+  unswizzle → LDS scatter → `__syncwarp` → LDS gather → dot, lanes 16-31 idle
+  in the dot) was the cost.
+
+The fix is `exl3_gemv_dot_tile_direct` (exl3_gemv_kernel_rdna.hip.h): keep the
+accumulation in dq's native fragment layout — lane L holds rows
+`(L%4)*2+{0,1,8,9}` of columns `(L/8)*2+((L>>2)&1)` and `+8` — so each k-tile
+is 4 `v_dot2_f32_f16` per lane with B read straight from global, no LDS, no
+barriers, no idle lanes. One 2-hop `__shfl_xor` quad reduction and a broadcast
+remap at the END of the k-range restore the "lane l returns column l" contract,
+so all six kernel wrappers (single/split-K x plain/graph/mgemv) take either
+core. Runtime selection via the kernels' trailing `lds_core` argument
+(`EXL3_GEMV_LDS=1` pins the old core; default is the direct core); smem is
+passed identically in both modes — LDS was never the occupancy limiter, and
+keeping the carve fixed leaves the graph patch sites untouched.
+
+Validated: `gemv_check.hip` (now runs every case on both cores) — all bits,
+codebooks, wave counts, dtypes pass, direct core slightly tighter;
+`mgemv_check.py` on Laguna — all routing configs pass; fp32 ground-truth
+parity on real Gemma weights — both cores rms 6e-4 from reference. Measured on
+real Gemma weights (m=1, whole dispatch): 5376→8192 **1.49x** (238 GB/s
+effective), 8192→5376 1.45x (228), 21504→5376 1.41x (177), 5376→21504 1.12x
+(158), lm_head 1.18x (225). Remaining headroom in the core: software-pipeline
+the B loads, then VOPD dual-issue interleaving (ISA doc in
+`exlproject/rocm_docs`); the wide gate/up shape (158 GB/s) suggests re-sweeping
+warps/block and the split-K threshold with the new core.
+
 ## Profiling on this machine
 
 rocprofv3 works, with three constraints found the hard way:

@@ -229,6 +229,104 @@ __device__ __forceinline__ float exl3_gemv_dot_tile
 }
 
 // =============================================================================
+// Barrier-free dot-tile core -- accumulates in dq's native fragment layout
+// =============================================================================
+//
+// The LDS core above spends most of each k-iteration on the unswizzle round
+// trip: stage quantized -> dq -> __shfl_down -> LDS scatter -> __syncwarp ->
+// LDS gather -> dot, with lanes 16-31 idle in the dot phase. This core deletes
+// all of it by never leaving dq's output layout. Derivation, re-verified
+// against the unswizzle above (and matching the workspace m1_dot sketch):
+//
+//   dq_dispatch<bits,cb>(b_tile, L << 3, frag0, frag1) hands lane L the 16x16
+//   (K x N) tile elements
+//     frag0[0] = ( B[r0  ][cA], B[r0+1][cA] )      r0 = (L % 4) * 2
+//     frag0[1] = ( B[r0+8][cA], B[r0+9][cA] )      cA = (L / 8) * 2 + ((L >> 2) & 1)
+//     frag1[0] = ( B[r0  ][cB], B[r0+1][cB] )      cB = cA + 8
+//     frag1[1] = ( B[r0+8][cB], B[r0+9][cB] )
+//
+//   (The unswizzle writes lane L's frag0[0] to column (L/8)*2 when L&4 == 0 and
+//   routes it through __shfl_down(,4) to column (L/8)*2+1 when L&4 == 4 --
+//   i.e. source lane S holds column (S/8)*2 + ((S>>2)&1). Rows follow (S%4)*2
+//   because S%4 == (S+4)%4.)
+//
+//   So column cA is held by exactly the lane quad {4*cA .. 4*cA+3}, whose four
+//   lanes cover rows {0..7} x {+0,+8} between them, and every lane does useful
+//   work. Two fdot2 per fragment pair against A rows (r0, r0+1) and (r0+8,
+//   r0+9), a 2-hop __shfl_xor quad reduction ONCE at the end of the k-range
+//   (not per tile), and a broadcast remap so lanes 0-15 return columns 0-15 --
+//   the same contract as the LDS core, so every kernel wrapper takes either.
+//
+// B is read directly from global: a tile is 32*bits contiguous bytes, the warp
+// collectively touches every byte exactly once, and L0 serves the overlapping
+// lane reads. A is read per-lane (two half2 loads); quads repeat the same 32
+// bytes and hit L0. No LDS, no barriers, no idle lanes.
+//
+// Selected at runtime by the kernels' trailing lds_core argument (see
+// exl3_gemv_lds_core() -- EXL3_GEMV_LDS=1 pins the LDS core). All 32 lanes
+// must enter (the reduction shuffles use the full warp).
+
+template <int bits, int cb>
+__device__ __forceinline__ float exl3_gemv_dot_tile_direct
+(
+    const half* __restrict__ A,        // rotated input, [size_k]
+    const uint16_t* __restrict__ B,    // quantized trellis for one matrix
+    const int n_tiles,                 // size_n / 16 for THIS matrix
+    const int tile_n,                  // this warp's N-tile
+    const int lane,
+    const int kb_begin,                // k16-tile range for THIS warp
+    const int kb_end
+)
+{
+    constexpr int tile_elements = 16 * bits;
+
+    const int r0 = (lane & 3) * 2;
+
+    float accA = 0.0f;                 // column cA
+    float accB = 0.0f;                 // column cB = cA + 8
+
+    for (int k_tile = kb_begin; k_tile < kb_end; k_tile++)
+    {
+        const uint32_t* b_ptr = (const uint32_t*)
+            (B + (k_tile * n_tiles + tile_n) * tile_elements);
+
+        FragB frag0, frag1;
+        dq_dispatch<bits, cb>(b_ptr, lane << 3, frag0, frag1);
+
+        const half2* a2 = (const half2*) (A + k_tile * 16);
+        half2 a01 = a2[r0 >> 1];             // (A[r0],   A[r0+1])
+        half2 a89 = a2[(r0 >> 1) + 4];       // (A[r0+8], A[r0+9])
+
+        accA = __builtin_amdgcn_fdot2(a01, frag0[0], accA, false);
+        accA = __builtin_amdgcn_fdot2(a89, frag0[1], accA, false);
+        accB = __builtin_amdgcn_fdot2(a01, frag1[0], accB, false);
+        accB = __builtin_amdgcn_fdot2(a89, frag1[1], accB, false);
+    }
+
+    // Quad reduction: after two xor hops every lane of quad g holds the full
+    // sum for columns g (accA) and g+8 (accB)
+    accA += __shfl_xor(accA, 1, 32);
+    accA += __shfl_xor(accA, 2, 32);
+    accB += __shfl_xor(accB, 1, 32);
+    accB += __shfl_xor(accB, 2, 32);
+
+    // Remap to the LDS core's contract: lane l (0-15) returns column l.
+    // Column c < 8 lives in quad 4c (accA); column c >= 8 in quad 4*(c-8)
+    // (accB). Lanes 16-31 return a defined but meaningless value, as before.
+    float vA = __shfl(accA, (lane & 7) * 4, 32);
+    float vB = __shfl(accB, (lane & 7) * 4, 32);
+    return (lane & 8) ? vB : vA;
+}
+
+// Defined in exl3_gemv_rdna.hip; EXL3_GEMV_LDS=1 pins the LDS core in every
+// GEMV form (the A/B and kill switch for the barrier-free core). Re-read per
+// call. Kernels take the result as their trailing lds_core argument -- runtime
+// rather than a template split so the instantiation count stays put; the LDS
+// high-water mark is unchanged (smem is passed identically in both modes) and
+// LDS was never the occupancy limiter for these kernels.
+bool exl3_gemv_lds_core();
+
+// =============================================================================
 // Dot-product GEMV kernel -- templated on WARPS_PER_BLOCK
 // =============================================================================
 
@@ -242,7 +340,8 @@ void exl3_gemv_dot_kernel
     const uint16_t* __restrict__ B,
     void* __restrict__ C,
     const int size_k,
-    const int size_n
+    const int size_n,
+    const bool lds_core
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -265,11 +364,16 @@ void exl3_gemv_dot_kernel
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
-    float accum = exl3_gemv_dot_tile<bits, cb>
-    (
-        A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
-        0, size_k / 16
-    );
+    float accum = lds_core
+        ? exl3_gemv_dot_tile<bits, cb>
+          (
+              A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
+              0, size_k / 16
+          )
+        : exl3_gemv_dot_tile_direct<bits, cb>
+          (
+              A, B, n_tiles, tile_n, lane, 0, size_k / 16
+          );
 
     // =========================================================================
     // Step 4: Write output
@@ -324,7 +428,8 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_splitk
     const int lane,
     half* my_sh_b,
     uint16_t* my_sh_b_quant,
-    float* sh_red                      // WARPS_PER_BLOCK * 16 floats
+    float* sh_red,                     // WARPS_PER_BLOCK * 16 floats
+    const bool lds_core
 )
 {
     const int num_k_tiles = size_k / 16;
@@ -334,11 +439,16 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_splitk
 
     float accum = 0.0f;
     if (kb0 < kb1)
-        accum = exl3_gemv_dot_tile<bits, cb>
-        (
-            A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
-            kb0, kb1
-        );
+        accum = lds_core
+            ? exl3_gemv_dot_tile<bits, cb>
+              (
+                  A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
+                  kb0, kb1
+              )
+            : exl3_gemv_dot_tile_direct<bits, cb>
+              (
+                  A, B, n_tiles, tile_n, lane, kb0, kb1
+              );
 
     if (lane < 16) sh_red[warp_id * 16 + lane] = accum;
     __syncthreads();
@@ -372,7 +482,8 @@ void exl3_gemv_dot_kernel_splitk
     const uint16_t* __restrict__ B,
     void* __restrict__ C,
     const int size_k,
-    const int size_n
+    const int size_n,
+    const bool lds_core
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -392,7 +503,8 @@ void exl3_gemv_dot_kernel_splitk
 
     float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
     (
-        A, B, size_k, n_tiles, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant, sh_red
+        A, B, size_k, n_tiles, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant,
+        sh_red, lds_core
     );
 
     if (warp_id == 0 && lane < 16)

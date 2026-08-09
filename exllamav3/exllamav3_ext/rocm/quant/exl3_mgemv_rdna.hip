@@ -246,7 +246,8 @@ void exl3_mgemv_dot_kernel
     const int size_n,
     const int bszm,
     const int min_index,
-    const int max_index
+    const int max_index,
+    const bool lds_core
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -273,11 +274,16 @@ void exl3_mgemv_dot_kernel
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
-    float accum = exl3_gemv_dot_tile<bits, cb>
-    (
-        A_j, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
-        0, size_k / 16
-    );
+    float accum = lds_core
+        ? exl3_gemv_dot_tile<bits, cb>
+          (
+              A_j, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
+              0, size_k / 16
+          )
+        : exl3_gemv_dot_tile_direct<bits, cb>
+          (
+              A_j, B, n_tiles, tile_n, lane, 0, size_k / 16
+          );
 
     if (lane < 16)
     {
@@ -307,7 +313,8 @@ void exl3_mgemv_dot_kernel_splitk
     const int size_n,
     const int bszm,
     const int min_index,
-    const int max_index
+    const int max_index,
+    const bool lds_core
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -334,7 +341,8 @@ void exl3_mgemv_dot_kernel_splitk
 
     float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
     (
-        A_j, B, size_k, n_tiles, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant, sh_red
+        A_j, B, size_k, n_tiles, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant,
+        sh_red, lds_core
     );
 
     if (warp_id == 0 && lane < 16)
@@ -542,6 +550,7 @@ bool exl3_mgemv_try_launch
     {
         int n_tiles = size_n / 16;
         bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
+        const bool lds_core = exl3_gemv_lds_core();
 
         dim3 grid(splitk ? n_tiles : CEIL_DIVIDE(n_tiles, EXL3_MGEMV_WARPS), bszm);
         dim3 block(EXL3_MGEMV_WARPS * 32);
@@ -553,12 +562,12 @@ bool exl3_mgemv_try_launch
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, true, codebook, EXL3_MGEMV_WARPS>), \
                     grid, block, smem, stream, \
-                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index); \
+                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, lds_core); \
             } else { \
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, false, codebook, EXL3_MGEMV_WARPS>), \
                     grid, block, smem, stream, \
-                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index); \
+                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, lds_core); \
             }
 
         #define LAUNCH_MGEMV_CB(bits_val, codebook) \

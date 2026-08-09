@@ -70,6 +70,16 @@ bool exl3_gemv_splitk_enabled()
     return atoi(env) != 0;
 }
 
+// EXL3_GEMV_LDS = 1 pins the LDS dot-tile core in every GEMV form -- the A/B
+// and kill switch for the barrier-free core (exl3_gemv_dot_tile_direct).
+// Re-read per call; graph captures bake the value read at capture time.
+bool exl3_gemv_lds_core()
+{
+    const char* env = std::getenv("EXL3_GEMV_LDS");
+    if (!env) return false;
+    return atoi(env) != 0;
+}
+
 // -----------------------------------------------------------------------------
 // Eligibility
 // -----------------------------------------------------------------------------
@@ -190,17 +200,19 @@ static void exl3_gemv_rdna_launch
         shared_mem_size = exl3_gemv_smem_bytes_splitk(warps_per_block);
     }
 
+    const bool lds_core = exl3_gemv_lds_core();
+
     #define LAUNCH_GEMV_WAVES_K(bits_val, codebook, warps, kernel_name) \
         if (c_fp32) { \
             hipLaunchKernelGGL( \
                 (kernel_name<bits_val, true, codebook, warps>), \
                 dim3(num_blocks), dim3(warps * 32), shared_mem_size, stream, \
-                gemv_input, B_ptr, C_ptr, size_k, size_n); \
+                gemv_input, B_ptr, C_ptr, size_k, size_n, lds_core); \
         } else { \
             hipLaunchKernelGGL( \
                 (kernel_name<bits_val, false, codebook, warps>), \
                 dim3(num_blocks), dim3(warps * 32), shared_mem_size, stream, \
-                gemv_input, B_ptr, C_ptr, size_k, size_n); \
+                gemv_input, B_ptr, C_ptr, size_k, size_n, lds_core); \
         }
 
     #define LAUNCH_GEMV_WAVES(bits_val, codebook, warps) \
@@ -503,7 +515,8 @@ void exl3_gemv_graph_dot_kernel
 (
     const Exl3GemvGraphParams* __restrict__ pb,
     const int size_k,
-    const int size_n
+    const int size_n,
+    const bool lds_core
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -519,11 +532,16 @@ void exl3_gemv_graph_dot_kernel
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
-    float accum = exl3_gemv_dot_tile<bits, cb>
-    (
-        pb->A_had, pb->B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
-        0, size_k / 16
-    );
+    float accum = lds_core
+        ? exl3_gemv_dot_tile<bits, cb>
+          (
+              pb->A_had, pb->B, size_k, n_tiles, tile_n, lane, my_sh_b,
+              my_sh_b_quant, 0, size_k / 16
+          )
+        : exl3_gemv_dot_tile_direct<bits, cb>
+          (
+              pb->A_had, pb->B, n_tiles, tile_n, lane, 0, size_k / 16
+          );
 
     if (lane < 16)
     {
@@ -543,7 +561,8 @@ void exl3_gemv_graph_dot_kernel_splitk
 (
     const Exl3GemvGraphParams* __restrict__ pb,
     const int size_k,
-    const int size_n
+    const int size_n,
+    const bool lds_core
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -562,7 +581,7 @@ void exl3_gemv_graph_dot_kernel_splitk
     float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
     (
         pb->A_had, pb->B, size_k, n_tiles, tile_n, warp_id, lane,
-        my_sh_b, my_sh_b_quant, sh_red
+        my_sh_b, my_sh_b_quant, sh_red, lds_core
     );
 
     if (warp_id == 0 && lane < 16)
@@ -679,17 +698,19 @@ bool exl3_gemv_graph_try_launch
             smem = exl3_gemv_smem_bytes_splitk(warps_per_block);
         }
 
+        const bool lds_core = exl3_gemv_lds_core();
+
         #define LAUNCH_GGEMV_WAVES_K(bits_val, codebook, warps, kernel_name) \
             if (c_fp32) { \
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, true, codebook, warps>), \
                     dim3(num_blocks), dim3(warps * 32), smem, stream, \
-                    pb, size_k, size_n); \
+                    pb, size_k, size_n, lds_core); \
             } else { \
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, false, codebook, warps>), \
                     dim3(num_blocks), dim3(warps * 32), smem, stream, \
-                    pb, size_k, size_n); \
+                    pb, size_k, size_n, lds_core); \
             }
 
         #define LAUNCH_GGEMV_WAVES(bits_val, codebook, warps) \

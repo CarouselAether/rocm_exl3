@@ -142,9 +142,18 @@ void run_case(int size_k, int size_n)
     const int num_blocks = (n_tiles + WARPS - 1) / WARPS;
     const size_t smem = exl3_gemv_smem_bytes(WARPS);
 
+    // Both dot-tile cores: core=0 is the barrier-free direct core (the runtime
+    // default), core=1 the LDS core (EXL3_GEMV_LDS=1). Same reference, same
+    // gates -- the direct core's whole risk is its layout claims, which show
+    // up here as gross error, not as a tolerance miss.
+    for (int core = 0; core < 2; core++)
+    {
+    const bool lds_core = core != 0;
+    (void) hipMemset(dC, 0, (size_t) size_n * 4);
+
     hipLaunchKernelGGL((exl3_gemv_dot_kernel<bits, CFP32, cb, WARPS>),
                        dim3(num_blocks), dim3(WARPS * 32), smem, 0,
-                       dA, dBq, dC, size_k, size_n);
+                       dA, dBq, dC, size_k, size_n, lds_core);
     hipError_t err = hipDeviceSynchronize();
 
     std::vector<float> got((size_t) size_n);
@@ -178,12 +187,14 @@ void run_case(int size_k, int size_n)
     rms_ref = sqrt(rms_ref / ref.size());
     rms_err = sqrt(rms_err / ref.size());
 
-    printf("  bits=%d cb=%d waves=%-2d %s k=%-5d n=%-5d %s  "
+    printf("  bits=%d cb=%d waves=%-2d %s %s k=%-5d n=%-5d %s  "
            "err/RMS=%.5f  worst_rel=%.4f  outliers=%d\n",
-           bits, cb, WARPS, CFP32 ? "fp32" : "fp16", size_k, size_n,
+           bits, cb, WARPS, lds_core ? "lds " : "dir ",
+           CFP32 ? "fp32" : "fp16", size_k, size_n,
            err == hipSuccess ? "ok  " : hipGetErrorString(err),
            rms_ref > 0 ? rms_err / rms_ref : 0.0, max_rel, bad);
     if (err != hipSuccess || bad) g_fail++;
+    }
 
     (void) hipFree(dBq); (void) hipFree(dA); (void) hipFree(dW); (void) hipFree(dC);
 }
@@ -200,7 +211,7 @@ void run_case(int size_k, int size_n)
 // ---------------------------------------------------------------------------
 
 template <int bits, int cb, int WARPS>
-void run_bench(int size_k, int size_n, int reps)
+void run_bench(int size_k, int size_n, int reps, bool lds_core = false)
 {
     const int k_blocks = size_k / 16;
     const int blocks_n = size_n / 16;
@@ -220,7 +231,7 @@ void run_bench(int size_k, int size_n, int reps)
     auto once = [&]() {
         hipLaunchKernelGGL((exl3_gemv_dot_kernel<bits, true, cb, WARPS>),
                            dim3(num_blocks), dim3(WARPS * 32), smem, 0,
-                           dA, dBq, dC, size_k, size_n);
+                           dA, dBq, dC, size_k, size_n, lds_core);
     };
 
     once(); (void) hipDeviceSynchronize();          // warm up, discarded
@@ -241,9 +252,10 @@ void run_bench(int size_k, int size_n, int reps)
     double spread = (ms.back() - ms.front()) / med * 100.0;
     double b_gb = (double) size_k * size_n * bits / 8.0 / 1e9;
 
-    printf("  bits=%d waves=%-2d k=%-5d n=%-5d  best=%7.3f ms  med=%7.3f ms  "
+    printf("  bits=%d waves=%-2d %s k=%-5d n=%-5d  best=%7.3f ms  med=%7.3f ms  "
            "spread=%5.1f%%  B-read %6.1f GB/s\n",
-           bits, WARPS, size_k, size_n, best, med, spread, b_gb / (best / 1000.0));
+           bits, WARPS, lds_core ? "lds" : "dir",
+           size_k, size_n, best, med, spread, b_gb / (best / 1000.0));
 
     (void) hipFree(dBq); (void) hipFree(dA); (void) hipFree(dC);
 }
@@ -290,14 +302,20 @@ int main()
     // Decode shapes: k x n as they appear in attention projections and FFN.
     // Wave count follows the host selector: n_tiles <= 32 -> 16, n_tiles <= 96
     // and k_blocks <= 256 -> 8, else 4.
-    printf("\nbandwidth, 4 bpw, 9 reps\n");
+    printf("\nbandwidth, 4 bpw, 9 reps (dir = barrier-free core, lds = LDS core)\n");
     run_bench<4, 0, 16>(4096, 512,  9);    // n_tiles 32
+    run_bench<4, 0, 16>(4096, 512,  9, true);
     run_bench<4, 0, 8 >(4096, 1536, 9);    // n_tiles 96, k_blocks 256
+    run_bench<4, 0, 8 >(4096, 1536, 9, true);
     run_bench<4, 0, 4 >(4096, 4096, 9);
+    run_bench<4, 0, 4 >(4096, 4096, 9, true);
     run_bench<4, 0, 4 >(4096, 14336, 9);   // FFN width
+    run_bench<4, 0, 4 >(4096, 14336, 9, true);
     printf("\nsame shapes, 2 bpw (decode-bound end of the range)\n");
     run_bench<2, 0, 4 >(4096, 4096, 9);
+    run_bench<2, 0, 4 >(4096, 4096, 9, true);
     run_bench<2, 0, 4 >(4096, 14336, 9);
+    run_bench<2, 0, 4 >(4096, 14336, 9, true);
 
     // k-scaling at fixed n, to separate kernel time from launch overhead. Every
     // warp owns one n-tile and walks all of k serially, so kernel time should be
