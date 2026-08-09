@@ -311,6 +311,7 @@ A selection of EXL3-quantized models is available [here](https://huggingface.co/
 
 This project owes its existence to a wonderful community of FOSS developers and some very generous supporters (🐈❤️!) The following projects in particular deserve a special mention:
 
+- [ExLlamaV3](https://github.com/turboderp-org/exllamav3)
 - [TabbyAPI](https://github.com/theroyallab/tabbyAPI/)
 - [PyTorch](https://github.com/pytorch/pytorch)
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention)
