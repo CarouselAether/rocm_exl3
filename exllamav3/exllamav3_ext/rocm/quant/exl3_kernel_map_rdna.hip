@@ -204,10 +204,16 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
     (void) cc;        // deliberately unused -- see the note above
     (void) size_m;
 
-    // Upstream applies the multi-GEMM block scaling before choosing a shape;
-    // keep that, since divisibility and fill are computed on the effective size.
-    size_k *= bszm_in;
-    size_n *= bszm_out;
+    // Upstream applies the multi-GEMM block scaling before choosing a shape and
+    // computes divisibility on the effective size. That is wrong for the tile
+    // walk in exl3_gemm_inner, which floors size_n / TILESIZE_N *per matrix*
+    // with no remainder pass: a tile that divides only the scaled width (e.g.
+    // N = 1024 with bszm_out = 3 admits the 384 tile because 3072 % 384 == 0)
+    // silently drops the last size_n % TILESIZE_N columns of every matrix.
+    // Compatibility below is therefore per-matrix; only the fill scoring uses
+    // the effective sizes, which is all the scaling is good for.
+    long long eff_k = (long long) size_k * bszm_in;
+    long long eff_n = (long long) size_n * bszm_out;
 
     int device = 0;
     cudaGetDevice(&device);
@@ -225,7 +231,7 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
         if (blocks_per_cu <= 0) continue;
 
         int tn = exl3_gemm_tilesize_n[shape];
-        long long slices = (long long)(size_k / 16) * (long long)(size_n / tn);
+        long long slices = (eff_k / 16) * (eff_n / tn);
         if (slices < 1) slices = 1;
 
         long long max_resident = (long long) cu_count * (long long) blocks_per_cu;
@@ -325,6 +331,16 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K, false, 1, 1) : force_shape_idx;
 
     TORCH_CHECK(shape_idx > 0, "exl3_gemm: no compatible kernel");
+    // The inner kernel floors size_n / TILESIZE_N with no remainder pass, so a
+    // shape whose tile does not divide the problem silently skips the tail
+    // columns. The selector never picks such a shape; a forced one must fail
+    // loudly rather than return a fast wrong answer (a forced 384 tile at
+    // N = 1024 measured 19% "faster" by computing 75% of the output).
+    TORCH_CHECK(size_k % exl3_gemm_tilesize_k[shape_idx] == 0 &&
+                size_n % exl3_gemm_tilesize_n[shape_idx] == 0,
+                "exl3_gemm: tile shape ", shape_idx, " (", exl3_gemm_tilesize_k[shape_idx],
+                "x", exl3_gemm_tilesize_n[shape_idx], ") does not divide ", size_k, "x", size_n,
+                " -- the kernel would silently drop the remainder");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 
@@ -360,6 +376,15 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K, true, bszm_in, bszm_out) : force_shape_idx;
     TORCH_CHECK(shape_idx > 0, "exl3_mgemm: no compatible kernel");
+    // Same truncation guard as the gemm selector. size_n here is the max
+    // per-matrix width (C.size(2)); callers passing a size_n_list with mixed
+    // widths are only covered to the extent the max width is representative,
+    // which holds for every current caller (uniform experts).
+    TORCH_CHECK(size_k % exl3_gemm_tilesize_k[shape_idx] == 0 &&
+                size_n % exl3_gemm_tilesize_n[shape_idx] == 0,
+                "exl3_mgemm: tile shape ", shape_idx, " (", exl3_gemm_tilesize_k[shape_idx],
+                "x", exl3_gemm_tilesize_n[shape_idx], ") does not divide ", size_k, "x", size_n,
+                " -- the kernel would silently drop the remainder");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 
