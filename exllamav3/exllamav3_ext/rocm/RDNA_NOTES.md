@@ -226,8 +226,15 @@ The grid computes to `(2, 1, 10)` for 10 experts at `exl3_gemm_rdna.hip`:
     if (num_sms * bszm > total_sms) num_sms = MAX(total_sms / bszm, 1);
     concurrency = MIN(total_sms / num_sms, bszm);
 
-20 workgroups x 8 waves = 160 waves over 160 SIMDs is ~1 wave per SIMD, which is
-why `MemUnitBusy` sits at 26-32% and the achieved rate is 55-66 GB/s against the
+The occupancy figure is fully accounted for by that grid. gfx1151 is 20 WGPs ->
+40 CUs (2 per WGP) -> **80 SIMD32** (2 per CU), and RDNA3 allows 16 wave32 per
+SIMD. So 20 workgroups x 8 waves = 160 waves over 80 SIMDs = **2 waves per SIMD**,
+and 2/16 = **12.5%** against a measured 11.66-12.16%. Nothing is left over for
+another explanation, which is what rules out register pressure and LDS: they
+would have to show up as a *shortfall* against this number, and there is none.
+
+Two waves per SIMD is far too few to keep loads in flight, which is why
+`MemUnitBusy` sits at 26-32% and the achieved rate is 55-66 GB/s against the
 206 GB/s roofline.
 
 **`force_num_sms` is inert in the mgemm path** -- `num_sms = tiles` overwrites it

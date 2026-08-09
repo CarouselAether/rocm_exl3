@@ -68,9 +68,10 @@ namespace cg = cooperative_groups;
 // workgroup per CU is asked for half that many.
 //
 // Measured on Laguna MoE decode, exl3_mgemm at m == 1 with 10 experts: the grid
-// comes out (2, 1, 10) = 20 workgroups of 256 threads = 160 waves across 160
-// SIMDs, and rocprofv3 reports OccupancyPercent 11.7-12.2% with MemUnitBusy only
-// 26-32%. Occupancy is identical at VGPR 144, 248 and 256, so it is the grid
+// comes out (2, 1, 10) = 20 workgroups of 256 threads = 160 waves. gfx1151 has 80
+// SIMD32 (20 WGPs -> 40 CUs -> 2 SIMDs each) and RDNA3 allows 16 wave32 per SIMD,
+// so that is 2/16 = 12.5% -- and rocprofv3 measures OccupancyPercent 11.7-12.2%
+// with MemUnitBusy only 26-32%. Occupancy is identical at VGPR 144, 248 and 256, so it is the grid
 // width that pins it, not register pressure. Cooperative launch cannot
 // oversubscribe -- grid.sync() requires every block co-resident -- so the kernel
 // has no way to recover the missing memory-level parallelism.
