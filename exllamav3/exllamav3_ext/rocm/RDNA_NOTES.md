@@ -205,6 +205,76 @@ A first probe of this reported the race as benign and was wrong: it used uniform
 lane values (all 1.0), where clamp-to-self and wrap are indistinguishable because
 `v += v` doubles to 32 either way. Reduction probes need distinct per-lane values.
 
+## Decode lost the GEMV path — how, and what it takes to get it back
+
+The legacy 0.0.29 fork routed essentially all of decode through the RDNA GEMV,
+leaving GEMM for prefill and weight loading. That is the correct division and it
+is no longer what happens: measured on v1.4.1, **~75-78% of decode GPU time runs
+`exl3_gemm`/`exl3_mgemm` 16-row tile kernels for one useful row**, at ~20-27% of
+achievable bandwidth. Neither half was lost to a deliberate change.
+
+**Half 1 — the `!graph` guard stopped being cheap.** `exl3_gemm_rdna.hip` declines
+GEMV while a graph is capturing (`EXL3_RDNA_GEMV_GRAPH`), and the legacy fork had
+the identical guard at the same site (`exl3_gemm.cu:110`, `size_m == 1 && !graph`).
+In 0.0.29 that cost almost nothing, because almost nothing was captured — there
+was no `bc_attn.py` and no MoE `bszN` graph path. Upstream has since added both,
+so decode is now ~100% captured (120 `hipGraphLaunch` per token, 2 per layer) and
+the guard declines GEMV for *everything*. Toggling `EXL3_BC_ATTN=0` moves
+`exl3_gemv_dot_kernel` from 31 calls to 4061 and gains 8% on dense Gemma. The
+guard's comment claimed it "costs coverage during capture and nothing else" —
+true when written, false now. Same pattern as the split-K defects: a comment
+asserting a path is harmless, invalidated by a change elsewhere.
+
+**Half 2 — retiring the mgemm guard closed the other door.** The fork disabled
+MultiLinear/mgemm outright, so fused q/k/v and gate/up ran as separate
+`exl3_gemm` calls at m == 1 and took GEMV. That guard was retired 2026-08-07 for
+good reasons (it was producing degenerate output), but `exl3_mgemm` has **no GEMV
+path at all** — `exl3_gemv_try_launch` is called only from `exl3_gemm`. Nothing
+declines; nothing asks. On MoE at bsz=1 this is the dominant cost: `bszn_eligible`
+routes bsz <= `MAX_BSZN` (8) through mgemm, so Laguna decode spends 42-48% there
+across ~139 calls/token, and `exl3_moe_kernel` is called about once per token.
+
+**Packing rows is not the alternative.** The tile's M dimension is rows sharing
+one weight matrix; routed experts each need a different B, so they cannot be
+packed into the 16 rows. mgemm already gives each expert its own z-slice with one
+useful row of sixteen. Packing only pays where rows share weights — concurrent
+sequences, or speculative decode. For single-user decode GEMV is the answer. (The
+user tried row packing early in the project; it did not work, for this reason.)
+
+### What the fix requires
+
+In dependency order — 1 must land first or 2 and 3 measure as no gains:
+
+1. **The fp32-output GEMV is slower than the tile GEMM it would replace.**
+   Measured on Laguna: `exl3_gemv_dot_kernel<4,true>` 911 ms over 2256 calls
+   against `exl3_gemm_kernel<4,true>` 710 ms over 2304. The fp16 form is 2.2x
+   *faster* (327 vs 709 ms). This asymmetry is why unblocking GEMV nets zero on
+   Laguna while gaining 8% on Gemma, and it is a real defect, not tuning.
+
+2. **Extend the graph-parameter contract to a multi-kernel path, then drop the
+   guard.** Upstream's GEMV is one kernel carrying exl3_gemm's full 10-argument
+   signature, so capture just patches offsets 7/8/9. The RDNA GEMV is three
+   kernels and those offsets exist on none of them, which is why
+   `exl3_gemv_try_launch` deliberately reports `nullptr` — failing loudly beats
+   corrupting a node. `Graph::record_param(kernel, param_id, offset)` already
+   keys on the kernel function pointer, so the path needs six sites instead of
+   three:
+
+   | param | site |
+   |---|---|
+   | `GP_gemm_A` | `had_in` 0 |
+   | `GP_gemm_A_had` | `had_in` 1, `dot` 0 |
+   | `GP_gemm_B_suh` | `had_in` 2 |
+   | `GP_gemm_B_trellis` | `dot` 1 |
+   | `GP_gemm_C` | `dot` 2, `had_out` 0 and 1 |
+   | `GP_gemm_B_svh` | `had_out` 2 |
+
+   `Graph::record()` walks nodes and `graph_sites` in lockstep and `break`s on
+   the first function mismatch, so sites must be pushed in launch order:
+   `had_in`, then `dot`, then `had_out`. Verify that before trusting it.
+
+3. **Give `exl3_mgemm` a GEMV call site** for m == 1 — the 42-48% item on MoE.
+
 ## Syncing to a new upstream release
 
 Every sibling is derived from exactly one upstream file. Before deciding how to
