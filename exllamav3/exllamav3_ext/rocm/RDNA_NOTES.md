@@ -52,7 +52,41 @@ checks it against a CPU reference with non-symmetric inputs.
 - **`__funnelshift_r` is native**, exactly matches PTX `shf.r.wrap.b32` (shift
   masked `& 31`), and lowers to one `v_alignbit_b32`. A hand-rolled uint64
   version with `& 63` is wrong for every shift >= 32.
-- **Prefill is slightly compute-bound; token generation is memory-bound.**
+- **Prefill is slightly compute-bound and lands near the achievable roofline.**
+  ~9.8 TFLOP/s at the model level (Gemma-4-31B, 158 t/s at 512 tokens) against a
+  peak fp16 GEMM of 24-32 TFLOP/s and a practical envelope of 30-37.
+- **Achievable memory bandwidth is ~206 GB/s** (`rocm_tools/bench_membw.py`),
+  ~80% of the 256 GB/s theoretical, and *flat* from 64 MiB to 16 GiB. There is no
+  VRAM-vs-GTT cliff: on this unified-memory part the 512 MiB "VRAM" aperture
+  rocm-smi reports is a legacy carveout, not a constraint, and torch's
+  `total_memory` is the GTT pool.
+- **There is a 32 MiB Infinity Cache, and it will flatter any kernel benchmark
+  whose working set fits.** Measured 653 GB/s at 16 MiB against 213 GB/s at
+  64 MiB. Timing one weight tensor in a repeat loop measures cache, not DRAM --
+  it overstated the EXL3 GEMV rate by 26% here, and a first pass at this
+  concluded "the kernels are healthy" from exactly that error. Cycle a working
+  set several times cache size.
+- **Token generation is NOT memory-bound. It is bound by running a 16-row tile
+  GEMM for one useful row.** Measured on Gemma-4-31B, decode at bsz=1:
+  `rocm_tools/profile_decode.py` reports the GPU 97.4% busy, with **97.6% of all
+  GPU time in `exl3_gemm`/`exl3_mgemm`** -- attention is 0.8%, norms 0.1%. The
+  effective rate is 27.0 GB of weights in 477 ms/token = **~57 GB/s, 27% of the
+  206 GB/s the hardware delivers**. The GEMV path is 2.4x faster per call
+  (0.392 ms vs 0.90-0.97 ms) and reaches 122 GB/s DRAM-resident, but it is
+  excluded from ~78% of decode by two separate things:
+  - `exl3_mgemm` has **no GEMV path at all** (`exl3_gemv_try_launch` is called
+    only from `exl3_gemm`), so every fused q/k/v and gate/up runs the tile GEMM.
+    That alone is ~50% of decode GPU time.
+  - this port's own `EXL3_RDNA_GEMV_GRAPH` guard declines GEMV whenever a graph
+    is capturing, and decode is ~100% captured (120 `hipGraphLaunch` per token,
+    2 per layer). Disabling BC-attn graphs moves `exl3_gemv_dot_kernel` from 31
+    calls to 4061 and gains 8% decode throughput -- so the guard's comment,
+    "costs coverage during capture and nothing else", is wrong in the one case
+    that matters.
+
+  The GEMM path measures ~53 GB/s at bsz 1, 4 *and* 16, i.e. flat, which is the
+  signature of the 16-row tile: the work is the same whether the rows are useful.
+  Closing both gaps is worth roughly 2x decode on paper (122 vs 53 GB/s).
 - **Benchmark noise floor is ~4.7% spread** (1.6% stdev), and the first run reads
   high. No perf claim under ~5% survives a single measurement.
 
