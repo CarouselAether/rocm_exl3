@@ -1,7 +1,18 @@
 // =============================================================================
-// exl3_gemm host dispatch for RDNA -- generated from upstream v1.3.0
-// quant/exl3_gemm.cu. Include swaps, plus one behavioural change to the launch
-// (documented at EXL3_RDNA_SMEM below). Nothing else.
+// exl3_gemm host dispatch for RDNA -- generated from upstream v1.4.1
+// quant/exl3_gemm.cu. Include swaps, plus three behavioural changes to the
+// launch (EXL3_RDNA_SMEM, EXL3_RDNA_GEMV_GRAPH, EXL3_RDNA_AUTOTUNE_GRAPH,
+// each documented at its site). Nothing else.
+//
+// Synced to v1.4.1 by three-way merge (base v1.3.0, ours the sibling, theirs
+// v1.4.1) rather than regeneration, because the autotune-graph guard re-indents
+// a block upstream still owns and a sed-style rewrite cannot express that.
+// v1.4.1's additions here are the per-matrix output width/pointer lists
+// (size_n_list / c_ptrs) threaded into mgemm, the A_had scratch size check, and
+// the autotune-hash clamp; all merged clean.
+//
+// EXL3_RDNA_SMEM covers the four launch-configuration sites. The four autotuner
+// sites still pass upstream's SMEM_MAX, unchanged from before this rebase.
 //
 // A sibling is required because exl3_gemm.cu includes exl3_gemm_kernel.cuh,
 // which reaches ptx.cuh through exl3_gemm_inner.cuh by relative quoted include.
@@ -132,8 +143,8 @@ uint64_t mgemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) bszm_in);
-    mix((uint64_t) bszm_out);
+    mix((uint64_t) MIN(bszm_in, 24));
+    mix((uint64_t) MIN(bszm_out, 24));
     return h;
 }
 
@@ -460,7 +471,9 @@ int exl3_mgemm_gr
     int max_index,
     int force_num_sms,
     Graph* graph,
-    int num_tokens
+    int num_tokens,
+    const c10::optional<at::Tensor>& size_n_list,
+    const c10::optional<at::Tensor>& c_ptrs
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -489,7 +502,28 @@ int exl3_mgemm_gr
     int bsz = A.size(1);
     int bszm_in = A.size(0);
     int bszm_out = C.size(0);
+
+    // Per-matrix output widths/pointers (uniform-width callers pass neither): C then only
+    // provides the dtype and the max width (locks/shape sizing); outputs go to c_ptrs
+    const int* size_n_list_ptr = nullptr;
+    void** c_list_ptr = nullptr;
+    if (size_n_list)
+    {
+        TORCH_CHECK(c_ptrs, "exl3_mgemm: size_n_list requires c_ptrs");
+        TORCH_CHECK_DTYPE(size_n_list.value(), kInt);
+        TORCH_CHECK_DTYPE(c_ptrs.value(), kLong);
+        TORCH_CHECK(num_tokens == 1 && min_index < 0 && !weights,
+                    "exl3_mgemm: per-matrix widths incompatible with multi-token/filtering/weights");
+        size_n_list_ptr = (const int*) size_n_list.value().data_ptr();
+        c_list_ptr = (void**) c_ptrs.value().data_ptr();
+        bszm_out = (int) c_ptrs.value().size(0);
+    }
     int bszm = MAX(bszm_in, bszm_out);
+
+    // The kernel writes one hadamard-transformed input slab PER MATRIX (A_had + j * m * k);
+    // an undersized scratch is silent OOB corruption (found the hard way)
+    TORCH_CHECK(A_had.numel() >= (int64_t) bszm * A.size(1) * A.size(2),
+                "exl3_mgemm: A_had must hold bszm * m * k elements");
 
     const int64_t* indices_ptr = (const int64_t*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
@@ -557,7 +591,9 @@ int exl3_mgemm_gr
         (void*)& bszm_out,
         (void*)& min_index,
         (void*)& max_index,
-        (void*)& num_tokens
+        (void*)& num_tokens,
+        (void*)& size_n_list_ptr,
+        (void*)& c_list_ptr
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -682,7 +718,9 @@ int exl3_mgemm
     int min_index,
     int max_index,
     int force_num_sms,
-    int num_tokens
+    int num_tokens,
+    const c10::optional<at::Tensor>& size_n_list,
+    const c10::optional<at::Tensor>& c_ptrs
 )
 {
     return exl3_mgemm_gr
@@ -703,6 +741,8 @@ int exl3_mgemm
         max_index,
         force_num_sms,
         nullptr,
-        num_tokens
+        num_tokens,
+        size_n_list,
+        c_ptrs
     );
 }

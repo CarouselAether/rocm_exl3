@@ -171,20 +171,141 @@ A first probe of this reported the race as benign and was wrong: it used uniform
 lane values (all 1.0), where clamp-to-self and wrap are indistinguishable because
 `v += v` doubles to 32 either way. Reduction probes need distinct per-lane values.
 
+## Syncing to a new upstream release
+
+Every sibling is derived from exactly one upstream file. Before deciding how to
+sync one, measure both numbers — our drift from the upstream file it was
+generated against, and what upstream did to that file since:
+
+```sh
+diff <(git show vOLD:exllamav3/exllamav3_ext/quant/reconstruct.cu) \
+     exllamav3/exllamav3_ext/rocm/quant/reconstruct_rdna.hip | grep -c '^[<>]'
+git diff --numstat vOLD vNEW -- exllamav3/exllamav3_ext/quant/reconstruct.cu
+```
+
+Low drift and high churn is the *cheap* case, not the expensive one: it means the
+sibling is a mechanical rewrite and can simply be regenerated, inheriting
+upstream's new code for free. The expensive case is high drift, because the
+deviations have to be re-applied by hand.
+
+Three methods, in order of preference:
+
+1. **Regenerate by `sed` on include lines.** For siblings whose entire delta is
+   include rewrites. `reconstruct_rdna.hip` is the pure case — its diff against
+   upstream is six `#include` lines and nothing else, so a v1.3.0 → v1.4.1 sync
+   absorbed 230 lines of new kernel with no review.
+2. **Regenerate with a scripted re-application** of a small, anchored set of
+   edits, asserting each anchor is found exactly the expected number of times so
+   a moved or renamed anchor fails loudly instead of silently skipping. This is
+   how `rope_rdna.hip` and `exl3_gemm_kernel_rdna.hip.h` are synced.
+3. **Three-way merge** (`git merge-file` with base = old upstream, ours = the
+   sibling, theirs = new upstream) when a deviation re-indents or restructures a
+   block upstream still owns, which a textual rewrite cannot express.
+   `exl3_gemm_rdna.hip`'s autotune-graph guard is the case that needs this.
+
+Never hand-copy. The earlier port replaced upstream's `__funnelshift_r` with a
+non-wrapping `fshift` that way, and it happened to land only in dead code.
+
+After syncing, the diff against the new upstream file should be *exactly* the
+documented deviations — check that, not just that it compiles. Then run
+`rocm_tools/hipcc_probe.sh --all`, whose exclusion regex must stay in step with
+`ROCM_EXCLUDE` in `setup.py`.
+
+### v1.3.0 → v1.4.1
+
+Recorded because it is the worked example, and because the cost was concentrated
+in a way that is not obvious in advance. Upstream moved 115 files and +12.5k
+lines; the port needed five siblings touched.
+
+| sibling | our drift | upstream churn | method |
+|---|---|---|---|
+| `reconstruct_rdna.hip` | 10 | +230 | regenerate (sed) |
+| `exl3_kernel_map_rdna.hip.h` | 180 | 3+/1- | two args added to `EXL3_MGEMM_ARGS` |
+| `exl3_gemm_kernel_rdna.hip.h` | 58 | 15+/11- | regenerate (scripted) |
+| `exl3_gemm_rdna.hip` | 146 | 35+/6- | three-way merge |
+| `rope_rdna.hip` | 65 | 155+/36- | regenerate (scripted) |
+
+The other thirteen siblings had **zero** upstream churn, including every
+high-drift one — `exl3_gemv_kernel_rdna.hip.h` (666), `exl3_gemm_inner_rdna.hip.h`
+(885), `exl3_gemv_rdna.hip` (418), `codebook_rdna.hip.h` (163). In particular
+`exl3_gemm_inner.cuh`, `exl3_moe_kernel.cuh`, `exl3_moe.cu` and `comp_units/` are
+byte-identical between the two tags, so the split-K fixes above carried forward
+untouched and `MOE_TILESIZE_K` did not need re-validating.
+
+Upstream's own change to the GEMM siblings is additive: two kernel arguments
+(`size_n_list`, `C_list`) that let one `exl3_mgemm` call write outputs of
+differing widths to separate pointers. They are consumed only by
+`libtorch/dsv4_attn.cpp`; every other caller passes neither, leaving
+`size_n_list_ptr` null and the kernel on its existing path. The four-line change
+to `EXL3_MGEMM_ARGS` must match upstream's `exl3_kernel_map.cuh` exactly, since
+the comp_units instantiate against it.
+
+The upstream surface stayed at four files and the conflict was four lines
+(`setup.py` swapping `kbnf`+`formatron` for `llguidance`, `__init__.py` exporting
+`LLGuidanceFilter`, two README model-list lines). `triton_paged.py` was untouched
+upstream. `requirements_rocm.txt` is ours and additive, but it duplicates the
+dependency list, so it needs the same `llguidance` swap or a cold install breaks.
+
 ## Test status on RDNA
 
-`tests/` hardcode `device = "cuda:2"`.
+Measured at v1.4.1. `tests/` hardcode a device index — `cuda:2` in most files,
+`cuda:1` in `test_reconstruct_had.py` — so a single-GPU machine has to rewrite
+both before anything collects.
+
+Note that several `tests/test_*.py` files are `main()` scripts rather than pytest
+modules. pytest reports "no tests collected" and moves on, which reads as a pass
+at a glance. **Run those directly** — they carry the reference checks for the
+newest kernels, and two of the three most valuable results below come from them.
 
 | test | result |
 |---|---|
-| `test_rope` | 60 passed (was 30 failed) |
+| `test_rope` | 64 passed (was 30 failed before the lane-0 fix; 60 at v1.3.0) |
+| `test_rope_yarn` | 8 passed |
 | `test_cache_rotate` | 32 passed |
 | `test_mla` | 53 passed |
 | `test_gated_delta_rule` | 21 passed |
-| `test_sampler` | 137 passed |
+| `test_sampler` | 140 passed |
 | `test_triton_paged_overflow` | 3 passed |
-| `test_kv_quant` | 60 failed — stale test, not a kernel bug: it calls `quant_cache_paged()` with a different arity than the current binding |
-| `test_quant_fn` | collection error — requires a model at a hardcoded `/mnt/str/...` path |
+| `test_reconstruct_had.py` (script) | ALL PASS, rel err ~1e-3 — covers the `reconstruct_had` kernel new in v1.4.1 |
+| `test_dsa_kernels.py` (script) | ALL PASS — DeepSeek V4 sparse attention, indexer and top-k, rel err ~3e-4 |
+| `test_ext_norm_` | 336 failed — **upstream test defect, not a kernel bug.** New in v1.4.1; calls `ext.rms_norm(x, w, y, eps)` against a binding upstream itself declares with 8 parameters. `norm.cu`, `norm.cuh` and `bindings.cpp` are byte-identical to upstream here, so it fails the same way on CUDA. Called with the real signature the kernel matches an fp32 reference to 4.2e-4 across 32 shapes. |
+| `test_kv_quant` | 60 failed — same class, and long-standing: `quant_cache_paged()` arity mismatch |
+| `test_dsv4_compress_kernel.py` (script) | same class again — `dsv4_compress()` arity mismatch. The kernel itself runs correctly under a real DeepSeek V4 generation. |
+| `test_dsv4_cached`, `test_dsv4_state` | collection error — both `import compare_deepseek_v4_hf_`, which upstream never committed (`git ls-tree v1.4.1` does not contain it) |
+| `test_qgemm`, `test_quant_fn` | collection error — require models at hardcoded `/mnt/str/...` paths |
+
+Three separate upstream tests now call an ext binding with the wrong arity. Treat
+a `TypeError: incompatible function arguments` from `tests/` as an upstream
+staleness signal and check the declaration before suspecting the port.
+
+### End-to-end generation
+
+| model | result |
+|---|---|
+| Gemma-4-31B-it (dense) | coherent |
+| GLM-4.6V 3.55bpw (MoE) | coherent |
+| DeepSeek-V4-Flash 2.04bpw | coherent — new in v1.4.1, working with no ROCm-specific code |
+
+The dense model remains the cheapest control for an MoE fault; run it first.
+
+### Open: segfault at interpreter teardown
+
+Any process that has loaded a model exits with SIGSEGV *after* all output is
+produced and all work has completed. Characterised so far:
+
+- needs a loaded model — plain torch HIP allocation and a bare `rms_norm` call
+  both exit cleanly;
+- not model-specific — dense Gemma and MoE GLM both do it, so it is not the CPU
+  MoE handoff's worker threads;
+- no Python traceback under `PYTHONFAULTHANDLER=1`, so it is native teardown
+  (static destructor ordering against an already-torn-down HIP runtime);
+- `os._exit(0)` after the work avoids it completely, which is the workaround if
+  it matters for a script.
+
+**Not established whether this predates v1.4.1** — it produces no output before
+the process dies, so it could have been present and unnoticed. Bisecting it means
+rebuilding the pre-rebase branch (`pre-v141-rebase`) and re-testing. Harmless to
+generation quality either way, but it will show up in a server shutdown.
 
 ## Verification tools
 

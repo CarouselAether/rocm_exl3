@@ -1,6 +1,6 @@
 // =============================================================================
 // exl3_gemm_kernel / exl3_mgemm_kernel for RDNA -- generated from upstream
-// v1.3.0 quant/exl3_gemm_kernel.cuh with the changes listed below and nothing
+// v1.4.1 quant/exl3_gemm_kernel.cuh with the changes listed below and nothing
 // else. Keeping it mechanical keeps the diff auditable across rebases.
 //
 //  1. Includes point at the RDNA kernel map and GEMM inner.
@@ -207,13 +207,18 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             grid.sync();
         #endif
 
-        // Matmul
+        // Matmul. Per-matrix output width/pointer when the caller supplies the lists
+        // (size_n then only sizes the per-z-slice lock ranges and must be the max width);
+        // resolved once per matrix, outside all inner loops
 
+        int n_j = (size_n_list && mat_index >= 0) ? size_n_list[mat_index] : size_n;
         int size_m_ = size_m;
         half* A_ = A_had + j * size_m * size_k;
         void* C_;
-        if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);
-        else                  C_ = (void*) (((half*) C) + j * size_m * size_n);
+        if (C_list && mat_index >= 0) C_ = C_list[mat_index];
+        else if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);
+        else                       C_ = (void*) (((half*) C) + j * size_m * size_n);
+        void* C_base = C_;
 
         while (size_m_ > 0)
         {
@@ -223,12 +228,12 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
                 exl3_gemm_kernel_inner
                 <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks + lock_offs, nullptr);
+                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr);
             }
 
             A_ += 16 * size_k;
-            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
-            else                  C_ = (void*) (((half*) C_) + 16 * size_n);
+            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * n_j);
+            else                  C_ = (void*) (((half*) C_) + 16 * n_j);
             size_m_ -= 16;
 
             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
@@ -242,7 +247,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
         if (B)
         {
-            int total_warps = size_m * size_n / 128;
+            int total_warps = size_m * n_j / 128;
             int warps_grid = gridDim.x * blockDim.x / 32;
             int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
 
@@ -250,8 +255,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             float scale = 0.088388347648f;  // 1/sqrt(128)
             if (B_weights) scale *= __half2float(B_weights[j]);
 
-            if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);
-            else                  C_ = (void*) (((half*) C) + j * size_m * size_n);
+            C_ = C_base;
 
             for(; this_warp < total_warps; this_warp += warps_grid)
             {
@@ -260,7 +264,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     (
                         ((const float*) C_) + this_warp * 128,
                         ((float*) C_) + this_warp * 128,
-                        svh + (this_warp * 128) % size_n,
+                        svh + (this_warp * 128) % n_j,
                         scale
                     );
                 else
@@ -268,7 +272,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                     (
                         ((const half*) C_) + this_warp * 128,
                         ((half*) C_) + this_warp * 128,
-                        svh + (this_warp * 128) % size_n,
+                        svh + (this_warp * 128) % n_j,
                         scale
                     );
             }
