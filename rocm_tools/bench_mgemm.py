@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Drive exl3_mgemm at m == 1 directly, outside any graph.
 
+NOTE (2026-08-08): exl3_mgemm at m == 1 now routes to the plain-launch
+multi-matrix GEMV (rocm/quant/exl3_mgemv_rdna.hip) unless a shape or grid is
+forced. So `-s -1` measures the mgemv path, while `-s 4` (or any forced shape)
+pins the cooperative kernel this file was originally written to study -- the
+two together are the A/B. EXL3_MGEMV=0 disables the routing entirely.
+
 exl3_mgemm is ~42-48% of MoE decode GPU time and sits at roughly 30% of the
 achievable memory roofline, but it is hard to study in situ: at bsz <= MAX_BSZN
 the MoE path runs it from inside a captured graph (C++ BC_BlockSparseMLP), and
@@ -106,6 +112,26 @@ def main():
             ext.exl3_mgemm(A, ml.ptrs_trellis, C, ml.ptrs_suh, A_had, ml.ptrs_svh,
                            idx, None, ml.K, shape_idx, ml.mcg, ml.mul1, -1, -1, nsms, 1, None, None)
 
+        # Coverage check before timing anything: fill C with NaN and require the
+        # kernel to overwrite every element. A tile shape that does not divide
+        # size_n leaves the tail columns untouched, and the resulting "speedup"
+        # is an artifact of skipped work -- a forced 384-wide tile at N = 1024
+        # measured 19% faster that way and cost a day. The ext now refuses such
+        # shapes outright; this catches any future gap from the output side.
+        try:
+            C.fill_(float("nan"))
+            call()
+            torch.cuda.synchronize()
+        except RuntimeError as err:
+            reason = str(err).splitlines()[0]
+            print(f"  {e:8} {shape_idx:6} {nsms:5}  rejected: {reason}")
+            continue
+        nan_cols = torch.isnan(C).view(-1, I).any(dim=0).sum().item()
+        if nan_cols:
+            print(f"  {e:8} {shape_idx:6} {nsms:5}  !! UNCOVERED OUTPUT: {nan_cols}/{I} "
+                  f"columns never written -- timings would be meaningless, skipping")
+            continue
+
         if args.profile:
             for _ in range(20):
                 call()
@@ -125,7 +151,10 @@ def main():
         spread = (max(samples) - min(samples)) / med if med else 0
         by = e * H * I * ml.K / 8          # packed trellis bytes actually read
         flag = "  <- noisy" if spread > 0.05 else ""
-        print(f"  {e:8} {shape_idx:6} {nsms:5} {med*1e6:9.1f} {by/2**20:8.1f} {by/med/1e9:9.1f} {spread:6.1%}{flag}")
+        # flush=True: an oversubscribed --sms value aborts the process from a GPU
+        # assert on the *next* combo, and buffered rows would die with it
+        print(f"  {e:8} {shape_idx:6} {nsms:5} {med*1e6:9.1f} {by/2**20:8.1f} {by/med/1e9:9.1f} {spread:6.1%}{flag}",
+              flush=True)
 
     if args.profile:
         # Must NOT os._exit() here: rocprofv3 writes its CSV from exit hooks, and a

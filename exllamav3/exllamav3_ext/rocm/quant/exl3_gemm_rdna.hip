@@ -30,6 +30,7 @@ namespace cg = cooperative_groups;
 #include "../../util.cuh"
 #include "exl3_gemm_kernel_rdna.hip.h"
 #include "exl3_kernel_map_rdna.hip.h"
+#include "exl3_mgemv_rdna.hip.h"
 #include "../../quant/exl3_devctx.cuh"
 #include "../../quant/exl3_gemv.cuh"
 #include "../../quant/exl3_gemv_int8.cuh"
@@ -297,32 +298,48 @@ int exl3_gemm_gr
     };
 
     // -------------------------------------------------------------------------
-    // EXL3_RDNA_GEMV_GRAPH: never take the GEMV path while capturing
+    // GEMV routing at m == 1, in and out of graph capture
     // -------------------------------------------------------------------------
-    // Upstream's comment below ("same kernel arguments, so graph recording is
-    // identical") is true of upstream's GEMV kernel, which takes exl3_gemm's
-    // full 10-argument signature. The RDNA GEMV does not: it is a plain launch
-    // of a 5-argument kernel with the Hadamard transforms as separate kernels
-    // either side, so add_graph_args' offsets 7/8/9 have no counterpart and
-    // patching them would write past the node's parameter array.
+    // Out of capture: the fork-carried plain path below (exl3_gemv_try_launch),
+    // which records no graph sites (*launched_kernel = nullptr contract).
     //
-    // The fork applied the identical guard at this call site
-    // (`if (size_m == 1 && !graph)` in its exl3_gemm.cu). Falling through to the
-    // cooperative kernel is always correct, so this costs coverage during
-    // capture and nothing else.
-    if (!graph && force_shape_idx <= 0 && force_num_sms <= 0)
+    // Under capture: the fork's `!graph` guard used to decline everything --
+    // correct then (the 5-argument kernel has no home for add_graph_args'
+    // offsets 7/8/9, and in the fork's era decode was not captured), but decode
+    // on v1.4.1 is ~100% captured, so the guard silently cost the whole GEMV
+    // path at decode. exl3_gemv_graph_try_launch is the capture-safe form: a
+    // prologue kernel hosts all six GP_gemm_* patch sites and republishes the
+    // downstream pointers through a device parameter block (the pattern proven
+    // by exl3_mgemv_rdna.hip; Graph::launch() patches one site per caller
+    // params entry, so multi-kernel paths must concentrate their sites on one
+    // node). Both routes share the measured profitability rule
+    // (exl3_gemv_rdna_pays) and the EXL3_GEMV env modes.
+    if (force_shape_idx <= 0 && force_num_sms <= 0)
     {
-        void* gemv_kernel = nullptr;
-        if (exl3_gemv_try_launch
+        if (!graph)
+        {
+            void* gemv_kernel = nullptr;
+            if (exl3_gemv_try_launch
+            (
+                kernelArgs, size_m, size_k, size_n, K, cb, c_fp32,
+                suh_ptr && A_had_ptr && svh_ptr,
+                device, stream, &gemv_kernel, false
+            ))
+            {
+                add_graph_args(gemv_kernel);
+                cuda_check(cudaPeekAtLastError());
+                return 90;
+            }
+        }
+        else if (exl3_gemv_graph_try_launch
         (
-            kernelArgs, size_m, size_k, size_n, K, cb, c_fp32,
-            suh_ptr && A_had_ptr && svh_ptr,
-            device, stream, &gemv_kernel, false
+            A_ptr, B_ptr, C_ptr, suh_ptr, (half*) A_had_ptr, svh_ptr,
+            size_m, size_k, size_n, K, cb, c_fp32,
+            device, stream, graph
         ))
         {
-            add_graph_args(gemv_kernel);
             cuda_check(cudaPeekAtLastError());
-            return 90;
+            return 91;
         }
     }
 
@@ -607,6 +624,28 @@ int exl3_mgemm_gr
     if (mcg) cb = 1;
     if (mul1) cb = 2;
 
+    // m == 1 decode: route to the plain-launch multi-matrix GEMV, which
+    // oversubscribes where the cooperative grid cannot (see
+    // exl3_mgemv_rdna.hip). Diagnostic overrides pin the cooperative path so
+    // shape/grid sweeps keep measuring the kernel they name; EXL3_MGEMV=0 is
+    // the runtime kill switch. Falls through when ineligible.
+    if (size_m == 1 && force_shape_idx <= 0 && force_num_sms <= 0)
+    {
+        if (exl3_mgemv_try_launch
+        (
+            A_ptr, B_ptr_ptr, C_ptr, suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
+            indices_ptr, weights_ptr,
+            size_m, size_k, size_n, K, cb, c_fp32,
+            bszm_in, bszm_out, min_index, max_index, num_tokens,
+            size_n_list_ptr != nullptr || c_list_ptr != nullptr,
+            device, stream, graph
+        ))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 0;
+        }
+    }
+
     int shape_idx;
     int block_dim;
     fp_exl3_mgemm_kernel kernel;
@@ -708,10 +747,25 @@ int exl3_mgemm_gr
     int tilesize_k = exl3_gemm_tilesize_k_g[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n_g[shape_idx];
     int tiles = MAX(size_k / tilesize_k * size_n / tilesize_n, 1);
-    num_sms = tiles;
-    if (num_sms * bszm > total_sms) num_sms = MAX(total_sms / bszm, 1);
-    if (num_sms <= total_sms && tiles / num_sms > 48) num_sms = MIN(total_sms, num_sms * 2);
-    concurrency = MIN(total_sms / num_sms, bszm);
+    if (force_num_sms > 0)
+    {
+        // Diagnostic override: honoured exactly as given, unlike the sized
+        // grid below. An oversubscribed cooperative grid is refused by the
+        // runtime with "too many blocks in cooperative launch", which is the
+        // informative failure mode a sweep wants. (This branch used to be
+        // dead: `num_sms = tiles` overwrote the forced value, so sweeping
+        // --sms changed nothing and looked like evidence the grid size did
+        // not matter.)
+        num_sms = force_num_sms;
+        concurrency = MAX(MIN(total_sms / num_sms, bszm), 1);
+    }
+    else
+    {
+        num_sms = tiles;
+        if (num_sms * bszm > total_sms) num_sms = MAX(total_sms / bszm, 1);
+        if (num_sms <= total_sms && tiles / num_sms > 48) num_sms = MIN(total_sms, num_sms * 2);
+        concurrency = MIN(total_sms / num_sms, bszm);
+    }
 
     // DBGI10(size_m, size_k, size_n, K, bszm_in, bszm_out, shape_idx, block_dim, num_sms, concurrency);
 

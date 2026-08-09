@@ -37,17 +37,23 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "../../util.h"
 #include "../../util.cuh"
+#include "../../graph.cuh"
 #include "exl3_gemv_kernel_rdna.hip.h"
+#include "exl3_mgemv_rdna.hip.h"
 
 #include <cstdlib>
+#include <mutex>
 
-// Env: EXL3_GEMV = 0 disables the path (every eligible call falls through to the
-// cooperative GEMM), anything else enables it. Upstream's mode 2 ("use wherever
-// the hard constraints allow") is the same as mode 1 here, because the hard
-// constraints *are* the envelope -- there is no measured heuristic to bypass.
-//
-// 0 is the A/B switch for comparing this path against the cooperative GEMM at
-// m == 1, which is the next measurement this port needs.
+// Defined in the graph-captured GEMV section at the bottom of this file;
+// called from the non-graph dispatch above it.
+static void exl3_gemv_graph_prewarm(int device);
+
+// Env: EXL3_GEMV = 0 disables the path (every eligible call falls through to
+// the cooperative GEMM); 1 (default) routes shape-aware per
+// exl3_gemv_rdna_pays(); 2 takes every eligible call regardless of the
+// measured envelope -- upstream's mode-2 semantics, kept for per-shape A/B
+// measurement (bench_gemv_vs_gemm). Re-read on every call so one process can
+// toggle it.
 static int exl3_gemv_env_mode()
 {
     const char* env = std::getenv("EXL3_GEMV");
@@ -270,7 +276,17 @@ bool exl3_gemv_try_launch
     bool force
 )
 {
-    if (!force && exl3_gemv_env_mode() == 0) return false;
+    // Pre-warm the graph path's parameter block while we are guaranteed to be
+    // outside capture (this function is only routed to when !graph). See
+    // exl3_gemv_graph_param_block for why allocation cannot happen mid-capture.
+    exl3_gemv_graph_prewarm(device);
+
+    int mode = exl3_gemv_env_mode();
+    if (!force && mode == 0) return false;
+    // Shape-aware envelope (see exl3_gemv_rdna_pays): below the measured
+    // profitability threshold the cooperative GEMM is faster, so decline
+    // unless forced or in take-everything mode.
+    if (!force && mode != 2 && !exl3_gemv_rdna_pays(size_k, size_n)) return false;
 
     const half*     A_ptr     = *(const half* const*)     kernel_args[0];
     const uint16_t* B_ptr     = *(const uint16_t* const*) kernel_args[1];
@@ -350,4 +366,299 @@ void exl3_gemv
     );
 
     cuda_check(cudaPeekAtLastError());
+}
+
+// =============================================================================
+// Graph-captured GEMV -- work item 4c
+// =============================================================================
+//
+// The plain-launch GEMV above is declined while a graph is capturing, because
+// exl3_gemm's six recorded parameter sites (A, B_trellis, C, suh, A_had, svh)
+// have no home on a 5-argument kernel. This section gives them one, using the
+// pattern proven by the multi-matrix path (exl3_mgemv_rdna.hip): a prologue
+// kernel that takes all six as ordinary arguments -- so it is the single node
+// Graph::launch() patches -- performs the input rotation, and republishes the
+// four pointers the downstream kernels need (B, C, A_had, svh) through a
+// per-device Exl3GemvGraphParams block. Graph::launch() patches ONE site per
+// caller params entry, so spreading the six GP ids across three kernels (the
+// original plan for this work item) would leave the later copies stale; the
+// republish is what makes a multi-kernel node sequence patchable at all.
+//
+// This path requires all three transform tensors (suh, A_had, svh): with them
+// present the kernel count is fixed at three, so the site group always lands
+// on the prologue. EXL3 quant linears always carry su/sv, so nothing real is
+// excluded. Kill switch: EXL3_GEMV_GRAPH=0 (the routing site also honours
+// EXL3_GEMV=0/1/2 exactly like the non-graph path).
+
+static bool exl3_gemv_graph_enabled()
+{
+    const char* env = std::getenv("EXL3_GEMV_GRAPH");
+    if (!env) return true;
+    return atoi(env) != 0;
+}
+
+// allow_alloc must be false while a graph is capturing: hipMalloc synchronizes
+// the device, which INVALIDATES an active stream capture ("operation failed due
+// to a previous error during capture" on the next call). The eager first pass
+// every BC module runs before its capture is where allocation happens -- the
+// non-graph try_launch below pre-warms unconditionally -- and a capture that
+// somehow arrives on a cold device declines to the cooperative kernel instead.
+static Exl3GemvGraphParams* exl3_gemv_graph_param_block(int device, bool allow_alloc)
+{
+    static std::mutex mtx;
+    static Exl3GemvGraphParams* blocks[64] = {};
+    if (device < 0 || device >= 64) return nullptr;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!blocks[device] && allow_alloc)
+    {
+        void* p = nullptr;
+        if (cudaMalloc(&p, sizeof(Exl3GemvGraphParams)) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        blocks[device] = (Exl3GemvGraphParams*) p;
+    }
+    return blocks[device];
+}
+
+static void exl3_gemv_graph_prewarm(int device)
+{
+    (void) exl3_gemv_graph_param_block(device, true);
+}
+
+// Prologue: argument order 0-5 is load-bearing -- these indices are the graph
+// patch sites, recorded in the cooperative kernel's order so the upstream
+// callers' params subsequences match. B, C and svh take no part in this
+// kernel's own math.
+static __global__
+__launch_bounds__(256)
+void exl3_gemv_graph_had_in_kernel
+(
+    const half* __restrict__ A,        // 0: GP_gemm_A
+    const uint16_t* __restrict__ B,    // 1: GP_gemm_B_trellis (patch host only)
+    void* __restrict__ C,              // 2: GP_gemm_C (patch host only)
+    const half* __restrict__ suh,      // 3: GP_gemm_B_suh
+    half* __restrict__ A_had,          // 4: GP_gemm_A_had
+    const half* __restrict__ svh,      // 5: GP_gemm_B_svh (patch host only)
+    Exl3GemvGraphParams* __restrict__ pb,
+    const int size_k
+)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        pb->B = B;
+        pb->C = C;
+        pb->A_had = A_had;
+        pb->svh = svh;
+    }
+
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp_id >= size_k / 128) return;
+    int offset = warp_id * 128;
+    had_hf_r_128_inner<true, false>
+    (
+        A + offset,
+        A_had + offset,
+        suh + offset,
+        0.088388347648f  // 1/sqrt(128)
+    );
+}
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
+static __global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_graph_dot_kernel
+(
+    const Exl3GemvGraphParams* __restrict__ pb,
+    const int size_k,
+    const int size_n
+)
+{
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int n_tiles = size_n / 16;
+    if (tile_n >= n_tiles) return;
+
+    extern __shared__ char shared_mem[];
+    constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
+    half* sh_b_dq = (half*) shared_mem;
+    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
+    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
+    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
+
+    float accum = exl3_gemv_dot_tile<bits, cb>
+    (
+        pb->A_had, pb->B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant
+    );
+
+    if (lane < 16)
+    {
+        const int out_idx = tile_n * 16 + lane;
+        if constexpr (c_fp32)
+            ((float*) pb->C)[out_idx] = accum;
+        else
+            ((half*) pb->C)[out_idx] = __float2half(accum);
+    }
+}
+
+template <bool c_fp32>
+static __global__
+__launch_bounds__(256)
+void exl3_gemv_graph_had_out_kernel
+(
+    const Exl3GemvGraphParams* __restrict__ pb,
+    const int size_n
+)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp_id >= size_n / 128) return;
+    int offset = warp_id * 128;
+    if constexpr (c_fp32)
+        had_ff_r_128_inner<false, true>
+        (
+            ((const float*) pb->C) + offset,
+            ((float*) pb->C) + offset,
+            pb->svh + offset,
+            0.088388347648f  // 1/sqrt(128)
+        );
+    else
+        had_hf_r_128_inner<false, true>
+        (
+            ((const half*) pb->C) + offset,
+            ((half*) pb->C) + offset,
+            pb->svh + offset,
+            0.088388347648f  // 1/sqrt(128)
+        );
+}
+
+bool exl3_gemv_graph_try_launch
+(
+    const half* A_ptr,
+    const uint16_t* B_ptr,
+    void* C_ptr,
+    const half* suh_ptr,
+    half* A_had_ptr,
+    const half* svh_ptr,
+    int size_m,
+    int size_k,
+    int size_n,
+    int K,
+    int cb,
+    bool c_fp32,
+    int device,
+    cudaStream_t stream,
+    Graph* graph
+)
+{
+    if (size_m != 1) return false;
+    if (K < 1 || K > 8) return false;
+    if (size_k % 128 || size_n % 128) return false;
+    if (!suh_ptr || !A_had_ptr || !svh_ptr) return false;
+
+    int mode = exl3_gemv_env_mode();
+    if (mode == 0) return false;
+    if (mode != 2 && !exl3_gemv_rdna_pays(size_k, size_n)) return false;
+    if (!exl3_gemv_graph_enabled()) return false;
+
+    // Never allocate here: this function only runs during capture, where
+    // hipMalloc would invalidate the graph. Cold block -> cooperative kernel.
+    Exl3GemvGraphParams* pb = exl3_gemv_graph_param_block(device, false);
+    if (!pb) return false;
+
+    // 1. Prologue + input rotation
+    {
+        int blocks = CEIL_DIVIDE((size_k / 128) * 32, 256);
+        hipLaunchKernelGGL
+        (
+            exl3_gemv_graph_had_in_kernel,
+            dim3(blocks), dim3(256), 0, stream,
+            A_ptr, B_ptr, C_ptr, suh_ptr, A_had_ptr, svh_ptr, pb, size_k
+        );
+        if (graph)
+        {
+            void* k = (void*) exl3_gemv_graph_had_in_kernel;
+            graph->record_param(k, GP_gemm_A, 0);
+            graph->record_param(k, GP_gemm_B_trellis, 1);
+            graph->record_param(k, GP_gemm_C, 2);
+            graph->record_param(k, GP_gemm_B_suh, 3);
+            graph->record_param(k, GP_gemm_A_had, 4);
+            graph->record_param(k, GP_gemm_B_svh, 5);
+            graph->record_param(k, GP_end, 0);
+        }
+    }
+
+    // 2. GEMV -- same wave selection as the non-graph path
+    {
+        int n_tiles = size_n / 16;
+        int k_blocks = size_k / 16;
+        int warps_per_block = exl3_gemv_rdna_warps(n_tiles, k_blocks);
+        int num_blocks = (n_tiles + warps_per_block - 1) / warps_per_block;
+        size_t smem = exl3_gemv_smem_bytes(warps_per_block);
+
+        #define LAUNCH_GGEMV_WAVES(bits_val, codebook, warps) \
+            if (c_fp32) { \
+                hipLaunchKernelGGL( \
+                    (exl3_gemv_graph_dot_kernel<bits_val, true, codebook, warps>), \
+                    dim3(num_blocks), dim3(warps * 32), smem, stream, \
+                    pb, size_k, size_n); \
+            } else { \
+                hipLaunchKernelGGL( \
+                    (exl3_gemv_graph_dot_kernel<bits_val, false, codebook, warps>), \
+                    dim3(num_blocks), dim3(warps * 32), smem, stream, \
+                    pb, size_k, size_n); \
+            }
+
+        #define LAUNCH_GGEMV_CB(bits_val, codebook) \
+            switch (warps_per_block) { \
+                case 4:  LAUNCH_GGEMV_WAVES(bits_val, codebook, 4);  break; \
+                case 8:  LAUNCH_GGEMV_WAVES(bits_val, codebook, 8);  break; \
+                case 16: LAUNCH_GGEMV_WAVES(bits_val, codebook, 16); break; \
+            }
+
+        #define LAUNCH_GGEMV(bits_val) \
+            switch (cb) { \
+                case 0: LAUNCH_GGEMV_CB(bits_val, 0); break; \
+                case 1: LAUNCH_GGEMV_CB(bits_val, 1); break; \
+                case 2: LAUNCH_GGEMV_CB(bits_val, 2); break; \
+            }
+
+        switch (K) {
+            case 1: LAUNCH_GGEMV(1); break;
+            case 2: LAUNCH_GGEMV(2); break;
+            case 3: LAUNCH_GGEMV(3); break;
+            case 4: LAUNCH_GGEMV(4); break;
+            case 5: LAUNCH_GGEMV(5); break;
+            case 6: LAUNCH_GGEMV(6); break;
+            case 7: LAUNCH_GGEMV(7); break;
+            case 8: LAUNCH_GGEMV(8); break;
+        }
+
+        #undef LAUNCH_GGEMV
+        #undef LAUNCH_GGEMV_CB
+        #undef LAUNCH_GGEMV_WAVES
+    }
+
+    // 3. Output rotation
+    {
+        int blocks = CEIL_DIVIDE((size_n / 128) * 32, 256);
+        if (c_fp32)
+            hipLaunchKernelGGL
+            (
+                exl3_gemv_graph_had_out_kernel<true>,
+                dim3(blocks), dim3(256), 0, stream,
+                pb, size_n
+            );
+        else
+            hipLaunchKernelGGL
+            (
+                exl3_gemv_graph_had_out_kernel<false>,
+                dim3(blocks), dim3(256), 0, stream,
+                pb, size_n
+            );
+    }
+
+    return true;
 }

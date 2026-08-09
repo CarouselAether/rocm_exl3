@@ -73,41 +73,29 @@ static inline size_t exl3_gemv_smem_bytes(int warps_per_block)
 }
 
 // =============================================================================
-// Dot-product GEMV kernel -- templated on WARPS_PER_BLOCK
+// Dot-product tile loop -- shared between the single-matrix GEMV kernel below
+// and the multi-matrix (expert-batched) GEMV in exl3_mgemv_rdna.hip
 // =============================================================================
+//
+// Extracted verbatim from exl3_gemv_dot_kernel; the kernel wrappers own the
+// grid/tile mapping and the output store, this owns everything per-warp. All 32
+// lanes must enter (the unswizzle round trip uses the full warp); the return
+// value is the accumulated dot product, meaningful for lanes 0-15 only.
 
-template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
-__global__
-__launch_bounds__(WARPS_PER_BLOCK * 32)
-__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
-void exl3_gemv_dot_kernel
+template <int bits, int cb>
+__device__ __forceinline__ float exl3_gemv_dot_tile
 (
-    const half* __restrict__ A,
-    const uint16_t* __restrict__ B,
-    void* __restrict__ C,
+    const half* __restrict__ A,        // rotated input, [size_k]
+    const uint16_t* __restrict__ B,    // quantized trellis for one matrix
     const int size_k,
-    const int size_n
+    const int n_tiles,                 // size_n / 16 for THIS matrix
+    const int tile_n,                  // this warp's N-tile
+    const int lane,
+    half* my_sh_b,                     // per-warp staging, 16 * EXL3_GEMV_SH_STRIDE halves
+    uint16_t* my_sh_b_quant            // per-warp staging, EXL3_GEMV_SH_QUANT_U16 u16
 )
 {
-    const int warp_id = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
-
-    // Each warp handles one N-tile (16 outputs)
-    const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    const int n_tiles = size_n / 16;
-
-    if (tile_n >= n_tiles) return;
-
-    // Dynamic shared memory -- layout mirrors exl3_gemv_smem_bytes() above
-    extern __shared__ char shared_mem[];
-
     constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
-
-    half* sh_b_dq = (half*) shared_mem;
-    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
-
-    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
-    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
     // Each lane 0-15 accumulates one output element
     float accum = 0.0f;
@@ -236,6 +224,51 @@ void exl3_gemv_dot_kernel
         __syncwarp();
     }
 
+    return accum;
+}
+
+// =============================================================================
+// Dot-product GEMV kernel -- templated on WARPS_PER_BLOCK
+// =============================================================================
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
+__global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_dot_kernel
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    void* __restrict__ C,
+    const int size_k,
+    const int size_n
+)
+{
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    // Each warp handles one N-tile (16 outputs)
+    const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int n_tiles = size_n / 16;
+
+    if (tile_n >= n_tiles) return;
+
+    // Dynamic shared memory -- layout mirrors exl3_gemv_smem_bytes() above
+    extern __shared__ char shared_mem[];
+
+    constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
+
+    half* sh_b_dq = (half*) shared_mem;
+    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
+
+    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
+    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
+
+    float accum = exl3_gemv_dot_tile<bits, cb>
+    (
+        A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant
+    );
+
     // =========================================================================
     // Step 4: Write output
     // =========================================================================
@@ -267,7 +300,11 @@ void exl3_gemv_dot_kernel
 // folded into the pointer -- which is what upstream's own GEMM call sites do
 // (suh + (this_warp * 128) % size_k).
 
-__global__
+// static: this header is included by two RDC TUs since the multi-matrix GEMV
+// landed (exl3_gemv_rdna.hip and exl3_mgemv_rdna.hip); non-template __global__
+// definitions would collide at device link. Each TU owning a private copy is
+// harmless -- only exl3_gemv_rdna.hip launches these three.
+static __global__
 __launch_bounds__(256)
 void exl3_gemv_rdna_had_in_kernel
 (
@@ -293,7 +330,7 @@ void exl3_gemv_rdna_had_in_kernel
     }
 }
 
-__global__
+static __global__
 __launch_bounds__(256)
 void exl3_gemv_rdna_had_out_half_kernel
 (
@@ -319,7 +356,7 @@ void exl3_gemv_rdna_had_out_half_kernel
     }
 }
 
-__global__
+static __global__
 __launch_bounds__(256)
 void exl3_gemv_rdna_had_out_float_kernel
 (
