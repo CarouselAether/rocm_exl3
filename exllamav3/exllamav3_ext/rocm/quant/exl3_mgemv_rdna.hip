@@ -275,10 +275,69 @@ void exl3_mgemv_dot_kernel
 
     float accum = exl3_gemv_dot_tile<bits, cb>
     (
-        A_j, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant
+        A_j, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
+        0, size_k / 16
     );
 
     if (lane < 16)
+    {
+        const int64_t out_idx = (int64_t) j * size_n + tile_n * 16 + lane;
+        if constexpr (c_fp32)
+            ((float*) pb->C)[out_idx] = accum;
+        else
+            ((half*) pb->C)[out_idx] = __float2half(accum);
+    }
+}
+
+// Split-K form of kernel 2: one block per (expert, N-tile), warps share K.
+// The expert shapes this path exists for are exactly the narrow-output ones
+// the single-warp form starves on (64 tiles at 1024 wide), so in practice
+// this is the form MoE decode takes; the threshold keeps parity with the
+// single-matrix sites.
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
+__global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_mgemv_dot_kernel_splitk
+(
+    const Exl3MgemvParams* __restrict__ pb,
+    const uintptr_t* __restrict__ B_list,
+    const half* __restrict__ A_had,
+    const int size_k,
+    const int size_n,
+    const int bszm,
+    const int min_index,
+    const int max_index
+)
+{
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int j = blockIdx.y;
+    const int tile_n = blockIdx.x;
+    const int n_tiles = size_n / 16;
+
+    const int64_t* indices = pb->indices;
+    int orig_pos;
+    int mat_index = exl3_mgemv_mat_index(indices, j, bszm, min_index, max_index, &orig_pos);
+    if (mat_index < 0) return;   // whole block exits together; no sync hazard
+
+    const uint16_t* B = (const uint16_t*) B_list[mat_index];
+    const half* A_j = A_had + (int64_t) j * size_k;
+
+    extern __shared__ char shared_mem[];
+    constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
+    half* sh_b_dq = (half*) shared_mem;
+    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
+    float* sh_red = (float*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
+    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
+    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
+
+    float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
+    (
+        A_j, B, size_k, n_tiles, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant, sh_red
+    );
+
+    if (warp_id == 0 && lane < 16)
     {
         const int64_t out_idx = (int64_t) j * size_n + tile_n * 16 + lane;
         if constexpr (c_fp32)
@@ -477,25 +536,36 @@ bool exl3_mgemv_try_launch
     }
 
     // -------------------------------------------------------------------------
-    // 2. GEMV
+    // 2. GEMV -- split-K when the per-expert output is narrow (same rule as
+    //    the single-matrix sites), which for MoE decode it always is
     // -------------------------------------------------------------------------
     {
         int n_tiles = size_n / 16;
-        dim3 grid(CEIL_DIVIDE(n_tiles, EXL3_MGEMV_WARPS), bszm);
-        dim3 block(EXL3_MGEMV_WARPS * 32);
-        size_t smem = exl3_gemv_smem_bytes(EXL3_MGEMV_WARPS);
+        bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
 
-        #define LAUNCH_MGEMV_CB(bits_val, codebook) \
+        dim3 grid(splitk ? n_tiles : CEIL_DIVIDE(n_tiles, EXL3_MGEMV_WARPS), bszm);
+        dim3 block(EXL3_MGEMV_WARPS * 32);
+        size_t smem = splitk ? exl3_gemv_smem_bytes_splitk(EXL3_MGEMV_WARPS)
+                             : exl3_gemv_smem_bytes(EXL3_MGEMV_WARPS);
+
+        #define LAUNCH_MGEMV_FP(bits_val, codebook, kernel_name) \
             if (c_fp32) { \
                 hipLaunchKernelGGL( \
-                    (exl3_mgemv_dot_kernel<bits_val, true, codebook, EXL3_MGEMV_WARPS>), \
+                    (kernel_name<bits_val, true, codebook, EXL3_MGEMV_WARPS>), \
                     grid, block, smem, stream, \
                     pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index); \
             } else { \
                 hipLaunchKernelGGL( \
-                    (exl3_mgemv_dot_kernel<bits_val, false, codebook, EXL3_MGEMV_WARPS>), \
+                    (kernel_name<bits_val, false, codebook, EXL3_MGEMV_WARPS>), \
                     grid, block, smem, stream, \
                     pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index); \
+            }
+
+        #define LAUNCH_MGEMV_CB(bits_val, codebook) \
+            if (splitk) { \
+                LAUNCH_MGEMV_FP(bits_val, codebook, exl3_mgemv_dot_kernel_splitk) \
+            } else { \
+                LAUNCH_MGEMV_FP(bits_val, codebook, exl3_mgemv_dot_kernel) \
             }
 
         #define LAUNCH_MGEMV(bits_val) \
@@ -518,6 +588,7 @@ bool exl3_mgemv_try_launch
 
         #undef LAUNCH_MGEMV
         #undef LAUNCH_MGEMV_CB
+        #undef LAUNCH_MGEMV_FP
     }
 
     // -------------------------------------------------------------------------

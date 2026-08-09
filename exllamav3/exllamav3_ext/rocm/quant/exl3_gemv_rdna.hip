@@ -61,6 +61,15 @@ static int exl3_gemv_env_mode()
     return atoi(env);
 }
 
+// EXL3_GEMV_SPLITK = 0 pins the single-warp kernel for every shape -- the A/B
+// switch for the in-block split-K form. Re-read per call, like EXL3_GEMV.
+bool exl3_gemv_splitk_enabled()
+{
+    const char* env = std::getenv("EXL3_GEMV_SPLITK");
+    if (!env) return true;
+    return atoi(env) != 0;
+}
+
 // -----------------------------------------------------------------------------
 // Eligibility
 // -----------------------------------------------------------------------------
@@ -162,23 +171,43 @@ static void exl3_gemv_rdna_launch
     int n_tiles = size_n / 16;
     int k_blocks = size_k / 16;
 
+    // Narrow outputs starve the single-warp form (n_tiles warps total); the
+    // split-K form gives them WARPS x the wave count. Wide outputs keep the
+    // single-warp form. EXL3_GEMV_SPLITK=0 pins the single-warp form
+    // everywhere (A/B switch).
+    bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
+
     int warps_per_block = exl3_gemv_rdna_warps(n_tiles, k_blocks);
     int num_blocks = (n_tiles + warps_per_block - 1) / warps_per_block;
 
     // Single source for the LDS figure -- see exl3_gemv_kernel_rdna.hip.h
     size_t shared_mem_size = exl3_gemv_smem_bytes(warps_per_block);
 
-    #define LAUNCH_GEMV_WAVES(bits_val, codebook, warps) \
+    if (splitk)
+    {
+        warps_per_block = EXL3_GEMV_SPLITK_WARPS;
+        num_blocks = n_tiles;
+        shared_mem_size = exl3_gemv_smem_bytes_splitk(warps_per_block);
+    }
+
+    #define LAUNCH_GEMV_WAVES_K(bits_val, codebook, warps, kernel_name) \
         if (c_fp32) { \
             hipLaunchKernelGGL( \
-                (exl3_gemv_dot_kernel<bits_val, true, codebook, warps>), \
+                (kernel_name<bits_val, true, codebook, warps>), \
                 dim3(num_blocks), dim3(warps * 32), shared_mem_size, stream, \
                 gemv_input, B_ptr, C_ptr, size_k, size_n); \
         } else { \
             hipLaunchKernelGGL( \
-                (exl3_gemv_dot_kernel<bits_val, false, codebook, warps>), \
+                (kernel_name<bits_val, false, codebook, warps>), \
                 dim3(num_blocks), dim3(warps * 32), shared_mem_size, stream, \
                 gemv_input, B_ptr, C_ptr, size_k, size_n); \
+        }
+
+    #define LAUNCH_GEMV_WAVES(bits_val, codebook, warps) \
+        if (splitk) { \
+            LAUNCH_GEMV_WAVES_K(bits_val, codebook, EXL3_GEMV_SPLITK_WARPS, exl3_gemv_dot_kernel_splitk) \
+        } else { \
+            LAUNCH_GEMV_WAVES_K(bits_val, codebook, warps, exl3_gemv_dot_kernel) \
         }
 
     #define LAUNCH_GEMV_CB(bits_val, codebook) \
@@ -209,6 +238,7 @@ static void exl3_gemv_rdna_launch
     #undef LAUNCH_GEMV
     #undef LAUNCH_GEMV_CB
     #undef LAUNCH_GEMV_WAVES
+    #undef LAUNCH_GEMV_WAVES_K
 
     // =========================================================================
     // Output Hadamard transform (SVH), in place on C
@@ -491,10 +521,51 @@ void exl3_gemv_graph_dot_kernel
 
     float accum = exl3_gemv_dot_tile<bits, cb>
     (
-        pb->A_had, pb->B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant
+        pb->A_had, pb->B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
+        0, size_k / 16
     );
 
     if (lane < 16)
+    {
+        const int out_idx = tile_n * 16 + lane;
+        if constexpr (c_fp32)
+            ((float*) pb->C)[out_idx] = accum;
+        else
+            ((half*) pb->C)[out_idx] = __float2half(accum);
+    }
+}
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
+static __global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_graph_dot_kernel_splitk
+(
+    const Exl3GemvGraphParams* __restrict__ pb,
+    const int size_k,
+    const int size_n
+)
+{
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tile_n = blockIdx.x;
+    const int n_tiles = size_n / 16;
+
+    extern __shared__ char shared_mem[];
+    constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
+    half* sh_b_dq = (half*) shared_mem;
+    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
+    float* sh_red = (float*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
+    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
+    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
+
+    float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
+    (
+        pb->A_had, pb->B, size_k, n_tiles, tile_n, warp_id, lane,
+        my_sh_b, my_sh_b_quant, sh_red
+    );
+
+    if (warp_id == 0 && lane < 16)
     {
         const int out_idx = tile_n * 16 + lane;
         if constexpr (c_fp32)
@@ -590,25 +661,42 @@ bool exl3_gemv_graph_try_launch
         }
     }
 
-    // 2. GEMV -- same wave selection as the non-graph path
+    // 2. GEMV -- same wave selection and split-K rule as the non-graph path.
+    //    The captured kernel choice is baked at capture; shapes are static per
+    //    call site, so the heuristic is graph-stable by construction.
     {
         int n_tiles = size_n / 16;
         int k_blocks = size_k / 16;
+        bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
+
         int warps_per_block = exl3_gemv_rdna_warps(n_tiles, k_blocks);
         int num_blocks = (n_tiles + warps_per_block - 1) / warps_per_block;
         size_t smem = exl3_gemv_smem_bytes(warps_per_block);
+        if (splitk)
+        {
+            warps_per_block = EXL3_GEMV_SPLITK_WARPS;
+            num_blocks = n_tiles;
+            smem = exl3_gemv_smem_bytes_splitk(warps_per_block);
+        }
 
-        #define LAUNCH_GGEMV_WAVES(bits_val, codebook, warps) \
+        #define LAUNCH_GGEMV_WAVES_K(bits_val, codebook, warps, kernel_name) \
             if (c_fp32) { \
                 hipLaunchKernelGGL( \
-                    (exl3_gemv_graph_dot_kernel<bits_val, true, codebook, warps>), \
+                    (kernel_name<bits_val, true, codebook, warps>), \
                     dim3(num_blocks), dim3(warps * 32), smem, stream, \
                     pb, size_k, size_n); \
             } else { \
                 hipLaunchKernelGGL( \
-                    (exl3_gemv_graph_dot_kernel<bits_val, false, codebook, warps>), \
+                    (kernel_name<bits_val, false, codebook, warps>), \
                     dim3(num_blocks), dim3(warps * 32), smem, stream, \
                     pb, size_k, size_n); \
+            }
+
+        #define LAUNCH_GGEMV_WAVES(bits_val, codebook, warps) \
+            if (splitk) { \
+                LAUNCH_GGEMV_WAVES_K(bits_val, codebook, EXL3_GEMV_SPLITK_WARPS, exl3_gemv_graph_dot_kernel_splitk) \
+            } else { \
+                LAUNCH_GGEMV_WAVES_K(bits_val, codebook, warps, exl3_gemv_graph_dot_kernel) \
             }
 
         #define LAUNCH_GGEMV_CB(bits_val, codebook) \
@@ -639,6 +727,7 @@ bool exl3_gemv_graph_try_launch
         #undef LAUNCH_GGEMV
         #undef LAUNCH_GGEMV_CB
         #undef LAUNCH_GGEMV_WAVES
+        #undef LAUNCH_GGEMV_WAVES_K
     }
 
     // 3. Output rotation

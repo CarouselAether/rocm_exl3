@@ -92,7 +92,9 @@ __device__ __forceinline__ float exl3_gemv_dot_tile
     const int tile_n,                  // this warp's N-tile
     const int lane,
     half* my_sh_b,                     // per-warp staging, 16 * EXL3_GEMV_SH_STRIDE halves
-    uint16_t* my_sh_b_quant            // per-warp staging, EXL3_GEMV_SH_QUANT_U16 u16
+    uint16_t* my_sh_b_quant,           // per-warp staging, EXL3_GEMV_SH_QUANT_U16 u16
+    const int kb_begin,                // k16-tile range for THIS warp; (0, size_k/16)
+    const int kb_end                   //   for the whole-K single-warp form
 )
 {
     constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
@@ -100,10 +102,9 @@ __device__ __forceinline__ float exl3_gemv_dot_tile
     // Each lane 0-15 accumulates one output element
     float accum = 0.0f;
 
-    const int num_k_tiles = size_k / 16;
     const int tile_elements = 16 * bits;
 
-    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++)
+    for (int k_tile = kb_begin; k_tile < kb_end; k_tile++)
     {
         const int k_offset = k_tile * 16;
 
@@ -266,13 +267,135 @@ void exl3_gemv_dot_kernel
 
     float accum = exl3_gemv_dot_tile<bits, cb>
     (
-        A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant
+        A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
+        0, size_k / 16
     );
 
     // =========================================================================
     // Step 4: Write output
     // =========================================================================
     if (lane < 16)
+    {
+        const int out_idx = tile_n * 16 + lane;
+        if constexpr (c_fp32)
+            ((float*) C)[out_idx] = accum;
+        else
+            ((half*) C)[out_idx] = __float2half(accum);
+    }
+}
+
+// =============================================================================
+// In-block split-K form -- one block per N-tile, warps share the K range
+// =============================================================================
+//
+// The single-warp form above gives a matmul only size_n/16 warps of
+// parallelism, which starves narrow outputs: 3072->1024 is 64 warps in 8
+// blocks on a part with 80 SIMDs. llama.cpp's mmvq solves the same problem on
+// this hardware with one wave per output row and lanes splitting K; the EXL3
+// trellis decodes in 16x16 tiles so one row per wave is off the table, but the
+// K split transplants: all WARPS_PER_BLOCK warps of a block work the SAME
+// N-tile on disjoint contiguous k16 ranges, then reduce through 16 floats of
+// LDS per warp. Total waves multiply by WARPS_PER_BLOCK with zero extra
+// global traffic (the ranges are disjoint), no atomics, no workspace, no
+// cooperative launch. Wide outputs that already saturate the device keep the
+// single-warp form -- see EXL3_GEMV_SPLITK_MAX_TILES at the launch sites.
+//
+// Per-warp staging (my_sh_b / my_sh_b_quant) is the same carve as the
+// single-warp form; sh_red is WARPS_PER_BLOCK * 16 floats appended after it
+// (exl3_gemv_smem_bytes_splitk). Every thread of the block must enter (the
+// reduction has a __syncthreads); the return value is the full dot product,
+// meaningful for warp 0 lanes 0-15 only.
+
+static inline size_t exl3_gemv_smem_bytes_splitk(int warps_per_block)
+{
+    return exl3_gemv_smem_bytes(warps_per_block) +
+           (size_t) warps_per_block * 16 * sizeof(float);
+}
+
+template <int bits, int cb, int WARPS_PER_BLOCK>
+__device__ __forceinline__ float exl3_gemv_dot_tile_splitk
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    const int size_k,
+    const int n_tiles,
+    const int tile_n,
+    const int warp_id,
+    const int lane,
+    half* my_sh_b,
+    uint16_t* my_sh_b_quant,
+    float* sh_red                      // WARPS_PER_BLOCK * 16 floats
+)
+{
+    const int num_k_tiles = size_k / 16;
+    const int chunk = (num_k_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    const int kb0 = warp_id * chunk;
+    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+
+    float accum = 0.0f;
+    if (kb0 < kb1)
+        accum = exl3_gemv_dot_tile<bits, cb>
+        (
+            A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
+            kb0, kb1
+        );
+
+    if (lane < 16) sh_red[warp_id * 16 + lane] = accum;
+    __syncthreads();
+
+    float total = 0.0f;
+    if (warp_id == 0 && lane < 16)
+    {
+        #pragma unroll
+        for (int w = 0; w < WARPS_PER_BLOCK; ++w)
+            total += sh_red[w * 16 + lane];
+    }
+    return total;
+}
+
+// Above this many N-tiles the single-warp form already exceeds ~6 waves/SIMD
+// on the 80-SIMD part and is kept (lm_head sits there, measured at roofline);
+// below it, split-K multiplies the wave count by WARPS_PER_BLOCK. Sweep with
+// bench_gemv_vs_gemm before trusting a different value.
+#define EXL3_GEMV_SPLITK_MAX_TILES 512
+
+// How many warps share a tile in the split-K form, everywhere it is used
+#define EXL3_GEMV_SPLITK_WARPS 8
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
+__global__
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_dot_kernel_splitk
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    void* __restrict__ C,
+    const int size_k,
+    const int size_n
+)
+{
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    // One block per N-tile; the block's warps split K
+    const int tile_n = blockIdx.x;
+    const int n_tiles = size_n / 16;
+
+    extern __shared__ char shared_mem[];
+    constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
+    half* sh_b_dq = (half*) shared_mem;
+    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
+    float* sh_red = (float*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
+    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
+    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
+
+    float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
+    (
+        A, B, size_k, n_tiles, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant, sh_red
+    );
+
+    if (warp_id == 0 && lane < 16)
     {
         const int out_idx = tile_n * 16 + lane;
         if constexpr (c_fp32)
