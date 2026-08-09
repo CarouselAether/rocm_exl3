@@ -260,9 +260,108 @@ void run_bench(int size_k, int size_n, int reps, bool lds_core = false)
     (void) hipFree(dBq); (void) hipFree(dA); (void) hipFree(dC);
 }
 
+// ---------------------------------------------------------------------------
+// Launch-geometry sweep on cache-defeating working sets. The bandwidth section
+// above re-reads ONE B buffer per repeat, so any shape near or under the
+// 32 MiB Infinity Cache reads high (measured up to +50% on a 33 MB shape).
+// Here NB distinct B buffers rotate across repeats, so steady-state traffic is
+// DRAM. Sweeps the single-warp form at 4/8/16 waves and the in-block split-K
+// form at 4/8/16 warps, both cores, for one (bits, k, n) shape.
+// ---------------------------------------------------------------------------
+
+template <int bits, int cb, int WARPS, bool SPLITK>
+void sweep_one(int size_k, int size_n, int reps, bool lds_core)
+{
+    constexpr int NB = 4;
+    const int k_blocks = size_k / 16;
+    const int n_tiles = size_n / 16;
+    const size_t bq_elems = (size_t) k_blocks * n_tiles * (256 * bits / 16);
+
+    uint16_t* dBq[NB]; half* dA; void* dC;
+    for (int i = 0; i < NB; i++)
+    {
+        (void) hipMalloc(&dBq[i], bq_elems * 2);
+        (void) hipMemset(dBq[i], 0x5a ^ i, bq_elems * 2);
+    }
+    (void) hipMalloc(&dA, (size_t) size_k * 2);
+    (void) hipMalloc(&dC, (size_t) size_n * 4);
+    (void) hipMemset(dA, 0x11, (size_t) size_k * 2);
+
+    const int num_blocks = SPLITK ? n_tiles : (n_tiles + WARPS - 1) / WARPS;
+    const size_t smem = SPLITK ? exl3_gemv_smem_bytes_splitk(WARPS)
+                               : exl3_gemv_smem_bytes(WARPS);
+
+    auto once = [&](int i) {
+        if constexpr (SPLITK)
+            hipLaunchKernelGGL((exl3_gemv_dot_kernel_splitk<bits, true, cb, WARPS>),
+                               dim3(num_blocks), dim3(WARPS * 32), smem, 0,
+                               dA, dBq[i], dC, size_k, size_n, lds_core);
+        else
+            hipLaunchKernelGGL((exl3_gemv_dot_kernel<bits, true, cb, WARPS>),
+                               dim3(num_blocks), dim3(WARPS * 32), smem, 0,
+                               dA, dBq[i], dC, size_k, size_n, lds_core);
+    };
+
+    once(0); once(1); (void) hipDeviceSynchronize();   // warm up, discarded
+
+    std::vector<double> ms;
+    hipEvent_t e0, e1; (void) hipEventCreate(&e0); (void) hipEventCreate(&e1);
+    for (int r = 0; r < reps; r++)
+    {
+        (void) hipEventRecord(e0);
+        once(r % NB);
+        (void) hipEventRecord(e1);
+        (void) hipEventSynchronize(e1);
+        float t = 0.f; (void) hipEventElapsedTime(&t, e0, e1);
+        ms.push_back(t);
+    }
+    std::sort(ms.begin(), ms.end());
+    double med = ms[ms.size() / 2];
+    double spread = (ms.back() - ms.front()) / med * 100.0;
+    double b_gb = (double) size_k * size_n * bits / 8.0 / 1e9;
+
+    printf("  bits=%d k=%-5d n=%-5d %s %-6s waves=%-2d  med=%7.3f ms  "
+           "spread=%5.1f%%  %6.1f GB/s\n",
+           bits, size_k, size_n, lds_core ? "lds" : "dir",
+           SPLITK ? "splitk" : "single", WARPS, med, spread, b_gb / (med / 1000.0));
+
+    for (int i = 0; i < NB; i++) (void) hipFree(dBq[i]);
+    (void) hipFree(dA); (void) hipFree(dC);
+}
+
+template <int bits, int cb>
+void sweep_shape(int size_k, int size_n, int reps)
+{
+    sweep_one<bits, cb, 4,  false>(size_k, size_n, reps, false);
+    sweep_one<bits, cb, 8,  false>(size_k, size_n, reps, false);
+    sweep_one<bits, cb, 16, false>(size_k, size_n, reps, false);
+    sweep_one<bits, cb, 4,  true >(size_k, size_n, reps, false);
+    sweep_one<bits, cb, 8,  true >(size_k, size_n, reps, false);
+    sweep_one<bits, cb, 16, true >(size_k, size_n, reps, false);
+    sweep_one<bits, cb, 8,  false>(size_k, size_n, reps, true);   // lds reference
+    sweep_one<bits, cb, 8,  true >(size_k, size_n, reps, true);
+    printf("\n");
+}
+
 int main()
 {
     srand(1234);
+
+    if (getenv("GEMV_SWEEP"))
+    {
+        printf("launch-geometry sweep, DRAM-resident (4 rotating B buffers), fp32 out\n\n");
+        printf(" Gemma-4-31B shapes, 6 bpw:\n");
+        sweep_shape<6, 1>(5376, 21504, 12);   // gate/up (n_tiles 1344, above splitk cap)
+        sweep_shape<6, 1>(21504, 5376, 12);   // down    (336 tiles, splitk today)
+        sweep_shape<6, 1>(5376, 8192, 12);    // q       (512 tiles, splitk boundary)
+        sweep_shape<6, 1>(8192, 5376, 12);    // o
+        printf(" Laguna expert shapes, 4 bpw:\n");
+        sweep_shape<4, 1>(3072, 1024, 12);    // expert down-proj slice
+        sweep_shape<4, 1>(1024, 3072, 12);    // expert gate/up slice
+        printf(" lm_head scale (does split-K still win at 16384 tiles?):\n");
+        sweep_shape<6, 1>(5376, 262144, 8);
+        return 0;
+    }
     printf("exl3_gemv_dot_kernel vs CPU reference (fp32 accumulate)\n");
     printf("reference weights via upstream reconstruct mapping\n\n");
 

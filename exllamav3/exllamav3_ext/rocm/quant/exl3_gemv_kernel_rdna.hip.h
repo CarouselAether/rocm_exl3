@@ -463,11 +463,15 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_splitk
     return total;
 }
 
-// Above this many N-tiles the single-warp form already exceeds ~6 waves/SIMD
-// on the 80-SIMD part and is kept (lm_head sits there, measured at roofline);
-// below it, split-K multiplies the wave count by WARPS_PER_BLOCK. Sweep with
-// bench_gemv_vs_gemm before trusting a different value.
-#define EXL3_GEMV_SPLITK_MAX_TILES 512
+// Above this many N-tiles the single-warp form is kept; below it, split-K
+// multiplies the wave count by WARPS_PER_BLOCK. 512 was tuned against the LDS
+// core; the barrier-free core shifted the balance — DRAM-resident sweep
+// (gemv_check GEMV_SWEEP=1, 2026-08-08): split-K wins at 1344 tiles by +29%
+// (208 vs 162 GB/s on 5376->21504) and only reaches parity at 16384 tiles
+// (lm_head, 227 GB/s both forms). 2048 flips every in-model projection to
+// split-K and leaves lm_head-scale outputs on the single-warp form, which
+// avoids 16k-block grids for no measured cost. Re-sweep if the core changes.
+#define EXL3_GEMV_SPLITK_MAX_TILES 2048
 
 // How many warps share a tile in the split-K form, everywhere it is used
 #define EXL3_GEMV_SPLITK_WARPS 8
