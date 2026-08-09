@@ -25,6 +25,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
+#include <cstdlib>
 #include "../../util.h"
 #include "../../util.cuh"
 #include "exl3_gemm_kernel_rdna.hip.h"
@@ -56,6 +57,42 @@ namespace cg = cooperative_groups;
 // fit per WGP instead of one. exl3_gemm_smem_bytes() in the RDNA kernel map
 // mirrors the kernel's own allocation and is the single source for it.
 #define EXL3_RDNA_SMEM(shape_idx) exl3_gemm_smem_bytes(K, (shape_idx))
+
+// -----------------------------------------------------------------------------
+// EXL3_RDNA_SMS_MULT: cooperative grid width in CUs rather than WGPs
+// -----------------------------------------------------------------------------
+// `get_num_sms()` returns cudaDeviceProp::multiProcessorCount, which on RDNA is
+// the **WGP** count -- 20 on a 40-CU gfx1151 -- while an NVIDIA SM is the unit
+// that actually hosts a workgroup. The cooperative grid is sized from it
+// (`block_grid(num_sms, 1, concurrency)` below), so a part that can hold one
+// workgroup per CU is asked for half that many.
+//
+// Measured on Laguna MoE decode, exl3_mgemm at m == 1 with 10 experts: the grid
+// comes out (2, 1, 10) = 20 workgroups of 256 threads = 160 waves across 160
+// SIMDs, and rocprofv3 reports OccupancyPercent 11.7-12.2% with MemUnitBusy only
+// 26-32%. Occupancy is identical at VGPR 144, 248 and 256, so it is the grid
+// width that pins it, not register pressure. Cooperative launch cannot
+// oversubscribe -- grid.sync() requires every block co-resident -- so the kernel
+// has no way to recover the missing memory-level parallelism.
+//
+// This is deliberately an env knob defaulting to 1 (no change) rather than a
+// silent 2: an oversubscribed cooperative grid is *refused* by the runtime, and
+// how many workgroups are genuinely co-resident depends on the shape's LDS and
+// VGPR use. Measure per shape before changing the default.
+//
+//   EXL3_RDNA_SMS_MULT=1  (default) upstream behaviour, grid sized in WGPs
+//   EXL3_RDNA_SMS_MULT=2            one workgroup per CU
+static int exl3_rdna_sms_mult()
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char* env = std::getenv("EXL3_RDNA_SMS_MULT");
+        int v = env ? atoi(env) : 1;
+        cached = (v >= 1 && v <= 8) ? v : 1;
+    }
+    return cached;
+}
 
 int exl3_gemm_tilesize_k_g[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n_g[] = {EXL3_GEMM_TILESIZE_N};
@@ -549,7 +586,8 @@ int exl3_mgemm_gr
     // Device properties
     int device;
     cudaGetDevice(&device);
-    int total_sms = DevCtx::instance().get_num_sms(device);
+    // EXL3_RDNA_SMS_MULT: see the note at the top -- get_num_sms() counts WGPs, not CUs
+    int total_sms = DevCtx::instance().get_num_sms(device) * exl3_rdna_sms_mult();
     int num_sms = force_num_sms ? force_num_sms : total_sms;
     int cc = DevCtx::instance().get_cc(device);
     int* locks = DevCtx::instance().get_locks(device);

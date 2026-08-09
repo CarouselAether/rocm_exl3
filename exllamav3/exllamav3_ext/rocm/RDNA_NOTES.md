@@ -205,6 +205,84 @@ A first probe of this reported the race as benign and was wrong: it used uniform
 lane values (all 1.0), where clamp-to-self and wrap are indistinguishable because
 `v += v` doubles to 32 either way. Reduction probes need distinct per-lane values.
 
+## Why mgemm is capped at ~1/3 roofline at m == 1
+
+Measured with rocprofv3 on `rocm_tools/bench_mgemm.py` (Laguna, 10 experts,
+3072->1024, K=4). The kernel is **occupancy-starved by the cooperative launch**,
+and it is not register pressure, not dequant, and not bandwidth:
+
+| shape | VGPR | duration | OccupancyPercent | MemUnitBusy |
+|---|---|---|---|---|
+| 1 (N=128) | 144 | 481.5 us | 12.16% | 46.40% |
+| 4 (N=512, selected) | 248 | 251.2 us | 11.88% | 25.89% |
+| 3 (N=384) | 256 | 211.8 us | 11.66% | 32.05% |
+
+Occupancy is ~12% at VGPR 144, 248 **and** 256, so registers are not the cap.
+`Grid_Size` is 5120 *threads* = 20 workgroups of 256, which is exactly
+`get_num_sms()` -- `multiProcessorCount`, reporting **WGPs (20), not CUs (40)**.
+The grid computes to `(2, 1, 10)` for 10 experts at `exl3_gemm_rdna.hip`:
+
+    num_sms = tiles;
+    if (num_sms * bszm > total_sms) num_sms = MAX(total_sms / bszm, 1);
+    concurrency = MIN(total_sms / num_sms, bszm);
+
+20 workgroups x 8 waves = 160 waves over 160 SIMDs is ~1 wave per SIMD, which is
+why `MemUnitBusy` sits at 26-32% and the achieved rate is 55-66 GB/s against the
+206 GB/s roofline.
+
+**`force_num_sms` is inert in the mgemm path** -- `num_sms = tiles` overwrites it
+unconditionally. Sweeping it 20/40/80/160/320 changes nothing. Do not use it as a
+diagnostic here; it looks like a knob and is not one.
+
+**The grid cannot simply be widened.** `EXL3_RDNA_SMS_MULT` (added for this
+experiment, default 1 = no change) multiplies `total_sms`. At 2 the runtime
+refuses shapes 3 and 4 outright -- "too many blocks in cooperative launch" --
+because `grid.sync()` requires every block co-resident and these shapes' LDS and
+VGPR use allows only one workgroup per WGP. The lighter shapes do accept it:
+
+| shape | MULT=1 | MULT=2 | note |
+|---|---|---|---|
+| 1 (N=128) | 29.1 GB/s | 45.2 GB/s | 1.55x |
+| 2 (N=256) | 44.7 GB/s | 61.7 GB/s | 1.38x |
+| 3 (N=384) | **66.2 GB/s** | refused | best overall |
+| 4 (N=512) | 55.5 GB/s | refused | what the selector picks |
+
+So 20 blocks is the genuine co-residency limit, not a WGP-vs-CU miscount.
+
+**Two conclusions.** First, a cheap one: the shape selector picks N=512 at m == 1
+where N=384 is 19% faster (237.8 vs 283.6 us). Narrower is *not* monotonically
+better -- N=128 is the worst of the four -- so this needs a measured rule, not a
+heuristic. Second, the structural one: **the cooperative GEMM cannot exceed ~1/3
+of roofline at m == 1 on this part, because it cannot oversubscribe.** Tuning
+inside it is worth ~19%; the rest requires a plain-launch path. The RDNA GEMV is
+exactly that and reaches 203 GB/s (the roofline) on lm_head, so the target is a
+non-cooperative multi-matrix GEMV for m == 1, not a better-tuned cooperative GEMM.
+
+## Profiling on this machine
+
+rocprofv3 works, with three constraints found the hard way:
+
+- **At most THREE counters per pass.** A fourth returns "Request exceeds the
+  capabilities of the hardware to collect". `OccupancyPercent MemUnitBusy
+  FETCH_SIZE` fits and is the useful triple.
+- **PyTorch processes need torch's bundled rocprofiler libs moved aside.** The
+  wheel ships `librocprofiler-sdk.so` and `librocprofiler-register.so` with
+  `RPATH=$ORIGIN` at different versions from the system copies, so two instances
+  load and registration fails with "Configuration request occurred outside of
+  valid rocprofiler configuration period". `LIBKINETO_NOROCTRACER`,
+  `LIBKINETO_NOCUPTI`, `LD_PRELOAD` (direct and appended via wrapper) and
+  `LD_LIBRARY_PATH` all fail; RPATH beats them. Renaming the two files in
+  `torch/lib` works and torch falls through to the system copies. Restore them
+  afterwards. rocprofv2 is not an option -- it does not support Strix Halo.
+- **Counter collection deadlocks cooperative kernels.** PMC serialises dispatches,
+  which breaks the co-residency `grid.sync()` depends on. `gemm_coop_check` hangs
+  with the GPU at 2% and no output. Graph-captured kernels fail differently, with
+  "Timeout while waiting for queue sync: N kernels still active". This is why
+  `bench_mgemm.py` exists: it reaches mgemm from Python, outside any graph, with a
+  plain launch.
+- A tool that calls `os._exit()` produces **no CSV** -- rocprofv3 writes from exit
+  hooks. Return normally; the teardown segfault happens after the flush.
+
 ## Decode lost the GEMV path — how, and what it takes to get it back
 
 The legacy 0.0.29 fork routed essentially all of decode through the RDNA GEMV,
