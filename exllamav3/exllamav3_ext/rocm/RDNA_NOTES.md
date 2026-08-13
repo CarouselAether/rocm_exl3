@@ -59,15 +59,24 @@ checks it against a CPU reference with non-symmetric inputs.
   ~80% of the 256 GB/s theoretical, and *flat* from 64 MiB to 16 GiB. There is no
   VRAM-vs-GTT cliff: on this unified-memory part the 512 MiB "VRAM" aperture
   rocm-smi reports is a legacy carveout, not a constraint, and torch's
-  `total_memory` is the GTT pool.
+  `total_memory` is the GTT pool. bench_membw's figure is not the ceiling for
+  pure streamed reads, though: the DRAM-resident GEMV sweep (`GEMV_SWEEP=1
+  gemv_check`, four rotating B buffers) sustains **226 GB/s**, which is the
+  right roofline for weight-streaming kernels — it puts Gemma-4-31B's decode
+  ceiling at ~9.7 t/s, not the ~8.8 the 206 figure implies.
 - **There is a 32 MiB Infinity Cache, and it will flatter any kernel benchmark
   whose working set fits.** Measured 653 GB/s at 16 MiB against 213 GB/s at
   64 MiB. Timing one weight tensor in a repeat loop measures cache, not DRAM --
   it overstated the EXL3 GEMV rate by 26% here, and a first pass at this
   concluded "the kernels are healthy" from exactly that error. Cycle a working
   set several times cache size.
-- **Token generation is NOT memory-bound. It is bound by running a 16-row tile
-  GEMM for one useful row.** Measured on Gemma-4-31B, decode at bsz=1:
+- **Token generation was NOT memory-bound as first shipped — it was bound by
+  running a 16-row tile GEMM for one useful row.** (Historical: this is the
+  measurement that motivated the GEMV-path work; the exclusions below are
+  closed as of 2026-08-08 — see "Decode lost the GEMV path" and "The
+  barrier-free dot-tile core". Kept because the profile method and the failure
+  shape are the reference for the next regression.) Measured on Gemma-4-31B,
+  decode at bsz=1:
   `rocm_tools/profile_decode.py` reports the GPU 97.4% busy, with **97.6% of all
   GPU time in `exl3_gemm`/`exl3_mgemm`** -- attention is 0.8%, norms 0.1%. The
   effective rate is 27.0 GB of weights in 477 ms/token = **~57 GB/s, 27% of the
@@ -330,6 +339,59 @@ the B loads, then VOPD dual-issue interleaving (ISA doc in
 `exlproject/rocm_docs`); the wide gate/up shape (158 GB/s) suggests re-sweeping
 warps/block and the split-K threshold with the new core.
 
+## Decode state after the GEMV-path work (2026-08-08)
+
+End-to-end decode, `rocm_tools/bench_model.py`, median of 3, this machine:
+
+| model | bpw | tg t/s | pre-GEMV-work | note |
+|---|---|---|---|---|
+| Gemma-4-31B (dense) | 6.00 | **7.8** | 4.7 | ~80% of the 9.7 t/s roofline at 226 GB/s |
+| Laguna-S-2.1 (MoE 256e top-10) | 4.03 | **20.8** | 15.7 | llama.cpp does 22–25 on this box |
+| DeepSeek-V4-Flash | 2.07 | **13.7** | 8.8 | its width-list sites still run cooperative — see below |
+
+Split-K is capped at `EXL3_GEMV_SPLITK_MAX_TILES = 2048`
+(`exl3_gemv_kernel_rdna.hip.h`), raised from 512 after a sweep with the direct
+core: split-K still wins +29% at 1344 tiles and reaches parity at 16384. The
+old 512 was tuned for the LDS core.
+
+Coherence after the direct core: user-verified via `examples/chat.py` on all
+three models above, 2026-08-08. (chat.py only — bare `tokenizer.encode` drops
+BOS and fakes corruption.)
+
+Kill switches, each re-read per call: `EXL3_GEMV_LDS=1` (pin the old LDS dot
+core), `EXL3_MGEMV=0`, `EXL3_GEMV_GRAPH=0`, `EXL3_GEMV_SPLITK=0`, `EXL3_GEMV=0`.
+Graph-captured kernels bake the switches at capture time. Related trap: a
+`hipMalloc` during stream capture invalidates the graph — allocate (prewarm)
+parameter blocks before capture begins.
+
+Open items, in rough order of expected value:
+
+1. **Software-pipeline the B loads in the direct core, then VOPD dual-issue.**
+   The core is a clean serial loop (load tile → dq → 4 fdot2). Check whether
+   the compiler already overlaps the loads (`hipcc --save-temps`) before
+   hand-rolling anything.
+2. **Re-sweep launch geometry with the new core.** The wide gate/up shape
+   (5376→21504) reaches only 158 GB/s against 228–238 on narrower shapes; the
+   wave-selector thresholds (`exl3_gemv_rdna_warps`) were tuned for the LDS
+   core. `gemv_check`'s selector section prints both cores.
+3. **Width-list support in mgemv — DS4 only.** DS4's `bc_dsa.py` fan/fan2
+   sites pass `size_n_list`/`c_ptrs`, which mgemv declines (`has_lists`), so
+   they still run the cooperative kernel at ~1/3 roofline. Dense models never
+   pass lists (a prior handoff blamed lists for Gemma's plateau; profiling
+   disproved it — dense decode runs zero cooperative kernels). Acceptance
+   metric is DS4 decode, nothing else.
+4. **mgemv split-K underperforms its single-matrix form**: the fused gate/up
+   shape captured only ~10% of the 22% the single-matrix split-K gained.
+   Unexplained.
+
+Validation discipline for any change here: `gemv_check.hip` runs every case on
+both cores against an independent reconstruct reference; fp32 ground truth for
+real weights is `A @ LinearEXL3.get_weight_tensor()` (it folds suh/svh and the
+Hadamards). Max-relative-error with a small denominator clamp false-flags
+near-zero outputs — accumulation-order noise reads as mismatch; use
+gemv_check's gates (`d > 0.01*denom + 0.05`, RMS ratio as primary). And
+profile before implementing: `rocm_tools/profile_decode.py`.
+
 ## Profiling on this machine
 
 rocprofv3 works, with three constraints found the hard way:
@@ -356,6 +418,15 @@ rocprofv3 works, with three constraints found the hard way:
   hooks. Return normally; the teardown segfault happens after the flush.
 
 ## Decode lost the GEMV path — how, and what it takes to get it back
+
+**Status: resolved as of 2026-08-08.** All three items under "What the fix
+requires" landed — the plain-launch mgemv and the graph-GEMV parameter
+contract (`Plain-launch GEMV paths for m == 1`, ae1855d), in-block split-K
+(e639593), and the barrier-free core plus the 2048-tile split-K cap (f69507b,
+5db0ab7). End-to-end results are in "Decode state after the GEMV-path work"
+below. The section is kept as written because it documents *how* the path was
+lost — both halves were comments that were true when written and invalidated
+by changes elsewhere, a failure shape this port has now hit three times.
 
 The legacy 0.0.29 fork routed essentially all of decode through the RDNA GEMV,
 leaving GEMM for prefill and weight loading. That is the correct division and it
@@ -568,10 +639,12 @@ Under `rocm_tools/`:
 | tool | checks |
 |---|---|
 | `wmma_check.hip` | WMMA operand order and fragment layout against a CPU reference |
-| `gemm_check.hip`, `gemv_check.hip` | GEMM / GEMV kernels against a CPU reference |
+| `gemm_check.hip`, `gemv_check.hip` | GEMM / GEMV kernels against a CPU reference; gemv_check runs both dot cores, and `GEMV_SWEEP=1` adds the DRAM-resident bandwidth sweep (build with the FLAGS block from `build_coop_check.sh` minus the torch libs, single TU) |
+| `mgemv_check.py` | mgemv against the cooperative kernel on real weights: packing, grouped reduce, every routing config |
 | `gemm_coop_check.hip` | cooperative launch against the same work without it |
 | `moe_ref32.py` | fused MoE **and** the per-expert path against an fp32 reference built from dequantized weights |
 | `moe_check.py` | fused MoE against the per-expert path (two fp16 implementations — see its own caveats) |
 | `nan_locate.py` | names the first module in a forward pass whose output goes non-finite |
-| `bench_moe.py`, `bench_prefill_tiles.py`, `bench_decode_splits.py` | timing, median of repeats, flagging spreads above the noise floor |
+| `bench_model.py`, `bench_moe.py`, `bench_mgemm.py`, `bench_gemv_vs_gemm.py`, `bench_prefill_tiles.py`, `bench_decode_splits.py` | timing, median of repeats, flagging spreads above the noise floor |
+| `profile_decode.py` | rocprofv3 wrapper for a decode run; the profile-before-implementing tool |
 | `hipcc_probe.sh` | per-file compile probe, without rdc |

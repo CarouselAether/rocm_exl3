@@ -212,8 +212,11 @@ def apply() -> list[str]:
     # RETIRED 2026-08-07 alongside the MultiLinear guard above, and for a sharper
     # reason: this reroute is now measurably WORSE than what it replaced. With the
     # guard on, GLM-4.6V decode degenerates into repetition; with it off (decode via
-    # bc.run_bszN -> exl3_mgemm) the same model is coherent. The fused exl3_moe path
-    # this patch forces is finite but not correct -- see [[exl3-moe-residual]].
+    # bc.run_bszN -> exl3_mgemm) the same model is coherent. At retirement the fused
+    # exl3_moe path this patch forces was also numerically wrong; its two split-K
+    # defects were fixed 2026-08-08 (see RDNA_NOTES.md, "exl3_gemm_inner_rdna.hip.h")
+    # and it now matches an fp32 reference as closely as the per-expert path. The
+    # reroute stays retired anyway: mgemm decode is correct and faster.
     if not _env_on("EXL3_ROCM_MGEMM", True):
         try:
             from ..modules import block_sparse_mlp as _bsq
