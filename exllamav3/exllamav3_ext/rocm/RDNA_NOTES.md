@@ -364,25 +364,43 @@ Graph-captured kernels bake the switches at capture time. Related trap: a
 `hipMalloc` during stream capture invalidates the graph — allocate (prewarm)
 parameter blocks before capture begins.
 
-Open items, in rough order of expected value:
+Open items, split by scope. General items are code-path and algorithmic work
+that would carry to any GPU running this port; Strix Halo items are tuning or
+ISA use whose value is established only for this part.
 
-1. **Software-pipeline the B loads in the direct core, then VOPD dual-issue.**
-   The core is a clean serial loop (load tile → dq → 4 fdot2). Check whether
-   the compiler already overlaps the loads (`hipcc --save-temps`) before
-   hand-rolling anything.
-2. **Re-sweep launch geometry with the new core.** The wide gate/up shape
-   (5376→21504) reaches only 158 GB/s against 228–238 on narrower shapes; the
-   wave-selector thresholds (`exl3_gemv_rdna_warps`) were tuned for the LDS
-   core. `gemv_check`'s selector section prints both cores.
-3. **Width-list support in mgemv — DS4 only.** DS4's `bc_dsa.py` fan/fan2
+General:
+
+1. **Software-pipeline the B loads in the direct core.** The core is a clean
+   serial loop (load tile → dq → 4 fdot2); overlapping tile t+1's global loads
+   with tile t's dq/dot is generic latency-hiding. Check whether the compiler
+   already overlaps the loads (`hipcc --save-temps`) before hand-rolling
+   anything.
+2. **Width-list support in mgemv — DS4 only.** DS4's `bc_dsa.py` fan/fan2
    sites pass `size_n_list`/`c_ptrs`, which mgemv declines (`has_lists`), so
-   they still run the cooperative kernel at ~1/3 roofline. Dense models never
-   pass lists (a prior handoff blamed lists for Gemma's plateau; profiling
-   disproved it — dense decode runs zero cooperative kernels). Acceptance
-   metric is DS4 decode, nothing else.
-4. **mgemv split-K underperforms its single-matrix form**: the fused gate/up
+   they still run the cooperative kernel at ~1/3 roofline. This is a
+   capability gap, not tuning. Dense models never pass lists (a prior handoff
+   blamed lists for Gemma's plateau; profiling disproved it — dense decode
+   runs zero cooperative kernels). Acceptance metric is DS4 decode, nothing
+   else.
+3. **mgemv split-K underperforms its single-matrix form**: the fused gate/up
    shape captured only ~10% of the 22% the single-matrix split-K gained.
-   Unexplained.
+   Unexplained, and likely structural (per-matrix z-slices) rather than a
+   gfx1151 quirk.
+
+Strix Halo (gfx1151) specific:
+
+4. **VOPD dual-issue interleaving in the direct core**, after the pipelining
+   above lands. Filed here even though VOPD is an RDNA3-family feature, not
+   gfx1151-only: whether the interleave pays is a per-part scheduling question
+   (wave32, dual-issue pairing rules), and it will be tuned and measured on
+   this part. ISA doc in `exlproject/rocm_docs`.
+5. **Re-sweep launch geometry with the new core.** The wide gate/up shape
+   (5376→21504) reaches only 158 GB/s against 228–238 on narrower shapes; the
+   wave-selector thresholds (`exl3_gemv_rdna_warps`) and the split-K cap were
+   tuned for the LDS core against this part's occupancy and 226 GB/s roofline.
+   `gemv_check`'s selector section prints both cores. The portable version of
+   this item is making the thresholds a per-arch table instead of baked
+   constants.
 
 Validation discipline for any change here: `gemv_check.hip` runs every case on
 both cores against an independent reconstruct reference; fp32 ground truth for
