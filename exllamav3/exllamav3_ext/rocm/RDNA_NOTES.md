@@ -334,10 +334,11 @@ codebooks, wave counts, dtypes pass, direct core slightly tighter;
 parity on real Gemma weights — both cores rms 6e-4 from reference. Measured on
 real Gemma weights (m=1, whole dispatch): 5376→8192 **1.49x** (238 GB/s
 effective), 8192→5376 1.45x (228), 21504→5376 1.41x (177), 5376→21504 1.12x
-(158), lm_head 1.18x (225). Remaining headroom in the core: software-pipeline
-the B loads, then VOPD dual-issue interleaving (ISA doc in
-`exlproject/rocm_docs`); the wide gate/up shape (158 GB/s) suggests re-sweeping
-warps/block and the split-K threshold with the new core.
+(158), lm_head 1.18x (225). Remaining headroom in the core: VOPD dual-issue
+interleaving (ISA doc in `exlproject/rocm_docs`); the wide gate/up shape
+(158 GB/s) suggests re-sweeping warps/block and the split-K threshold with the
+new core. Software-pipelining the B loads was tried and measured a strict
+loss — see "Software-pipelining the direct core: tried, rejected" below.
 
 ## Decode state after the GEMV-path work (2026-08-08)
 
@@ -370,37 +371,72 @@ ISA use whose value is established only for this part.
 
 General:
 
-1. **Software-pipeline the B loads in the direct core.** The core is a clean
-   serial loop (load tile → dq → 4 fdot2); overlapping tile t+1's global loads
-   with tile t's dq/dot is generic latency-hiding. Check whether the compiler
-   already overlaps the loads (`hipcc --save-temps`) before hand-rolling
-   anything.
-2. **Width-list support in mgemv — DS4 only.** DS4's `bc_dsa.py` fan/fan2
+1. **Width-list support in mgemv — DS4 only.** DS4's `bc_dsa.py` fan/fan2
    sites pass `size_n_list`/`c_ptrs`, which mgemv declines (`has_lists`), so
    they still run the cooperative kernel at ~1/3 roofline. This is a
    capability gap, not tuning. Dense models never pass lists (a prior handoff
    blamed lists for Gemma's plateau; profiling disproved it — dense decode
    runs zero cooperative kernels). Acceptance metric is DS4 decode, nothing
    else.
-3. **mgemv split-K underperforms its single-matrix form**: the fused gate/up
+2. **mgemv split-K underperforms its single-matrix form**: the fused gate/up
    shape captured only ~10% of the 22% the single-matrix split-K gained.
    Unexplained, and likely structural (per-matrix z-slices) rather than a
    gfx1151 quirk.
 
 Strix Halo (gfx1151) specific:
 
-4. **VOPD dual-issue interleaving in the direct core**, after the pipelining
-   above lands. Filed here even though VOPD is an RDNA3-family feature, not
-   gfx1151-only: whether the interleave pays is a per-part scheduling question
-   (wave32, dual-issue pairing rules), and it will be tuned and measured on
-   this part. ISA doc in `exlproject/rocm_docs`.
-5. **Re-sweep launch geometry with the new core.** The wide gate/up shape
+3. **VOPD dual-issue interleaving in the direct core.** Filed here even
+   though VOPD is an RDNA3-family feature, not gfx1151-only: whether the
+   interleave pays is a per-part scheduling question (wave32, dual-issue
+   pairing rules), and it will be tuned and measured on this part. ISA doc in
+   `exlproject/rocm_docs`. The pipelining negative below does not kill this
+   lever — pipelining hides latency, VOPD raises VALU throughput, and the
+   low-bpw shapes are decode-ALU-bound (2 bpw streams B at half the rate of
+   4 bpw on identical shapes).
+4. **Re-sweep launch geometry with the new core.** The wide gate/up shape
    (5376→21504) reaches only 158 GB/s against 228–238 on narrower shapes; the
    wave-selector thresholds (`exl3_gemv_rdna_warps`) and the split-K cap were
    tuned for the LDS core against this part's occupancy and 226 GB/s roofline.
    `gemv_check`'s selector section prints both cores. The portable version of
    this item is making the thresholds a per-arch table instead of baked
    constants.
+
+### Software-pipelining the direct core: tried, rejected (2026-08-13)
+
+The former open item — overlap tile t+1's B loads with tile t's dq/dot —
+was implemented and measured, and the code was reverted. Record of both
+halves, because each kills a different future re-attempt:
+
+**The premise was half right.** The compiler does NOT pipeline the plain
+loop: the ISA (probe TU over `exl3_gemv_dot_kernel`, bits 4 and 6) issues all
+of an iteration's loads at the top, staggers `s_waitcnt vmcnt(2/1/0)` through
+the dequant, and issues the next iteration's loads only after the last
+`v_dot2acc`. Full global-load latency is exposed every k-tile, per wave.
+
+**The conclusion drawn from that was still wrong.** A depth-2 register
+pipeline (dq split into `dq_load_dispatch`/`dq_decode_dispatch` halves,
+prologue load, rotate `cur = nxt`, epilogue) compiled to the intended
+schedule — next tile's loads interleaved between the current tile's dots,
+waits rotated to the loop top — passed all 40 gemv_check cases on both cores,
+cost only +3-4 VGPRs, and was **slower everywhere**. Same-session A/B against
+a HEAD-built binary, DRAM-resident sweep: no shape improved; large shapes
+-1% typical; short-k split-K shapes (Laguna expert 3072→1024, 1024→3072)
+**-6 to -8%** consistent across wave counts; untouched LDS-core control rows
+flat ±0.5%, so the rig was sound.
+
+Why: these kernels are plain launches at high occupancy — when one wave sits
+in `vmcnt`, the SIMD issues another wave. Wave-level parallelism was already
+covering the load latency (lm_head runs 225 GB/s against the 226 measured
+roofline — there was nothing left to unlock), so intra-wave pipelining
+contributed only its overhead: the register rotate and the duplicated
+address math, proportionally worst where split-K makes per-warp k-ranges
+short. Intra-wave latency hiding is for kernels that CANNOT oversubscribe —
+the cooperative GEMM was such a kernel; the GEMV path is not.
+
+The corollary for the remaining gaps: mid shapes at 180–205 GB/s are not
+latency-limited (pipelining would have moved them), which points the
+remaining headroom at launch geometry (open item 4) and decode ALU
+throughput (open item 3), not at the memory pipeline.
 
 Validation discipline for any change here: `gemv_check.hip` runs every case on
 both cores against an independent reconstruct reference; fp32 ground truth for
