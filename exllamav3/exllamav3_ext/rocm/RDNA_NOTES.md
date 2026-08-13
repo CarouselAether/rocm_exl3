@@ -348,7 +348,7 @@ End-to-end decode, `rocm_tools/bench_model.py`, median of 3, this machine:
 |---|---|---|---|---|
 | Gemma-4-31B (dense) | 6.00 | **7.8** | 4.7 | ~80% of the 9.7 t/s roofline at 226 GB/s |
 | Laguna-S-2.1 (MoE 256e top-10) | 4.03 | **20.8** | 15.7 | llama.cpp does 22–25 on this box |
-| DeepSeek-V4-Flash | 2.07 | **13.7** | 8.8 | its width-list sites still run cooperative — see below |
+| DeepSeek-V4-Flash | 2.07 | **15.6** | 8.8 | 13.7 → 15.6 when the width-list sites moved to mgemv (2026-08-13) |
 
 Split-K is capped at `EXL3_GEMV_SPLITK_MAX_TILES = 2048`
 (`exl3_gemv_kernel_rdna.hip.h`), raised from 512 after a sweep with the direct
@@ -371,17 +371,32 @@ ISA use whose value is established only for this part.
 
 General:
 
-1. **Width-list support in mgemv — DS4 only.** DS4's `bc_dsa.py` fan/fan2
-   sites pass `size_n_list`/`c_ptrs`, which mgemv declines (`has_lists`), so
-   they still run the cooperative kernel at ~1/3 roofline. This is a
-   capability gap, not tuning. Dense models never pass lists (a prior handoff
-   blamed lists for Gemma's plateau; profiling disproved it — dense decode
-   runs zero cooperative kernels). Acceptance metric is DS4 decode, nothing
-   else.
+1. **`exl3_moe_kernel` is ~30% of DS4 decode in ~one call per token.**
+   Found while profiling for the width-list work (2026-08-13): on
+   DeepSeek-V4-Flash decode, `exl3_moe_kernel<2, 256, 2>` runs ~once per
+   token at ~23 ms per call — 959 ms of a 3.08 s / 42-token profile, the
+   single largest kernel by far (the whole rest of a token is ~50 ms).
+   Unexplained: which site issues it, why one call per token, and why 23 ms.
+   This is now the dominant DS4 lever; profile the call's shape and caller
+   before touching anything.
 2. **mgemv split-K underperforms its single-matrix form**: the fused gate/up
    shape captured only ~10% of the 22% the single-matrix split-K gained.
    Unexplained, and likely structural (per-matrix z-slices) rather than a
    gfx1151 quirk.
+
+Width-list support in mgemv — the former item here — landed 2026-08-13:
+`size_n_list`/`c_ptrs` calls (DS4's `bc_dsa` fan/fan2 sites, the only users)
+now take the plain-launch mgemv instead of falling to the cooperative kernel.
+Per-matrix width gates the tile grid, `c_list[mat_index]` replaces the
+`j * size_n` output stride, and both lists are device arrays read per launch
+(the `B_list` indirection), so graph capture needed no new patch sites. The
+cooperative kernel disappeared from the DS4 decode profile (was 254 ms /
+7.8% / 1333 calls; the same work now adds ~49 ms on the mgemv split-K rows —
+~5x per call), decode 13.7 → **15.6 t/s** (+14%, spread 0.2%). The extra gain
+over the 7.8% share is the cooperative launch overhead going with it.
+Validated: greedy A/B vs `EXL3_MGEMV=0` produces equivalent coherent text
+(fp16-noise wording drift only), `mgemv_check.py` all-PASS,
+`test_dsa_kernels.py` ALL PASS, Laguna 20.8 / Gemma 7.7 unchanged.
 
 Strix Halo (gfx1151) specific:
 

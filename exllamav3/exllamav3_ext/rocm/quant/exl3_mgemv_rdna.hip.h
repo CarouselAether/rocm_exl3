@@ -108,7 +108,8 @@ bool exl3_mgemv_try_launch
     int min_index,
     int max_index,
     int num_tokens,
-    bool has_lists,
+    const int* size_n_list,   // per-matrix output widths (device), or nullptr
+    void** c_list,            // per-matrix output pointers (device), or nullptr
     int device,
     cudaStream_t stream,
     Graph* graph

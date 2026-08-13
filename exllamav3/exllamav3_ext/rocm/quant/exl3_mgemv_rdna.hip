@@ -49,6 +49,20 @@
 // the 128-wide hadamard or a full-K dot). Semantics are identical: slot j means
 // "the j-th index inside the range", weights follow their original position,
 // and the reduce stride is the packed count.
+//
+// Per-matrix width/output lists (size_n_list / c_list). DS4's bc_dsa fan and
+// fan2 sites project ONE input through several matrices of differing widths in
+// a single call: size_n is then only the max width, matrix mat_index is
+// size_n_list[mat_index] wide, and its output goes to its own tensor at
+// c_list[mat_index] (row 0 -- this whole path is m == 1) instead of C's j-th
+// row. The entry point enforces no-weights/no-packing/single-token for list
+// calls, so the reduce epilogue never runs with lists. Both list pointers are
+// device arrays whose contents the kernels read per launch -- the same
+// indirection B_list already uses -- so list calls are graph-stable without
+// new patch sites. The grid covers the widest matrix; warps (or split-K
+// blocks, which are tile-uniform) beyond a narrower matrix's width exit early,
+// and the dot core sees the matrix's own n_tiles because B is packed at that
+// width.
 // =============================================================================
 
 #include <cuda_fp16.h>
@@ -247,6 +261,8 @@ void exl3_mgemv_dot_kernel
     const int bszm,
     const int min_index,
     const int max_index,
+    const int* __restrict__ size_n_list,  // per-matrix widths; size_n is the max
+    void* const* __restrict__ c_list,     // per-matrix output bases (row 0; m == 1)
     const bool lds_core
 )
 {
@@ -263,6 +279,12 @@ void exl3_mgemv_dot_kernel
     int mat_index = exl3_mgemv_mat_index(indices, j, bszm, min_index, max_index, &orig_pos);
     if (mat_index < 0) return;
 
+    // Per-matrix width (the cooperative kernel's n_j): the grid covers the
+    // widest matrix, warps beyond a narrower one exit here. B is packed at the
+    // matrix's own width, so the dot core must see n_tiles_j, not the max.
+    const int n_tiles_j = size_n_list ? size_n_list[mat_index] / 16 : n_tiles;
+    if (tile_n >= n_tiles_j) return;
+
     const uint16_t* B = (const uint16_t*) B_list[mat_index];
     const half* A_j = A_had + (int64_t) j * size_k;
 
@@ -277,21 +299,33 @@ void exl3_mgemv_dot_kernel
     float accum = lds_core
         ? exl3_gemv_dot_tile<bits, cb>
           (
-              A_j, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
+              A_j, B, size_k, n_tiles_j, tile_n, lane, my_sh_b, my_sh_b_quant,
               0, size_k / 16
           )
         : exl3_gemv_dot_tile_direct<bits, cb>
           (
-              A_j, B, n_tiles, tile_n, lane, 0, size_k / 16
+              A_j, B, n_tiles_j, tile_n, lane, 0, size_k / 16
           );
 
     if (lane < 16)
     {
-        const int64_t out_idx = (int64_t) j * size_n + tile_n * 16 + lane;
-        if constexpr (c_fp32)
-            ((float*) pb->C)[out_idx] = accum;
+        if (c_list)
+        {
+            // Each matrix owns its output tensor; no j stride (m == 1)
+            const int out_idx = tile_n * 16 + lane;
+            if constexpr (c_fp32)
+                ((float*) c_list[mat_index])[out_idx] = accum;
+            else
+                ((half*) c_list[mat_index])[out_idx] = __float2half(accum);
+        }
         else
-            ((half*) pb->C)[out_idx] = __float2half(accum);
+        {
+            const int64_t out_idx = (int64_t) j * size_n + tile_n * 16 + lane;
+            if constexpr (c_fp32)
+                ((float*) pb->C)[out_idx] = accum;
+            else
+                ((half*) pb->C)[out_idx] = __float2half(accum);
+        }
     }
 }
 
@@ -314,6 +348,8 @@ void exl3_mgemv_dot_kernel_splitk
     const int bszm,
     const int min_index,
     const int max_index,
+    const int* __restrict__ size_n_list,  // per-matrix widths; size_n is the max
+    void* const* __restrict__ c_list,     // per-matrix output bases (row 0; m == 1)
     const bool lds_core
 )
 {
@@ -328,6 +364,11 @@ void exl3_mgemv_dot_kernel_splitk
     int mat_index = exl3_mgemv_mat_index(indices, j, bszm, min_index, max_index, &orig_pos);
     if (mat_index < 0) return;   // whole block exits together; no sync hazard
 
+    // Per-matrix width: tile_n and mat_index are block-uniform, so the whole
+    // block exits together here too and the split-K __syncthreads is safe
+    const int n_tiles_j = size_n_list ? size_n_list[mat_index] / 16 : n_tiles;
+    if (tile_n >= n_tiles_j) return;
+
     const uint16_t* B = (const uint16_t*) B_list[mat_index];
     const half* A_j = A_had + (int64_t) j * size_k;
 
@@ -341,17 +382,28 @@ void exl3_mgemv_dot_kernel_splitk
 
     float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
     (
-        A_j, B, size_k, n_tiles, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant,
+        A_j, B, size_k, n_tiles_j, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant,
         sh_red, lds_core
     );
 
     if (warp_id == 0 && lane < 16)
     {
-        const int64_t out_idx = (int64_t) j * size_n + tile_n * 16 + lane;
-        if constexpr (c_fp32)
-            ((float*) pb->C)[out_idx] = accum;
+        if (c_list)
+        {
+            const int out_idx = tile_n * 16 + lane;
+            if constexpr (c_fp32)
+                ((float*) c_list[mat_index])[out_idx] = accum;
+            else
+                ((half*) c_list[mat_index])[out_idx] = __float2half(accum);
+        }
         else
-            ((half*) pb->C)[out_idx] = __float2half(accum);
+        {
+            const int64_t out_idx = (int64_t) j * size_n + tile_n * 16 + lane;
+            if constexpr (c_fp32)
+                ((float*) pb->C)[out_idx] = accum;
+            else
+                ((half*) pb->C)[out_idx] = __float2half(accum);
+        }
     }
 }
 
@@ -369,7 +421,9 @@ void exl3_mgemv_had_out_kernel
     const int size_n,
     const int bszm,
     const int min_index,
-    const int max_index
+    const int max_index,
+    const int* __restrict__ size_n_list,  // per-matrix widths; size_n is the max
+    void* const* __restrict__ c_list      // per-matrix output bases (row 0; m == 1)
 )
 {
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -384,26 +438,33 @@ void exl3_mgemv_had_out_kernel
     int mat_index = exl3_mgemv_mat_index(indices, j, bszm, min_index, max_index, &orig_pos);
     if (mat_index < 0) return;
 
+    // Per-matrix width: warps beyond a narrower matrix's rotation blocks exit.
+    // EXL3 trellis padding guarantees n_j % 128 == 0 (the cooperative kernel's
+    // output rotation depends on the same).
+    const int n_j = size_n_list ? size_n_list[mat_index] : size_n;
+    if (seg * 128 >= n_j) return;
+
     const half* svh = (const half*) svh_list[mat_index];
 
     float scale = 0.088388347648f;  // 1/sqrt(128)
     if (pb->weights) scale *= __half2float(pb->weights[orig_pos]);
 
-    int64_t offset = (int64_t) j * size_n + seg * 128;
+    void* Cb = c_list ? c_list[mat_index] : pb->C;
+    int64_t offset = (c_list ? 0 : (int64_t) j * size_n) + seg * 128;
 
     if constexpr (c_fp32)
         had_ff_r_128_inner<false, true>
         (
-            ((const float*) pb->C) + offset,
-            ((float*) pb->C) + offset,
+            ((const float*) Cb) + offset,
+            ((float*) Cb) + offset,
             svh + seg * 128,
             scale
         );
     else
         had_hf_r_128_inner<false, true>
         (
-            ((const half*) pb->C) + offset,
-            ((half*) pb->C) + offset,
+            ((const half*) Cb) + offset,
+            ((half*) Cb) + offset,
             svh + seg * 128,
             scale
         );
@@ -495,19 +556,25 @@ bool exl3_mgemv_try_launch
     int min_index,
     int max_index,
     int num_tokens,
-    bool has_lists,
+    const int* size_n_list,
+    void** c_list,
     int device,
     cudaStream_t stream,
     Graph* graph
 )
 {
     // Hard constraints first, then the kill switch. m == 1 and the 128-multiple
-    // dims are kernel requirements (hadamard blocks); the per-matrix width/
-    // output lists are a cooperative-path feature this path does not implement.
+    // dims are kernel requirements (hadamard blocks). Per-matrix width/output
+    // lists (DS4's bc_dsa fan sites) are supported under the same constraints
+    // the entry point enforces for them -- no weights, no packing, single
+    // token; size_n is then the max width, per-matrix widths come from the
+    // device-side list and are %16/%128 by trellis padding. Both lists arrive
+    // together or not at all; a half-supplied pair falls through.
     if (size_m != 1) return false;
     if (K < 1 || K > 8) return false;
     if (size_k % 128 || size_n % 128) return false;
-    if (has_lists) return false;
+    if ((size_n_list != nullptr) != (c_list != nullptr)) return false;
+    if (size_n_list && (weights_ptr || num_tokens != 1 || min_index >= 0)) return false;
     if (!exl3_mgemv_enabled()) return false;
 
     // 128 = MAX_INDICES, the cooperative kernel's packing-array bound; kept for
@@ -562,12 +629,14 @@ bool exl3_mgemv_try_launch
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, true, codebook, EXL3_MGEMV_WARPS>), \
                     grid, block, smem, stream, \
-                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, lds_core); \
+                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, \
+                    size_n_list, c_list, lds_core); \
             } else { \
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, false, codebook, EXL3_MGEMV_WARPS>), \
                     grid, block, smem, stream, \
-                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, lds_core); \
+                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, \
+                    size_n_list, c_list, lds_core); \
             }
 
         #define LAUNCH_MGEMV_CB(bits_val, codebook) \
@@ -611,14 +680,16 @@ bool exl3_mgemv_try_launch
             (
                 exl3_mgemv_had_out_kernel<true>,
                 dim3(blocks), dim3(256), 0, stream,
-                pb, svh_ptr_ptr, size_n, bszm, min_index, max_index
+                pb, svh_ptr_ptr, size_n, bszm, min_index, max_index,
+                size_n_list, c_list
             );
         else
             hipLaunchKernelGGL
             (
                 exl3_mgemv_had_out_kernel<false>,
                 dim3(blocks), dim3(256), 0, stream,
-                pb, svh_ptr_ptr, size_n, bszm, min_index, max_index
+                pb, svh_ptr_ptr, size_n, bszm, min_index, max_index,
+                size_n_list, c_list
             );
     }
 

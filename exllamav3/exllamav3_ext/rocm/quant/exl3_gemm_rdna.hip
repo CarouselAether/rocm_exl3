@@ -637,7 +637,7 @@ int exl3_mgemm_gr
             indices_ptr, weights_ptr,
             size_m, size_k, size_n, K, cb, c_fp32,
             bszm_in, bszm_out, min_index, max_index, num_tokens,
-            size_n_list_ptr != nullptr || c_list_ptr != nullptr,
+            size_n_list_ptr, c_list_ptr,
             device, stream, graph
         ))
         {
