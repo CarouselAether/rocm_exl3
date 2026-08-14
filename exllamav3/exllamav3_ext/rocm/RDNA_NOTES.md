@@ -412,21 +412,36 @@ Validated: greedy A/B vs `EXL3_MGEMV=0` produces equivalent coherent text
 
 Strix Halo (gfx1151) specific:
 
-3. **VOPD dual-issue interleaving in the direct core.** Filed here even
-   though VOPD is an RDNA3-family feature, not gfx1151-only: whether the
-   interleave pays is a per-part scheduling question (wave32, dual-issue
-   pairing rules), and it will be tuned and measured on this part. ISA doc in
-   `exlproject/rocm_docs`. The pipelining negative below does not kill this
-   lever — pipelining hides latency, VOPD raises VALU throughput, and the
-   low-bpw shapes are decode-ALU-bound (2 bpw streams B at half the rate of
-   4 bpw on identical shapes).
-4. **Re-sweep launch geometry with the new core.** The wide gate/up shape
+3. **Re-sweep launch geometry with the new core.** The wide gate/up shape
    (5376→21504) reaches only 158 GB/s against 228–238 on narrower shapes; the
    wave-selector thresholds (`exl3_gemv_rdna_warps`) and the split-K cap were
    tuned for the LDS core against this part's occupancy and 226 GB/s roofline.
    `gemv_check`'s selector section prints both cores. The portable version of
    this item is making the thresholds a per-arch table instead of baked
    constants.
+
+### VOPD: checked, closed (2026-08-13)
+
+The former open item — hand-interleave the direct core for VOPD dual-issue —
+is closed on ISA-level evidence, no implementation needed:
+
+- **The compiler already emits VOPD where it is legal.** The probe TU shows
+  56 `v_dual_*` instructions, including `v_dual_dot2acc_f32_f16` inside the
+  bits=2 hot loop. (`-Rpass-missed=gcn-vopd` reports nothing.)
+- **The op mix caps what is left.** The bits=2/cb=2 (DS4) inner-loop
+  histogram: 8 `v_mul_lo_u32`, 8 `v_dot4_u32_u8`, 7 `v_bfe_u32`,
+  4 `v_pk_fma_f16` dominate — all VOP3/VOP3P-class, ineligible for VOPD
+  pairing by ISA restriction (§7.6: VOPD pairs a restricted op list, wave32
+  only, VGPR-bank port limits). The pairable remainder (a few `v_and_b32`,
+  shifts, moves, the dot2accs) is single-digit percent of the loop's VALU,
+  and the compiler is already pairing within it.
+
+Hand-rolled VOPD asm would fight the compiler's `s_delay_alu` scheduling to
+chase <10% of VALU on shapes that are only partially VALU-bound. If low-bpw
+decode ALU ever needs to shrink, the lever is reducing the op count of the
+3INST decode itself, not dual-issuing the current ops. (RDNA2 note for the
+record: VOPD does not exist pre-RDNA3, and this port does not target RDNA2 —
+its prefill would be blocked on WMMA absence anyway.)
 
 ### Software-pipelining the direct core: tried, rejected (2026-08-13)
 
