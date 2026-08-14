@@ -57,9 +57,25 @@ const CudaDrv& CudaDrv::instance()
         #ifdef _WIN32
             void* lib = (void*) LoadLibraryA("amdhip64.dll");
         #else
-            void* lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
-            if (!lib) lib = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_GLOBAL);
-            if (!lib) lib = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL);  // already-loaded image
+            // Prefer the runtime already linked into the process (torch's).
+            // pip ROCm/torch wheels bundle libamdhip64 WITHOUT the .so dev
+            // symlink, so a named dlopen resolves to the SYSTEM tree and
+            // loads a second runtime instance beside torch's. Two instances
+            // of the same version happen to interoperate -- which is how the
+            // old order passed on a system-ROCm stack -- but mismatched
+            // versions fail at first launch with hipErrorContextIsDestroyed
+            // (709): found the hard way on torch 2.11+rocm7.13 wheels over
+            // system ROCm 7.2.4. dlopen(nullptr) searches the global scope,
+            // where torch's NEEDED libamdhip64 already lives; verify the
+            // probe symbol resolves before trusting it, and keep the named
+            // forms only as a fallback for processes where HIP is not yet
+            // loaded.
+            void* lib = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL);
+            if (!lib || !dlsym(lib, DRV_STR(cuModuleLoadData)))
+            {
+                lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
+                if (!lib) lib = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_GLOBAL);
+            }
         #endif
         TORCH_CHECK(lib, "Could not load the HIP runtime library (libamdhip64.so)");
 

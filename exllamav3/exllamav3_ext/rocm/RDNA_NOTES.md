@@ -613,6 +613,49 @@ In dependency order — 1 must land first or 2 and 3 measure as no gains:
 
 3. **Give `exl3_mgemm` a GEMV call site** for m == 1 — the 42-48% item on MoE.
 
+## ROCm wheel stack (TheRock): tested 7.13, no benefit, four traps
+
+Tested 2026-08-13 against community claims of large Strix Halo gains on the
+new pip-distributed ROCm ("7.14"): isolated venv (`pip install
+--index-url https://repo.amd.com/rocm/whl/gfx1151/ torch` → torch
+2.11+rocm7.13, the newest STABLE gfx1151 pairing; 7.14+ exists only as
+nightlies, renumbered to 10.x from Aug 2026) plus a git worktree so the
+working build stays untouched. Full validation ladder passed (mgemv_check,
+moe_ref32, coherence). Verdict: **decode flat on all three models (15.6 /
+20.1 / 7.7), prefill 3-8% SLOWER; stay on system 7.2.4.** Expected in
+hindsight — decode runs this port's own kernels at near-roofline, so a
+runtime upgrade has nothing to give here; the community wins come from
+stacks bottlenecked on hipBLASLt/attention libraries or host overhead.
+
+The traps, for the next attempt:
+
+1. **TheRock wheels are runtime-only by default.** Building the extension
+   needs `pip install "rocm[devel]"` (1.7 GB) and then `rocm-sdk init` to
+   materialize the SDK; the resulting
+   `site-packages/_rocm_sdk_devel` is a drop-in `ROCM_PATH` (has
+   `.info/version`, hipcc, device libs). The core package's hipcc alone
+   cannot find its device bitcode (needs `HIP_DEVICE_LIB_PATH`) and ships no
+   thrust headers, which torch's headers require.
+2. **7.13 header bug:** `amd_hip_cooperative_groups.h` defines
+   `this_cluster()` without `inline`, so every TU including it emits the
+   symbol and the `-fgpu-rdc` device link fails with duplicate symbols.
+   One-word patch (`inline`) in the venv header.
+3. **Dual HIP runtime via CudaDrv's dlopen** — fixed on main
+   (`cuda_drv_rdna.cpp`): wheel stacks bundle `libamdhip64` without the
+   `.so` dev symlink, so the old name-first dlopen loaded the SYSTEM
+   runtime as a second instance beside torch's. Same-version instances
+   interoperate by luck (the pre-fix state on 7.2.4 wheels + system
+   7.2.4); mismatched versions fail at first triton-kernel launch with
+   hipErrorContextIsDestroyed (709). The fix prefers the already-loaded
+   image (`dlopen(nullptr)` + probe) with named dlopens as fallback.
+4. **triton >= 3.6 unloads modules in `CompiledKernel.__del__`.**
+   `bc_attn.py:_compile_kernel` copies the cubin into its own module and
+   drops the triton object; on triton 3.6 the destructor then fires — during
+   lazy compilation this happens mid-graph-capture ("operation not permitted
+   when stream is capturing" spam). Workaround: no-op the destructor
+   (bounded leak — kernels are cached per shape). Needed only if the stack
+   ever moves to triton >= 3.6; the 7.2-era triton does not unload.
+
 ## Syncing to a new upstream release
 
 Every sibling is derived from exactly one upstream file. Before deciding how to
