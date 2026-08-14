@@ -41,6 +41,17 @@ def decode_n(generator, ids, n):
     return res
 
 
+# The profiled job's prompt must be ONE token. The Job runs its prompt's
+# prefill inside the same iterate() loop as decode, so a profiler around the
+# job counts prefill kernels in the "decode" table -- bleed-through that has
+# caused two wrong localizations (cooperative kernels blamed for Gemma decode;
+# exl3_moe read as a ~23 ms per-token decode cost on DS4 when it is one
+# prefill call per MoE layer per chunk). Starting the Kineto session
+# mid-generation captures nothing on ROCm, so the window cannot simply open
+# after prefill; a 1-token prompt makes "prefill" a single bsz-1 forward with
+# the same kernel mix as a decode step (~1/n of the window, same shapes).
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model_dir", required=True)
@@ -65,13 +76,14 @@ def main():
     # would otherwise dominate a short profile.
     decode_n(generator, mk(), 8)
 
+    one = torch.randint(int(vocab * .05), int(vocab * .95), (1, 1),
+                        dtype=torch.long, generator=rng)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        res = decode_n(generator, mk(), args.new_tokens)
+        res = decode_n(generator, one, args.new_tokens)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
-
     n = res["new_tokens"]
     ka = prof.key_averages()
     gpu_us = sum(getattr(e, "self_device_time_total", 0) or 0 for e in ka)

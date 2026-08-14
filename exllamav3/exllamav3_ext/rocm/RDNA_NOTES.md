@@ -371,18 +371,30 @@ ISA use whose value is established only for this part.
 
 General:
 
-1. **`exl3_moe_kernel` is ~30% of DS4 decode in ~one call per token.**
-   Found while profiling for the width-list work (2026-08-13): on
-   DeepSeek-V4-Flash decode, `exl3_moe_kernel<2, 256, 2>` runs ~once per
-   token at ~23 ms per call — 959 ms of a 3.08 s / 42-token profile, the
-   single largest kernel by far (the whole rest of a token is ~50 ms).
-   Unexplained: which site issues it, why one call per token, and why 23 ms.
-   This is now the dominant DS4 lever; profile the call's shape and caller
-   before touching anything.
-2. **mgemv split-K underperforms its single-matrix form**: the fused gate/up
+1. **mgemv split-K underperforms its single-matrix form**: the fused gate/up
    shape captured only ~10% of the 22% the single-matrix split-K gained.
    Unexplained, and likely structural (per-matrix z-slices) rather than a
    gfx1151 quirk.
+
+**RETRACTED (2026-08-13, same day it was filed): "`exl3_moe_kernel` is ~30%
+of DS4 decode in ~one call per token."** Python-level instrumentation of
+`ext.exl3_moe` (wrap the binding, record module key/phase/shapes per call)
+shows decode NEVER calls it: at bsz == 1 every MoE layer is `bszn_eligible`
+and takes `run_bszN` → mgemv. The 42 calls in the profile were the 64-token
+prompt's PREFILL — one fused call per MoE layer — inside the profiler window,
+because `profile_decode.py` wrapped the whole Job and a Job runs its prompt's
+prefill in the same iterate() loop as decode. This is the THIRD wrong
+localization produced by kernels-in-window ≠ decode-kernels (the cooperative
+"decode" calls that were prefill; the width-list theory built on them; now
+this). profile_decode.py now uses a 1-token prompt for the profiled job, so
+the window contains decode-shaped work only. (Starting the Kineto session
+mid-generation instead captures zero device events on ROCm — that approach
+does not work.) The ~23 ms/layer fused-MoE prefill call itself is a
+plausible PREFILL lever (at 64 rows it streams essentially all 256 experts'
+weights), but DS4 prefill is 103–162 t/s and healthy; low priority.
+
+DS4 decode after the width-list work is dominated by the mgemv split-K dots
+and DSA attention — there is no hidden MoE cost.
 
 Width-list support in mgemv — the former item here — landed 2026-08-13:
 `size_n_list`/`c_ptrs` calls (DS4's `bc_dsa` fan/fan2 sites, the only users)
@@ -485,6 +497,14 @@ rocprofv3 works, with three constraints found the hard way:
   plain launch.
 - A tool that calls `os._exit()` produces **no CSV** -- rocprofv3 writes from exit
   hooks. Return normally; the teardown segfault happens after the flush.
+- **Kineto device-activity capture can wedge machine-wide.** Observed
+  2026-08-13: torch.profiler CUDA activity returned zero device events in
+  every fresh process (even a bare matmul) after a HIP process died with
+  SIGSEGV mid-run earlier in the session, where identical profiles worked
+  hours before. No stray processes or /dev/shm state to clean; suspected
+  driver/tracer-side, cleared by reboot (unverified). If a profile shows
+  0.000 s GPU time with a populated host-op table, test capture with a
+  trivial matmul before trusting any "HOST-BOUND" verdict.
 
 ## Decode lost the GEMV path — how, and what it takes to get it back
 
