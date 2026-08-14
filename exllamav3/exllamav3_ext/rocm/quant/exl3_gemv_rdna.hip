@@ -134,6 +134,41 @@ static int exl3_gemv_rdna_warps(int n_tiles, int k_blocks)
     return 4;
 }
 
+// Split-K wave count, shared by all three split-K sites (plain, graph, mgemv).
+// The old fixed 8 was tuned with the LDS core; the direct core shifted the
+// balance, and the DRAM-resident sweep (gemv_check GEMV_SWEEP=1, 2026-08-13)
+// shows the best count is shape-dependent: more warps pay while the grid is
+// starved for waves, fewer warps pay once the block count alone saturates the
+// device (the in-block reduce and the shrinking per-warp k-chunk are pure
+// overhead then). blocks = n_tiles x bszm (the mgemv grid multiplies by the
+// expert count, which is why bszm is part of the rule, not just n_tiles).
+// Fit to the sweep (direct core, GB/s at W=4/8/16):
+//   3072->1024  (k192, blk64):    84 / 107 / 115  -> 16   starved grid
+//   1024->3072  (k64,  blk192):  122 / 114 / 113  -> 4    short k
+//   21504->5376 (k1344, blk336): 158 / 187 / 193  -> 16   long k
+//   8192->5376  (k512, blk336):  164 / 181 / 177  -> 8
+//   5376->8192  (k336, blk512):  194 / 190 / 192  -> 8    (~tie, -1.8%)
+//   5376->21504 (k336, blk1344): 205 / 202 / 197  -> 4    saturated
+//   4096->2048  (k256, blk128):   88 / 101 / 100  -> 8    (DS4 gate/up, 2bpw)
+//   2048->4096  (k128, blk256):  106 / 101 /  96  -> 4    (DS4 down, 2bpw; sets
+//                                                          the short-k bound at 128)
+// EXL3_GEMV_SPLITK_WARPS forces one count everywhere (model-level A/B);
+// re-read per call, baked at graph capture like the other switches.
+int exl3_gemv_splitk_warps(int k_tiles, int n_tiles, int bszm)
+{
+    const char* env = std::getenv("EXL3_GEMV_SPLITK_WARPS");
+    if (env)
+    {
+        int w = atoi(env);
+        if (w == 4 || w == 8 || w == 16) return w;
+    }
+    int blocks = n_tiles * (bszm > 0 ? bszm : 1);
+    if (k_tiles <= 128) return 4;
+    if (blocks >= 1024) return 4;
+    if (blocks < 128 || k_tiles >= 1024) return 16;
+    return 8;
+}
+
 // -----------------------------------------------------------------------------
 // Launch
 // -----------------------------------------------------------------------------
@@ -195,7 +230,7 @@ static void exl3_gemv_rdna_launch
 
     if (splitk)
     {
-        warps_per_block = EXL3_GEMV_SPLITK_WARPS;
+        warps_per_block = exl3_gemv_splitk_warps(k_blocks, n_tiles, 1);
         num_blocks = n_tiles;
         shared_mem_size = exl3_gemv_smem_bytes_splitk(warps_per_block);
     }
@@ -217,7 +252,7 @@ static void exl3_gemv_rdna_launch
 
     #define LAUNCH_GEMV_WAVES(bits_val, codebook, warps) \
         if (splitk) { \
-            LAUNCH_GEMV_WAVES_K(bits_val, codebook, EXL3_GEMV_SPLITK_WARPS, exl3_gemv_dot_kernel_splitk) \
+            LAUNCH_GEMV_WAVES_K(bits_val, codebook, warps, exl3_gemv_dot_kernel_splitk) \
         } else { \
             LAUNCH_GEMV_WAVES_K(bits_val, codebook, warps, exl3_gemv_dot_kernel) \
         }
@@ -693,7 +728,7 @@ bool exl3_gemv_graph_try_launch
         size_t smem = exl3_gemv_smem_bytes(warps_per_block);
         if (splitk)
         {
-            warps_per_block = EXL3_GEMV_SPLITK_WARPS;
+            warps_per_block = exl3_gemv_splitk_warps(k_blocks, n_tiles, 1);
             num_blocks = n_tiles;
             smem = exl3_gemv_smem_bytes_splitk(warps_per_block);
         }
@@ -715,7 +750,7 @@ bool exl3_gemv_graph_try_launch
 
         #define LAUNCH_GGEMV_WAVES(bits_val, codebook, warps) \
             if (splitk) { \
-                LAUNCH_GGEMV_WAVES_K(bits_val, codebook, EXL3_GEMV_SPLITK_WARPS, exl3_gemv_graph_dot_kernel_splitk) \
+                LAUNCH_GGEMV_WAVES_K(bits_val, codebook, warps, exl3_gemv_graph_dot_kernel_splitk) \
             } else { \
                 LAUNCH_GGEMV_WAVES_K(bits_val, codebook, warps, exl3_gemv_graph_dot_kernel) \
             }

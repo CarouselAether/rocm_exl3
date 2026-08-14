@@ -95,7 +95,7 @@ static int g_fail = 0;
 // Correctness
 // ---------------------------------------------------------------------------
 
-template <int bits, int cb, int WARPS, bool CFP32>
+template <int bits, int cb, int WARPS, bool CFP32, bool SPLITK = false>
 void run_case(int size_k, int size_n)
 {
     const int k_blocks = size_k / 16;
@@ -139,8 +139,9 @@ void run_case(int size_k, int size_n)
     }
 
     const int n_tiles = size_n / 16;
-    const int num_blocks = (n_tiles + WARPS - 1) / WARPS;
-    const size_t smem = exl3_gemv_smem_bytes(WARPS);
+    const int num_blocks = SPLITK ? n_tiles : (n_tiles + WARPS - 1) / WARPS;
+    const size_t smem = SPLITK ? exl3_gemv_smem_bytes_splitk(WARPS)
+                               : exl3_gemv_smem_bytes(WARPS);
 
     // Both dot-tile cores: core=0 is the barrier-free direct core (the runtime
     // default), core=1 the LDS core (EXL3_GEMV_LDS=1). Same reference, same
@@ -151,9 +152,14 @@ void run_case(int size_k, int size_n)
     const bool lds_core = core != 0;
     (void) hipMemset(dC, 0, (size_t) size_n * 4);
 
-    hipLaunchKernelGGL((exl3_gemv_dot_kernel<bits, CFP32, cb, WARPS>),
-                       dim3(num_blocks), dim3(WARPS * 32), smem, 0,
-                       dA, dBq, dC, size_k, size_n, lds_core);
+    if (SPLITK)
+        hipLaunchKernelGGL((exl3_gemv_dot_kernel_splitk<bits, CFP32, cb, WARPS>),
+                           dim3(num_blocks), dim3(WARPS * 32), smem, 0,
+                           dA, dBq, dC, size_k, size_n, lds_core);
+    else
+        hipLaunchKernelGGL((exl3_gemv_dot_kernel<bits, CFP32, cb, WARPS>),
+                           dim3(num_blocks), dim3(WARPS * 32), smem, 0,
+                           dA, dBq, dC, size_k, size_n, lds_core);
     hipError_t err = hipDeviceSynchronize();
 
     std::vector<float> got((size_t) size_n);
@@ -187,9 +193,10 @@ void run_case(int size_k, int size_n)
     rms_ref = sqrt(rms_ref / ref.size());
     rms_err = sqrt(rms_err / ref.size());
 
-    printf("  bits=%d cb=%d waves=%-2d %s %s k=%-5d n=%-5d %s  "
+    printf("  bits=%d cb=%d waves=%-2d %s %s %s k=%-5d n=%-5d %s  "
            "err/RMS=%.5f  worst_rel=%.4f  outliers=%d\n",
-           bits, cb, WARPS, lds_core ? "lds " : "dir ",
+           bits, cb, WARPS, SPLITK ? "splitk" : "single",
+           lds_core ? "lds " : "dir ",
            CFP32 ? "fp32" : "fp16", size_k, size_n,
            err == hipSuccess ? "ok  " : hipGetErrorString(err),
            rms_ref > 0 ? rms_err / rms_ref : 0.0, max_rel, bad);
@@ -358,6 +365,9 @@ int main()
         printf(" Laguna expert shapes, 4 bpw:\n");
         sweep_shape<4, 1>(3072, 1024, 12);    // expert down-proj slice
         sweep_shape<4, 1>(1024, 3072, 12);    // expert gate/up slice
+        printf(" DeepSeek-V4-Flash expert shapes, 2 bpw (mul1):\n");
+        sweep_shape<2, 2>(4096, 2048, 12);    // expert gate/up (k_tiles 256, n_tiles 128)
+        sweep_shape<2, 2>(2048, 4096, 12);    // expert down    (k_tiles 128, n_tiles 256)
         printf(" lm_head scale (does split-K still win at 16384 tiles?):\n");
         sweep_shape<6, 1>(5376, 262144, 8);
         return 0;
@@ -386,6 +396,17 @@ int main()
     run_case<4, 0, 4,  true>(512, 256);
     run_case<4, 0, 16, true>(512, 256);
     run_case<4, 0, 16, true>(512, 128);   // n_tiles=8 < WARPS: partial block, tail warps exit early
+
+    printf("\n split-K at every wave count -- the in-block reduce and the k-chunk\n"
+           " division depend on WARPS, so 4 and 16 need their own cases now that\n"
+           " exl3_gemv_splitk_warps() can pick them:\n");
+    run_case<4, 0, 4,  true,  true>(4096, 1024);
+    run_case<4, 0, 8,  true,  true>(4096, 1024);
+    run_case<4, 0, 16, true,  true>(4096, 1024);
+    run_case<4, 0, 16, false, true>(4096, 1024);
+    run_case<2, 2, 4,  true,  true>(2048, 4096);   // DS4 expert down shape/cb
+    run_case<2, 2, 16, true,  true>(4096, 2048);   // DS4 expert gate/up shape/cb
+    run_case<6, 1, 16, true,  true>(2064, 256);    // k_tiles=129, odd chunk split
 
     printf("\n fp16 output:\n");
     run_case<4, 0, 8, false>(512, 256);

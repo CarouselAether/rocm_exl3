@@ -64,6 +64,12 @@ bool exl3_gemv_graph_try_launch
 // call, shared by every split-K launch site.
 bool exl3_gemv_splitk_enabled();
 
+// Defined in exl3_gemv_rdna.hip; shape-aware split-K wave count (4, 8 or 16),
+// shared by the plain, graph and mgemv split-K sites. bszm is the grid's
+// matrix-batch factor (1 for the single-matrix sites); EXL3_GEMV_SPLITK_WARPS
+// forces one count everywhere.
+int exl3_gemv_splitk_warps(int k_tiles, int n_tiles, int bszm);
+
 // Shape-aware GEMV profitability rule, shared by the graph and non-graph
 // routing sites. With the in-block split-K form (2026-08-08) the GEMV wins
 // every measured shape, so the rule is currently "always" and EXL3_GEMV modes

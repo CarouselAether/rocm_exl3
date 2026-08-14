@@ -346,7 +346,7 @@ End-to-end decode, `rocm_tools/bench_model.py`, median of 3, this machine:
 
 | model | bpw | tg t/s | pre-GEMV-work | note |
 |---|---|---|---|---|
-| Gemma-4-31B (dense) | 6.00 | **7.8** | 4.7 | ~80% of the 9.7 t/s roofline at 226 GB/s |
+| Gemma-4-31B (dense) | 6.00 | **7.9** | 4.7 | ~81% of the 9.7 t/s roofline; 7.8 → 7.9 from the split-K wave selector (2026-08-13) |
 | Laguna-S-2.1 (MoE 256e top-10) | 4.03 | **20.8** | 15.7 | llama.cpp does 22–25 on this box |
 | DeepSeek-V4-Flash | 2.07 | **15.6** | 8.8 | 13.7 → 15.6 when the width-list sites moved to mgemv (2026-08-13) |
 
@@ -360,7 +360,9 @@ three models above, 2026-08-08. (chat.py only — bare `tokenizer.encode` drops
 BOS and fakes corruption.)
 
 Kill switches, each re-read per call: `EXL3_GEMV_LDS=1` (pin the old LDS dot
-core), `EXL3_MGEMV=0`, `EXL3_GEMV_GRAPH=0`, `EXL3_GEMV_SPLITK=0`, `EXL3_GEMV=0`.
+core), `EXL3_MGEMV=0`, `EXL3_GEMV_GRAPH=0`, `EXL3_GEMV_SPLITK=0`, `EXL3_GEMV=0`,
+`EXL3_GEMV_SPLITK_WARPS=4|8|16` (force one split-K wave count everywhere,
+overriding the shape-aware selector).
 Graph-captured kernels bake the switches at capture time. Related trap: a
 `hipMalloc` during stream capture invalidates the graph — allocate (prewarm)
 parameter blocks before capture begins.
@@ -410,15 +412,26 @@ Validated: greedy A/B vs `EXL3_MGEMV=0` produces equivalent coherent text
 (fp16-noise wording drift only), `mgemv_check.py` all-PASS,
 `test_dsa_kernels.py` ALL PASS, Laguna 20.8 / Gemma 7.7 unchanged.
 
-Strix Halo (gfx1151) specific:
+Strix Halo (gfx1151) specific: none open.
 
-3. **Re-sweep launch geometry with the new core.** The wide gate/up shape
-   (5376→21504) reaches only 158 GB/s against 228–238 on narrower shapes; the
-   wave-selector thresholds (`exl3_gemv_rdna_warps`) and the split-K cap were
-   tuned for the LDS core against this part's occupancy and 226 GB/s roofline.
-   `gemv_check`'s selector section prints both cores. The portable version of
-   this item is making the thresholds a per-arch table instead of baked
-   constants.
+**Launch-geometry re-sweep: done (2026-08-13).** The fixed split-K wave count
+(8, tuned with the LDS core) is now `exl3_gemv_splitk_warps(k_tiles, n_tiles,
+bszm)` — 4/8/16 chosen per shape, shared by all three split-K sites, with the
+fit and the sweep data recorded at the function (exl3_gemv_rdna.hip). The
+rule's drivers: short k (≤128 k-tiles) and saturated grids (≥1024 blocks,
+where blocks = n_tiles × bszm — the mgemv grid multiplies by expert count)
+prefer 4; starved grids (<128 blocks) and long k (≥1024 k-tiles) prefer 16.
+`EXL3_GEMV_SPLITK_WARPS` forces one count everywhere (model-level A/B);
+gemv_check now covers split-K correctness at all three counts, both cores.
+
+Honest end-to-end outcome: per-shape kernel gains up to +8% (starved grids)
+and +5-6% (short k) in the DRAM-resident sweep, but Gemma is the only model
+that moves — 7.8 → **7.9** t/s (its 21504→5376 down at W=16, gate/up at W=4).
+DS4 (15.6) and Laguna (20.7 vs 20.6 pinned-8) are flat: their dominant mgemv
+expert shapes sit with bszm-multiplied grids in regions where the old 8 was
+already right or the delta is diluted below the noise floor. The selector
+ships because it is never worse, fixes the single-matrix starved-grid cases,
+and the env override is the sweep tool the next core change will want.
 
 ### VOPD: checked, closed (2026-08-13)
 
@@ -516,9 +529,9 @@ rocprofv3 works, with three constraints found the hard way:
   2026-08-13: torch.profiler CUDA activity returned zero device events in
   every fresh process (even a bare matmul) after a HIP process died with
   SIGSEGV mid-run earlier in the session, where identical profiles worked
-  hours before. No stray processes or /dev/shm state to clean; suspected
-  driver/tracer-side, cleared by reboot (unverified). If a profile shows
-  0.000 s GPU time with a populated host-op table, test capture with a
+  hours before. No stray processes or /dev/shm state to clean; driver/
+  tracer-side, and a reboot clears it (verified 2026-08-13). If a profile
+  shows 0.000 s GPU time with a populated host-op table, test capture with a
   trivial matmul before trusting any "HOST-BOUND" verdict.
 
 ## Decode lost the GEMV path — how, and what it takes to get it back

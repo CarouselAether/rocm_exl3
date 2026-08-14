@@ -619,21 +619,27 @@ bool exl3_mgemv_try_launch
         bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
         const bool lds_core = exl3_gemv_lds_core();
 
-        dim3 grid(splitk ? n_tiles : CEIL_DIVIDE(n_tiles, EXL3_MGEMV_WARPS), bszm);
-        dim3 block(EXL3_MGEMV_WARPS * 32);
-        size_t smem = splitk ? exl3_gemv_smem_bytes_splitk(EXL3_MGEMV_WARPS)
-                             : exl3_gemv_smem_bytes(EXL3_MGEMV_WARPS);
+        // The split-K wave count is shape-aware (see exl3_gemv_splitk_warps);
+        // the grid here is n_tiles x bszm blocks, so bszm enters the rule.
+        // The single-warp form keeps the fixed EXL3_MGEMV_WARPS.
+        int warps = splitk ? exl3_gemv_splitk_warps(size_k / 16, n_tiles, bszm)
+                           : EXL3_MGEMV_WARPS;
 
-        #define LAUNCH_MGEMV_FP(bits_val, codebook, kernel_name) \
+        dim3 grid(splitk ? n_tiles : CEIL_DIVIDE(n_tiles, warps), bszm);
+        dim3 block(warps * 32);
+        size_t smem = splitk ? exl3_gemv_smem_bytes_splitk(warps)
+                             : exl3_gemv_smem_bytes(warps);
+
+        #define LAUNCH_MGEMV_FP(bits_val, codebook, warps_val, kernel_name) \
             if (c_fp32) { \
                 hipLaunchKernelGGL( \
-                    (kernel_name<bits_val, true, codebook, EXL3_MGEMV_WARPS>), \
+                    (kernel_name<bits_val, true, codebook, warps_val>), \
                     grid, block, smem, stream, \
                     pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, \
                     size_n_list, c_list, lds_core); \
             } else { \
                 hipLaunchKernelGGL( \
-                    (kernel_name<bits_val, false, codebook, EXL3_MGEMV_WARPS>), \
+                    (kernel_name<bits_val, false, codebook, warps_val>), \
                     grid, block, smem, stream, \
                     pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, \
                     size_n_list, c_list, lds_core); \
@@ -641,9 +647,13 @@ bool exl3_mgemv_try_launch
 
         #define LAUNCH_MGEMV_CB(bits_val, codebook) \
             if (splitk) { \
-                LAUNCH_MGEMV_FP(bits_val, codebook, exl3_mgemv_dot_kernel_splitk) \
+                switch (warps) { \
+                    case 4:  LAUNCH_MGEMV_FP(bits_val, codebook, 4,  exl3_mgemv_dot_kernel_splitk) break; \
+                    case 8:  LAUNCH_MGEMV_FP(bits_val, codebook, 8,  exl3_mgemv_dot_kernel_splitk) break; \
+                    case 16: LAUNCH_MGEMV_FP(bits_val, codebook, 16, exl3_mgemv_dot_kernel_splitk) break; \
+                } \
             } else { \
-                LAUNCH_MGEMV_FP(bits_val, codebook, exl3_mgemv_dot_kernel) \
+                LAUNCH_MGEMV_FP(bits_val, codebook, EXL3_MGEMV_WARPS, exl3_mgemv_dot_kernel) \
             }
 
         #define LAUNCH_MGEMV(bits_val) \

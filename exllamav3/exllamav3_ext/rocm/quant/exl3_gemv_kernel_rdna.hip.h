@@ -473,8 +473,10 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_splitk
 // avoids 16k-block grids for no measured cost. Re-sweep if the core changes.
 #define EXL3_GEMV_SPLITK_MAX_TILES 2048
 
-// How many warps share a tile in the split-K form, everywhere it is used
-#define EXL3_GEMV_SPLITK_WARPS 8
+// The split-K wave count is no longer a fixed constant: all three split-K
+// sites call exl3_gemv_splitk_warps() (exl3_gemv_rdna.hip), which picks 4, 8
+// or 16 from (k_tiles, blocks = n_tiles x bszm) per the 2026-08-13 sweep, and
+// EXL3_GEMV_SPLITK_WARPS (env) forces one count everywhere for model-level A/B.
 
 template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
 __global__
