@@ -338,39 +338,52 @@ def make_job(req: SamplingFields, ids: torch.Tensor, max_new: int,
     )
 
 
-class DisconnectPoll:
-    """Rate-limited request.is_disconnected() poll (TabbyAPI pattern). Polling receive()
-    also makes uvicorn resume reading the socket, without which a client disconnect on a
-    POST request can go unnoticed for the entire stream."""
-    def __init__(self, request: Request):
+class DisconnectWatch:
+    """Cancels a job when the client goes away, polling request.is_disconnected() from a
+    background task (TabbyAPI-style active poll: passive detection via send() failure or
+    listen_for_disconnect never fires on this stack, and polling receive() also makes
+    uvicorn resume reading the socket, without which a client disconnect on a POST request
+    can go unnoticed for the entire stream). The poll must NOT run inside the token loop:
+    every is_disconnected() await suspends the consumer and hands the event loop to the
+    generator's always-ready iteration task, which blocks it for one synchronous decode
+    step -- polled per token, delivery cost ~2 decode steps/token and the undelivered half
+    of the stream sat in the job queue until EOS flushed it as one burst."""
+    def __init__(self, request: Request, job: AsyncJob, interval: float = 0.5):
         self.request = request
-        self.last = 0.0
+        self.job = job
+        self.interval = interval
+        self.disconnected = False
+        self.task = asyncio.create_task(self._watch())
 
-    async def check(self) -> bool:
-        now = time.monotonic()
-        if now - self.last < 0.05:
-            return False
-        self.last = now
-        return await self.request.is_disconnected()
+    async def _watch(self):
+        while True:
+            await asyncio.sleep(self.interval)
+            if await self.request.is_disconnected():
+                self.disconnected = True
+                await self.job.cancel()
+                print(" -- Client disconnected, job cancelled", flush = True)
+                return
+
+    def stop(self):
+        self.task.cancel()
 
 
 async def collect_job(job: AsyncJob, request: Request | None = None) -> tuple[str, dict]:
     """Run a job to completion, returning (text, final_result). Cancels on task cancellation."""
     text = ""
     final = {}
-    poll = DisconnectPoll(request) if request is not None else None
+    watch = DisconnectWatch(request, job) if request is not None else None
     try:
         async for r in job:
-            if poll and await poll.check():
-                await job.cancel()
-                print(" -- Client disconnected, job cancelled", flush = True)
-                break
             text += r.get("text", "")
             if r.get("eos"):
                 final = r
     except asyncio.CancelledError:
         await job.cancel()
         raise
+    finally:
+        if watch:
+            watch.stop()
     return text, final
 
 
@@ -604,8 +617,6 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         job = make_job(body, ids, max_new, body.stop)
         include_usage = bool((body.stream_options or {}).get("include_usage"))
 
-        poll = DisconnectPoll(request)
-
         async def stream():
             def chunk(delta: dict, fin: str | None = None, usage: dict | None = None):
                 d = {
@@ -621,25 +632,25 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
 
             final = {}
             done = False
+            watch = DisconnectWatch(request, job)
             try:
                 yield chunk({"role": "assistant", "content": ""})
                 async for r in job:
-                    if await poll.check():
-                        await job.cancel()
-                        done = True
-                        print(" -- Client disconnected, job cancelled", flush = True)
-                        return
                     text = r.get("text", "")
                     if text:
                         yield chunk({"content": text})
                     if r.get("eos"):
                         final = r
                         done = True
+                if watch.disconnected:
+                    done = True
+                    return
                 yield chunk({}, fin = finish_reason(final.get("eos_reason")),
                             usage = usage_dict(final) if include_usage else None)
                 yield "[DONE]"
                 log_request("chat (stream)", final)
             finally:
+                watch.stop()
                 if not done:
                     await job.cancel()
                     print(" -- Client disconnected, job cancelled", flush = True)
@@ -692,8 +703,6 @@ async def completions(request: Request, body: CompletionRequest):
         job = make_job(body, ids, max_new, body.stop)
         include_usage = bool((body.stream_options or {}).get("include_usage"))
 
-        poll = DisconnectPoll(request)
-
         async def stream():
             def chunk(text: str, fin: str | None = None, usage: dict | None = None):
                 d = {
@@ -709,24 +718,24 @@ async def completions(request: Request, body: CompletionRequest):
 
             final = {}
             done = False
+            watch = DisconnectWatch(request, job)
             try:
                 async for r in job:
-                    if await poll.check():
-                        await job.cancel()
-                        done = True
-                        print(" -- Client disconnected, job cancelled", flush = True)
-                        return
                     text = r.get("text", "")
                     if text:
                         yield chunk(text)
                     if r.get("eos"):
                         final = r
                         done = True
+                if watch.disconnected:
+                    done = True
+                    return
                 yield chunk("", fin = finish_reason(final.get("eos_reason")),
                             usage = usage_dict(final) if include_usage else None)
                 yield "[DONE]"
                 log_request("completion (stream)", final)
             finally:
+                watch.stop()
                 if not done:
                     await job.cancel()
                     print(" -- Client disconnected, job cancelled", flush = True)
@@ -883,8 +892,6 @@ async def native_completion(request: Request, body: NativeCompletionRequest):
         }
 
     if body.stream:
-        poll = DisconnectPoll(request)
-
         async def stream():
             # Native streaming: chunks carry {content, stop: false}; the last event
             # carries stop: true with full stats. No "data: [DONE]" terminator.
@@ -892,13 +899,9 @@ async def native_completion(request: Request, body: NativeCompletionRequest):
             tokens_all: list[int] = []
             final = {}
             done = False
+            watch = DisconnectWatch(request, job)
             try:
                 async for r in job:
-                    if await poll.check():
-                        await job.cancel()
-                        done = True
-                        print(" -- Client disconnected, job cancelled", flush = True)
-                        return
                     text = r.get("text", "")
                     tids = r.get("token_ids")
                     if tids is not None:
@@ -909,9 +912,13 @@ async def native_completion(request: Request, body: NativeCompletionRequest):
                     if r.get("eos"):
                         final = r
                         done = True
+                if watch.disconnected:
+                    done = True
+                    return
                 yield sse(final_payload("", tokens_all, final))
                 log_request("native completion (stream)", final)
             finally:
+                watch.stop()
                 if not done:
                     await job.cancel()
                     print(" -- Client disconnected, job cancelled", flush = True)
@@ -925,13 +932,9 @@ async def native_completion(request: Request, body: NativeCompletionRequest):
     text = ""
     tokens_all: list[int] = []
     final = {}
-    poll = DisconnectPoll(request)
+    watch = DisconnectWatch(request, job)
     try:
         async for r in job:
-            if await poll.check():
-                await job.cancel()
-                print(" -- Client disconnected, job cancelled", flush = True)
-                break
             text += r.get("text", "")
             tids = r.get("token_ids")
             if tids is not None:
@@ -941,6 +944,8 @@ async def native_completion(request: Request, body: NativeCompletionRequest):
     except asyncio.CancelledError:
         await job.cancel()
         raise
+    finally:
+        watch.stop()
     log_request("native completion", final)
     return JSONResponse(final_payload(text, tokens_all, final))
 
