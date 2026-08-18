@@ -808,3 +808,56 @@ Under `rocm_tools/`:
 | `bench_model.py`, `bench_moe.py`, `bench_mgemm.py`, `bench_gemv_vs_gemm.py`, `bench_prefill_tiles.py`, `bench_decode_splits.py` | timing, median of repeats, flagging spreads above the noise floor |
 | `profile_decode.py` | rocprofv3 wrapper for a decode run; the profile-before-implementing tool |
 | `hipcc_probe.sh` | per-file compile probe, without rdc |
+| `attn_8k_check.py` | Triton paged attention vs fp32 oracle at KV 4K-16K, straddling the 8192 prefill-split activation; SWA windows, batched decode (attn_check.py's old max ctx was 1000) |
+| `graphpatch_check.hip`, `graphpatch_module_check.hip`, `graphpatch_multinode_check.hip` | hipGraphExecKernelNodeSetParams semantics: runtime-launched, module-launched (Triton-style), and multi-node/ping-pong patched graphs. All PASS on 7.2.4 — the graph corruption is not the patch primitive |
+| `graph_order_check.hip` | back-to-back hipGraphLaunch ordering through a shared buffer under deep queues. PASSES on 7.2.4 |
+| `stream_wedge_check.hip` | spin kernel + pageable hipMemcpyAsync on one stream. **HANGS the process on 7.2.4 (reproducible)** — the objective repro for this stack's async/stream defects; rerun on every new ROCm before trusting HIP graphs |
+
+## HIP graphs: disabled on ROCm (graph_rdna.hip), and how we got there (2026-08-15)
+
+`graph.cu` is excluded on ROCm in favor of `rocm/graph_rdna.hip`, which by
+default never begins a capture: every BC step executes its `run_gr()` sequence
+eagerly on the live stream (the same code path as each slot's first warmup run).
+`EXL3_ROCM_HIP_GRAPHS=1` restores upstream capture/replay. Measured cost on
+Laguna-S-2.1: decode 20.8 -> 17.7 t/s (-15%), prefill unchanged. What it buys:
+graph-capture hangs are impossible by construction (observed on this stack as
+intermittent stalls; same class as vLLM's open capture-hang issue on ROCm 7.2.x,
+and llama.cpp ships HIP graphs off by default behind a CMake flag), and it
+removes exposure to HIP's missing capture-time validation (pytorch#155684:
+operations CUDA rejects during capture are silently captured on ROCm).
+
+What is PROVEN vs SUSPECTED, so nobody re-litigates the wrong part:
+
+- The patch/replay primitives are NOT the defect: see the four graph checks
+  above, all passing on 7.2.4.
+- A months-old in-tree datapoint: the MoE BC graph route died with "Graph
+  update failed" + segfault on GLM decode (recorded at the rocm_py mgemm
+  patch), closed rather than diagnosed at the time.
+- `stream_wedge_check.hip` hangs this stack reproducibly without any graph
+  involvement — the async machinery under HIP graphs is demonstrably unsound
+  here.
+- The multi-turn "coherency collapse" that triggered this investigation was
+  NOT graphs and NOT ROCm at all — it was resolved the same day as sampler
+  arithmetic: OAI-style frequency/presence penalties (0.10/0.15) with
+  TabbyAPI's default penalty_range = max_seq_len, applied by SS_PresFreqP over
+  past_ids = the full sequence INCLUDING the prompt. At 8K context a common
+  token carries freq_penalty × ~350 occurrences ≈ −35 logits: function words
+  die first, then generation flees to the only unpenalized vocab region
+  (never-used tokens — emoji/hashtag spam). Same numbers are harmless on
+  backends that bound the window (llama.cpp repeat_last_n=64) or count only
+  the completion (OpenAI), which is why they looked innocent. Fix: bounded
+  penalty_range (512-2048) or freq_p ≈ 0. Confirmed by the user in real chat.
+  Along the way, kernel-level exonerations that remain valid: attention parity
+  to 16K incl. the 8192 split path, rope to pos 32K, YaRN config, cache
+  rotate, per-position NLL flat to 16K through the nc path. Also a
+  methodological note: greedy loop-collapse probes are pure decoding chaos
+  (1/8 collapse in EVERY config at different knife-edge prompt points) — never
+  use them as a coherence metric.
+- ROCm 7.14 reworked graph replay ("allocation nodes no longer block during
+  replay; physical memory reused across nodes instead of mapped/unmapped per
+  launch") — the right neighborhood for the suspected allocator interaction.
+  Untestable here as of 2026-08-15: Linux gfx1151 torch pairings stop at
+  rocm7.13 nightlies, and preloading the 7.14.0a runtime libs over the 7.2.4
+  driver stack segfaults in rocr GpuAgent::InitDma at hsa_init. When a Linux
+  7.14 pairing ships: run stream_wedge_check + the graph checks first, then
+  A/B EXL3_ROCM_HIP_GRAPHS=1 on real multi-turn chat.

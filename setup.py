@@ -150,6 +150,12 @@ ROCM_EXCLUDE = (
     # dlopen's libcuda.so.1 by name to resolve the driver API used by the Triton
     # attention kernels. Only the library name differs on ROCm; see the sibling.
     "cuda_drv.cpp",              # -> rocm/cuda_drv_rdna.cpp
+    # HIP graph capture/replay corrupts BC decode across generator jobs and
+    # intermittently hangs at capture on ROCm 7.2.x (runtime-level, not this
+    # codebase -- see the sibling's header for the exclusion experiments). The
+    # sibling runs the BC step eagerly by default; EXL3_ROCM_HIP_GRAPHS=1
+    # restores capture for A/B against future ROCm stacks.
+    "graph.cu",                  # -> rocm/graph_rdna.hip
 )
 
 def _collect_sources():
