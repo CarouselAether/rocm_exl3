@@ -9,3 +9,5 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+# rocprofv3 leaves counter dumps in the cwd
+.rocprofv3/
