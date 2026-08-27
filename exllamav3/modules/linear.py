@@ -55,6 +55,7 @@ class Linear(Module):
         first_out_feature: int | None = None,
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
+        pre_scale: float = 1.0,
         post_scale: float = 1.0,
         weight_scale: float = 1.0,
         transposed_load: bool = True,
@@ -86,6 +87,7 @@ class Linear(Module):
         self.softcap = softcap
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
         self.out_dtype = out_dtype
+        self.pre_scale = pre_scale
         self.post_scale = post_scale
         self.weight_scale = weight_scale
         self.transposed_load = transposed_load
@@ -443,6 +445,37 @@ class Linear(Module):
 
 
     @override
+    def pin_linears(self):
+        """Move this layer's bulk weight storage (fp16 weight or EXL3 trellis) to pinned host
+        memory and swap in a zero-copy CUDA alias, freeing the VRAM. Compute paths read the
+        weights over PCIe: fine for occasional, compute-bound vision-tower batches. Small
+        tensors (bias, suh/svh) stay in VRAM. Runs post-load, so it covers every load flavor
+        (fused/sliced/fp8-dequant) and deferred fills have already landed."""
+        inner = self.inner
+        if inner is None or self.device is None:
+            return
+        device = torch.device(self.device)
+        if device.type != "cuda":
+            return
+
+        def pin_alias(t):
+            if not t.is_contiguous():
+                t = t.contiguous()
+            p = torch.empty(t.shape, dtype = t.dtype, device = "cpu", pin_memory = True)
+            p.copy_(t)
+            return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
+
+        if isinstance(inner, LinearFP16) and inner.swap_device is None:
+            inner._pinned_store, inner.weight = pin_alias(inner.weight)
+            inner.bc = ext.BC_LinearFP16(inner.weight, inner.bias)
+        elif isinstance(inner, LinearEXL3):
+            from ..util.tensor import g_tensor_cache
+            inner._pinned_store, inner.trellis = pin_alias(inner.trellis)
+            inner.bc = ext.BC_LinearEXL3(
+                inner.trellis, inner.suh, inner.svh, inner.K, inner.bias,
+                inner.mcg, inner.mul1, g_tensor_cache.get(*inner.bsz1_xh_args))
+
+    @override
     def unload(self):
         if self.inner is not None:
             self.inner.unload()
@@ -595,6 +628,8 @@ class Linear(Module):
         if lora_input is not None:
             self.apply_lora(lora_input, x)
 
+        if self.pre_scale != 1.0:
+            x *= self.pre_scale
         if self.softcap != 0.0:
             ext.softcap(x, x, self.softcap)
         if self.post_scale != 1.0:
@@ -680,6 +715,7 @@ class Linear(Module):
                 "full_out_features": self.full_out_features,
                 "first_in_feature": self.first_in_feature,
                 "first_out_feature": self.first_out_feature,
+                "pre_scale": self.pre_scale,
                 "post_scale": self.post_scale,
             },
             # Not constructor args: restored post-construction by _adopt_inner_dims for dims the
@@ -806,7 +842,9 @@ def convert_exl3_group(
     for linear in linears:
         assert isinstance(linear.inner, LinearFP16), \
             "Inner layer is already quant type"
-        weights.append(linear.inner.get_weight_tensor().float())
+        # Checkpoint precision, usually still swapped to CPU: quantize_exl3_batch stages the
+        # upload through pinned memory and casts to fp32 on the device
+        weights.append(linear.inner.get_weight_tensor())
         biases.append(linear.inner.get_bias_tensor())
         linear.inner = None
 

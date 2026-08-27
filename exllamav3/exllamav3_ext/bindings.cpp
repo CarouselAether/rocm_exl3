@@ -80,6 +80,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("cuda_host_unregister", &cuda_host_unregister, py::arg("ptr"));
     m.def("cuda_host_get_device_pointer", &cuda_host_get_device_pointer, py::arg("ptr"));
     m.def("cuda_device_get_attribute", &cuda_device_get_attribute, py::arg("attr"), py::arg("device"));
+    m.def("pinned_cuda_view", &pinned_cuda_view, py::arg("t"), py::arg("device"));
 
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
@@ -89,6 +90,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_ds3_nogroup_logits", &routing_ds3_nogroup_logits, "routing_ds3_nogroup_logits");
     m.def("routing_sel_norm", &routing_sel_norm, "routing_sel_norm");
+    m.def("moe_split_map", &moe_split_map, "moe_split_map");
+    m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
+    m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");

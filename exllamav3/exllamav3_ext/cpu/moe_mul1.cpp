@@ -11,6 +11,7 @@
 #include <fstream>
 #include <immintrin.h>
 #include <chrono>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -1396,6 +1397,7 @@ struct Pool
     std::atomic<PoolFn> fn{nullptr};
     void* ctx = nullptr;
     int num_workers = 1;
+    std::atomic<int> run_nw{1};   // participant count for the CURRENT dispatch (see run)
     std::vector<int> core_order;
 
     void pin_self(int idx)
@@ -1440,10 +1442,13 @@ struct Pool
             idle = 0;
             seen = g;
 
-            // num_workers may have shrunk below this worker's index: surplus workers must not
-            // run the function (their (idx, num_workers) pair indexes out of range) and must not
-            // ack, or run() returns before the participating workers have finished
-            const int nw = num_workers;
+            // The participant count may sit below this worker's index (pool shrink, or a
+            // small-job dispatch cap): surplus workers must not run the function (their
+            // (idx, nw) pair indexes out of range) and must not ack, or run() returns before
+            // the participating workers have finished. run_nw is published with release
+            // ordering before the gen bump, so a worker that observes the new gen also
+            // observes its participant count
+            const int nw = run_nw.load(std::memory_order_acquire);
             if (idx < nw)
             {
                 fn.load(std::memory_order_relaxed)(ctx, idx, nw);
@@ -1464,13 +1469,18 @@ struct Pool
         pin_self(0);   // worker 0 is the calling thread itself, never goes through worker_loop
     }
 
-    // Run fn on workers 0..n-1; returns when all are done (implicit barrier)
-    void run(PoolFn f, void* c)
+    // Run fn on workers 0..n-1; returns when all are done (implicit barrier). n_req > 0
+    // caps the worker count for this run: small jobs (one or two experts) saturate RAM
+    // bandwidth on a fraction of the pool, and every surplus worker is another straggler
+    // candidate at the six per-phase barriers
+    void run(PoolFn f, void* c, int n_req = 0)
     {
-        const int n = num_workers;
+        int n = num_workers;
+        if (n_req > 0 && n_req < n) n = n_req;
         if (n <= 1) { f(c, 0, 1); return; }
         ctx = c;
         fn.store(f, std::memory_order_relaxed);
+        run_nw.store(n, std::memory_order_release);
         const uint64_t d0 = done.load(std::memory_order_acquire);
         gen.fetch_add(1, std::memory_order_release);
 #ifndef __linux__
@@ -1682,18 +1692,27 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 transform_out(L.ups[ch.expert], u, ch.m);
                 const size_t count = static_cast<size_t>(ch.m) * I;
                 float* a = gated ? g : u;
+                // Nonzero act_limit clamps the up path symmetrically and the activated gate
+                // from above, BEFORE the multiply (matching the GPU act_mul kernels). DS4
+                // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
+                // context push |u| into the thousands, and skipping the clamp here made
+                // offloaded experts diverge arbitrarily far from their GPU-resident twins
+                const float lim = L.act_limit != 0.0f
+                    ? L.act_limit : std::numeric_limits<float>::infinity();
                 switch (L.activation) {
                     case 0:
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = g[i];
-                            g[i] = gv / (1.0f + std::exp(-gv)) * u[i];
+                            const float av = std::min(gv / (1.0f + std::exp(-gv)), lim);
+                            g[i] = av * std::clamp(u[i], -lim, lim);
                         }
                         break;
                     case 1:
                         for (size_t i = 0; i < count; ++i) {
                             const float gv = g[i];
                             const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
-                            g[i] = gv * cdf * u[i];
+                            const float av = std::min(gv * cdf, lim);
+                            g[i] = av * std::clamp(u[i], -lim, lim);
                         }
                         break;
                     case 3: {
@@ -2053,6 +2072,14 @@ void exl3_moe_cpu_forward_raw(
     std::lock_guard<std::mutex> lock(g_pool_mutex);
     g_pool.ensure(threads > 0 ? threads : 1);
 
+    // Small-job worker cap (see Pool::run): enough cores to saturate RAM bandwidth on a
+    // couple of expert GEMVs, few enough to keep the phase barriers tight
+    static const int small_cap = [](){
+        const char* e = getenv("EXL3_MOE_CPU_SMALL_WORKERS");
+        return e ? atoi(e) : 0;
+    }();
+    const int n_run = nc <= 2 ? small_cap : 0;
+
     // Per-phase wall time, reported every 512 jobs; enabled once at worker startup via
     // exl3_moe_cpu_set_prof (MoeCpuTuning.cpu_prof in moe_cpu_host.py, EXL3_MOE_CPU_PROF env)
     const bool prof = g_prof_enabled.load(std::memory_order_relaxed);
@@ -2064,12 +2091,12 @@ void exl3_moe_cpu_forward_raw(
         if (prof)
         {
             const auto t0 = std::chrono::steady_clock::now();
-            g_pool.run(&forward_phase, &ctx);
+            g_pool.run(&forward_phase, &ctx, n_run);
             phase_us[phase] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         }
         else
         {
-            g_pool.run(&forward_phase, &ctx);
+            g_pool.run(&forward_phase, &ctx, n_run);
         }
     }
     if (prof && ++prof_jobs % 512 == 0)

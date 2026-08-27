@@ -68,6 +68,14 @@ class Module(ABC):
         for module in self.modules:
             module.load(device, **kwargs)
 
+    def pin_linears(self):
+        """Move eligible linear-layer weights to pinned host memory, replacing them with
+        zero-copy device aliases (see InferParams.vision_pinned). Called by the loader after
+        a top-level module's (possibly deferred) load has fully materialized its tensors;
+        recurses to Linear, which does the work. Everything else keeps its VRAM tensors."""
+        for module in self.modules:
+            module.pin_linears()
+
     def unload(self):
         self.device = None
         for module in self.modules:
@@ -163,3 +171,9 @@ class Module(ABC):
 
     def get_compile_tensors(self, stc):
         return stc.get_tensors(self.key, allow_bf16 = True)
+
+    def autosplit_extra_measure(self, params):
+        """
+        Extra measuring forwards for the autosplit loader.
+        """
+        pass

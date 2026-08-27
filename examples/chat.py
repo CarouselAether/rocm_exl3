@@ -1,4 +1,5 @@
 import sys, os
+from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
@@ -46,16 +47,6 @@ def main(args):
     assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
     save_probs = args.probs
 
-    if args.basic_console:
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_basic
-    elif args.mode == "gptoss":
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_harmony
-    else:
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_rich
-
     # Prompt format
     prompt_format = prompt_formats[args.mode](user_name, bot_name)
     spc = {}
@@ -64,6 +55,17 @@ def main(args):
     prompt_format.set_special(spc)
     system_prompt = prompt_format.default_system_prompt(think) if not args.system_prompt else args.system_prompt
     add_bos = prompt_format.add_bos()
+
+    # Console
+    if args.basic_console:
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_basic
+    elif prompt_format.is_harmony_like():
+        read_input_fn = read_input_ptk
+        streamer_cm = partial(Streamer_harmony, tags = prompt_format.harmony_tags())
+    else:
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_rich
 
     # Load model
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
@@ -88,7 +90,7 @@ def main(args):
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
         dynamic_draft_tokens = args.dynamic_draft,
-        dynamic_draft_skip_ema = args.draft_skip_ema,
+        draft_confidence = args.draft_confidence,
         cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
         recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
         show_visualizer = args.visualize_cache,

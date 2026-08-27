@@ -19,6 +19,7 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .glm_moe_dsa import GlmMoeDsaModel
 from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
@@ -33,7 +34,8 @@ from .ministral3 import Ministral3Model
 from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
-from .nanochat import NanoChatModel
+from .muse_glimmer import MuseGlimmerTextModel
+from .muse_glimmer_assistant import MuseGlimmerAssistantModel
 from .nemotronh import NemotronHModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
@@ -81,6 +83,7 @@ ARCHITECTURES = {
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        GlmMoeDsaModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
@@ -95,7 +98,8 @@ ARCHITECTURES = {
         MistralModel,
         Mistral3Model,
         MixtralModel,
-        NanoChatModel,
+        MuseGlimmerTextModel,
+        MuseGlimmerAssistantModel,
         NemotronHModel,
         Olmo3Model,
         OlmoHybridModel,
