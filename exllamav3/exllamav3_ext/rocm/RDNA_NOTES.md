@@ -951,5 +951,15 @@ What is PROVEN vs SUSPECTED, so nobody re-litigates the wrong part:
   cooperative route from decode, so the −15% passthrough penalty this flag
   once recovered no longer exists. Graphs stay off by default; the flag is
   now known-safe on 7.14-class runtimes should a path that benefits return.
-  stream_wedge_check itself was deliberately NOT run (machine-wedge risk;
-  user's call) — the graphpatch ladder was accepted as the gating evidence.
+  WHY flat, verified: rocm-smi shows the GPU 100% busy through decode —
+  decode is GPU-bound at the bandwidth roofline, so graphs (which only
+  remove host-side launch overhead, ~300 launches x ~5us ≈ 1.5ms/token,
+  async and fully overlapped against 48ms/token) have nothing to reclaim.
+  The "-15% decode without graphs" recorded 2026-08-15 does NOT reproduce
+  today on either stack (system 7.2.4 graphs-off matches historical
+  graphs-on numbers exactly); treat it as stale — most plausibly it
+  amortized the cooperative kernel's per-launch setup in a configuration
+  the mgemv fast path had already made obsolete, or it was first-run-high
+  measurement noise. stream_wedge_check itself was deliberately NOT run
+  (machine-wedge risk; user's call) — the graphpatch ladder was accepted
+  as the gating evidence.
