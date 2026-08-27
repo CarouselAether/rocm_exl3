@@ -56,6 +56,37 @@ def run_mgemm(ml, A, C, A_had, idx, weights, min_index, max_index, num_tokens):
                    min_index, max_index, 0, num_tokens, None, None)
 
 
+def check_masked_2tok(name, ml, H, I, idx2, w2, min_index, max_index, tol):
+    """Masked range filtering at num_tokens=2 vs the unfiltered -1-skip path."""
+    dev = ml.ptrs_trellis.device
+    e2 = idx2.shape[1]
+    torch.manual_seed(0)
+    A = torch.randn(e2, 1, H, dtype=torch.half, device=dev) * 0.5
+
+    # Reference indices: pre-rebased, out-of-range picks -> -1
+    keep = (idx2 >= min_index) & (idx2 < max_index)
+    idx_ref = torch.where(keep, idx2 - min_index, torch.full_like(idx2, -1))
+
+    os.environ["EXL3_MGEMV"] = "0"
+    outs = []
+    for run_idx, mi, ma in ((idx_ref, -1, -1), (idx2, min_index, max_index)):
+        C = torch.full((e2, 1, I), float("nan"), dtype=torch.float, device=dev)
+        A_had = torch.empty(e2, 1, H, dtype=torch.half, device=dev)
+        run_mgemm(ml, A, C, A_had, run_idx, w2, mi, ma, 2)
+        torch.cuda.synchronize()
+        # Only the two reduced token rows are defined output
+        outs.append(C[:2].float())
+    ref, got = outs
+    if torch.isnan(got).any() or torch.isnan(ref).any():
+        print(f"  FAIL {name}: NaN in reduced token rows")
+        return False
+    denom = ref.abs().clamp_min(1.0)
+    err = ((got - ref).abs() / denom).max().item()
+    good = err <= tol
+    print(f"  {'ok  ' if good else 'FAIL'} {name}: tokens=2 max_rel_err={err:.3e} (tol {tol:.0e})")
+    return good
+
+
 def compare(name, ml, H, I, idx, weights, min_index, max_index, num_tokens,
             fp32, fan_in_shared, tol, e=None):
     dev = ml.ptrs_trellis.device
@@ -162,6 +193,18 @@ def main():
             w2 = torch.cat([w, w], dim=1)
             ok &= compare(f"{label}/fp16C/2tok", ml, H, I, idx2, w2, -1, -1, 2,
                           False, False, 2e-2)
+
+            # v1.4.4 masked grouped reduction: num_tokens > 1 WITH range filtering.
+            # The mgemv fast path declines this combination, so an EXL3_MGEMV A/B is
+            # vacuous (both runs are the cooperative kernel). Cross-check instead
+            # against the validated unfiltered path: filtering [half, n_exp) with
+            # rebase is identical to pre-shifting the indices by half and marking
+            # out-of-range picks -1 (negative indices skip the slot; the v1.4.4
+            # reduction guard must then skip their stale scratch too). Same experts,
+            # same per-slot input rows, same weights, same summation order -> fp32
+            # outputs should agree to rounding. Coop-only on both sides.
+            ok &= check_masked_2tok(f"{label}/fp32C/2tok+pack-half", ml, H, I,
+                                    idx2, w2, n_exp // 2, n_exp, 1e-5)
 
     print("PASS" if ok else "FAIL")
     sys.stdout.flush()

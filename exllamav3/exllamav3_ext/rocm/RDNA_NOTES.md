@@ -731,6 +731,43 @@ The upstream surface stayed at four files and the conflict was four lines
 upstream. `requirements_rocm.txt` is ours and additive, but it duplicates the
 dependency list, so it needs the same `llguidance` swap or a cold install breaks.
 
+### v1.4.1 → v1.4.4
+
+71 upstream commits (GLM 5.2, DSA-on-MLA, quantized-vision defaults, CPU-MoE
+expert maps, new optimization pipeline). Cheaper than the previous sync: zero
+merge conflicts (`setup.py`, `__init__.py`, `triton_paged.py`, even README
+merged clean), and the fragile paths (`exl3_gemm_inner.cuh`, all of
+`exl3_moe*`/`exl3_gemv*`/`comp_units`, reconstruct, quantize, kernel map) are
+byte-identical between the tags — the split-K fixes and the GEMV decode work
+carried forward untouched. `EXL3_MGEMM_ARGS` did not change, so the comp_units
+needed nothing.
+
+| sibling | our drift | upstream churn | method |
+|---|---|---|---|
+| `rope_rdna.hip` | 71 | 51+/~90- | regenerate (scripted); upstream deleted `post_rope_norm`/`apply_norm_uw` and Nanochat, taking the second lane-0-bug site with it — one guarded site remains (`apply_norm`), bug still live upstream |
+| `moe_handoff_rdna.hip` | 3 (include lines) | +59, layout change | regenerate (sed) — `MOE_FLAGS_SIZE` grew 2×→3× slot regions (`consumed[]`), new `MOE_JOB_KIND_COMPUTE_GATED`; all inherited for free, but a stale sibling here is silent shared-memory corruption, not a compile error |
+| `exl3_gemm_rdna.hip` | 272 | 11+/4- | apply the two hunks (doc comment + drop the `num_tokens == 1 \|\| min_index < 0` TORCH_CHECK); drift is 272 now, not the 146 recorded at v1.4.1 — the mgemv routing and width-list work grew it post-sync |
+| `exl3_gemm_kernel_rdna.hip.h` | 58 (unchanged) | 34+/12- | apply the three hunks: position-preserving `-1` masking for `num_tokens > 1` range filtering, plus the two stale-scratch reduction guards |
+
+**Port-specific consequence of the masking change:** upstream made
+`num_tokens > 1` legal *with* expert-range filtering by switching the
+cooperative kernel from index compaction to in-place masking. Our mgemv fast
+path (`exl3_mgemv_rdna.hip`) still compacts — its grouped reduce divides
+`packed / num_tokens`, which the new combination breaks (per-token slot runs
+collapse, and packed need not divide). Fixed by declining
+`num_tokens > 1 && min_index >= 0` in `exl3_mgemv_try_launch` so those calls
+fall through to the cooperative kernel. Only TP-sharded / CPU-split expert maps
+produce the combination; if CPU-split MoE decode ever matters for throughput,
+that fall-through is the place to look.
+
+New device code is all in `dsa_topk.cu` (+481, DSA-on-MLA top-k split/merge):
+six guarded Hillis–Steele `__shfl_up_sync` scans, no asm/PTX/mma. Validated
+with distinct per-lane values by `rocm_tools/shfl_up_scan_check.hip` (PASS on
+gfx1151 — the `lane >= o` guard makes clamp-vs-wrap moot, in-range delivery is
+correct). `routing.cu`'s +241 and `mla_attention.cpp`'s +416 lines contain no
+new warp ops. `graph_rdna.hip` needed nothing — it includes `graph.cuh`, so the
+new `GP_dsa_indices` enum flows through.
+
 ## Test status on RDNA
 
 Measured at v1.4.1. `tests/` hardcode a device index — `cuda:2` in most files,

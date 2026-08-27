@@ -2,7 +2,7 @@
 # <img src="doc/cat.png" width="40"> ExLlamaV3 — ROCm / RDNA fork
 
 This is a **ROCm fork of [ExLlamaV3](https://github.com/turboderp-org/exllamav3)** by turboderp, tracking
-upstream v1.3.0. If you are on NVIDIA, you want [the upstream repo](https://github.com/turboderp-org/exllamav3) —
+upstream v1.4.4. If you are on NVIDIA, you want [the upstream repo](https://github.com/turboderp-org/exllamav3) —
 this one builds for CUDA too, but adds nothing there.
 
 The Python package is still named `exllamav3`, so it is a drop-in replacement (including for TabbyAPI).
@@ -17,11 +17,11 @@ The CUDA kernels that cannot compile for RDNA are replaced with hand-written HIP
 **No upstream C++ or CUDA source is modified — not one.** Verify it yourself:
 
 ```sh
-git diff --stat v1.3.0 -- '*.cu' '*.cuh' '*.cpp' '*.h' ':(exclude)exllamav3/exllamav3_ext/rocm'
+git diff --stat v1.4.4 -- '*.cu' '*.cuh' '*.cpp' '*.h' ':(exclude)exllamav3/exllamav3_ext/rocm'
 # (empty)
 ```
 
-Outside `rocm/` and `rocm_py/`, exactly four upstream files differ from v1.3.0:
+Outside `rocm/` and `rocm_py/`, exactly four upstream files differ from v1.4.4:
 
 | file | change |
 |---|---|
@@ -31,7 +31,7 @@ Outside `rocm/` and `rocm_py/`, exactly four upstream files differ from v1.3.0:
 | `README.md` | This section. |
 
 ```sh
-git diff --stat v1.3.0 -- . ':(exclude)exllamav3/exllamav3_ext/rocm' ':(exclude)exllamav3/rocm_py' ':(exclude)rocm_tools'
+git diff --stat v1.4.4 -- . ':(exclude)exllamav3/exllamav3_ext/rocm' ':(exclude)exllamav3/rocm_py' ':(exclude)rocm_tools'
 ```
 
 That is the whole surface. Rebasing onto a new upstream means re-applying four files, none of them kernels.
@@ -45,7 +45,7 @@ That is the whole surface. Rebasing onto a new upstream means re-applying four f
 | Python | 3.10+ (whatever the ROCm torch index publishes a wheel for) |
 | Torch | ROCm build, from `download.pytorch.org/whl/rocmX.Y` — see below |
 
-You do **not** need FlashAttention. Upstream v1.3.0 uses Triton paged attention, so the FA2 dependency that
+You do **not** need FlashAttention. Upstream uses Triton paged attention, so the FA2 dependency that
 earlier ROCm forks required is gone.
 
 ### Install
@@ -72,9 +72,9 @@ machine).
 ### Tested
 
 Developed on a Ryzen AI Max 395+ (Strix Halo, **gfx1151**, 128 GB unified) — Ubuntu 24.04, ROCm 7.2.4,
-torch 2.13.0+rocm7.2, triton-rocm 3.7.1, Python 3.12. Verified end to end with GLM-4.6V (MoE, 3.55 bpw) and
-Gemma-4-31B (dense). The other architectures in the supported list above should work but are untested —
-reports welcome.
+torch 2.13.0+rocm7.2, triton-rocm 3.7.1, Python 3.12. Verified end to end with GLM-4.6V (MoE, 3.55 bpw),
+Gemma-4-31B (dense) and DeepSeek-V4-Flash (DSA sparse attention, 2.04 bpw). The other architectures in the
+supported list above should work but are untested — reports welcome.
 
 ### Known limitations on ROCm
 

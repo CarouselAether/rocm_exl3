@@ -575,6 +575,13 @@ bool exl3_mgemv_try_launch
     if (size_k % 128 || size_n % 128) return false;
     if ((size_n_list != nullptr) != (c_list != nullptr)) return false;
     if (size_n_list && (weights_ptr || num_tokens != 1 || min_index >= 0)) return false;
+    // v1.4.4: upstream made num_tokens > 1 legal WITH range filtering by switching the
+    // cooperative kernel to position-preserving masking (out-of-range slots -> -1 in
+    // place). This path still packs (compacts), which collapses the per-token slot runs
+    // the grouped reduce below divides by (stride = packed / num_tokens) -- wrong
+    // grouping, and packed need not even divide. Decline and let the cooperative
+    // kernel handle it; only TP-sharded / CPU-split expert maps hit this combination.
+    if (num_tokens > 1 && min_index >= 0) return false;
     if (!exl3_mgemv_enabled()) return false;
 
     // 128 = MAX_INDICES, the cooperative kernel's packing-array bound; kept for
