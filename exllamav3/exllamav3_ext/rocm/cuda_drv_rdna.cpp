@@ -73,6 +73,19 @@ const CudaDrv& CudaDrv::instance()
             void* lib = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL);
             if (!lib || !dlsym(lib, DRV_STR(cuModuleLoadData)))
             {
+                // torch >= 2.15 loads its bundled runtime RTLD_LOCAL, so the
+                // global-scope probe above misses it even though the runtime IS
+                // mapped. RTLD_NOLOAD returns a handle to the already-loaded
+                // instance by soname without searching the filesystem -- the
+                // named searches below would find the SYSTEM tree's dev symlink
+                // first and load that mismatched second instance (the 709-class
+                // failure the comment above describes, reproduced on torch
+                // 2.15+rocm7.14 over system 7.2.4 as "CUDA driver error" at
+                // module load).
+                lib = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_NOLOAD);
+            }
+            if (!lib || !dlsym(lib, DRV_STR(cuModuleLoadData)))
+            {
                 lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
                 if (!lib) lib = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_GLOBAL);
             }
