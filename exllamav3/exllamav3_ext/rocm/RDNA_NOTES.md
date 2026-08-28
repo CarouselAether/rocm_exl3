@@ -968,7 +968,21 @@ What is PROVEN vs SUSPECTED, so nobody re-litigates the wrong part:
   triplet, batching expert slots), not by replaying the same kernels
   from a graph — that dispatch-gap budget (~4ms/token profiled, less
   unprofiled; A/B bounds it under 0.5% real) belongs to the mgemv
-  split-K/fusion arc. The "-15% decode without graphs" recorded
+  split-K/fusion arc. Cross-model (same tool, 31 tokens, profiled):
+  launches/token 1953 Laguna / 1622 Gemma / 2172 DS4; dispatch-gap
+  3.5-5.2 ms/token everywhere, but as % of span it is 10.0 / 2.9 / 7.8 —
+  fusion pays most on fast MoE tokens, least on big dense.
+  OPEN LEAD (DS4 only): 1271 big gaps (~41/token, once per layer,
+  ~100-500us each, ~5 ms/token ≈ 8%) sit between dsv4_compress_store and
+  _dsa_attn_split — SAME stream (tid 1), next kernel already enqueued
+  (host parked in one ~60 ms hipDeviceSynchronize per token), so it is a
+  DEVICE-side dispatch stall, unaffected by EXL3_ROCM_HIP_GRAPHS (1369
+  vs 1374 gaps A/B). Prime suspect: per-dispatch scratch/LDS
+  reconfiguration for the two big Triton DSA kernels alternating with
+  scratch-light exl3 kernels every layer (Laguna/Gemma module-launch
+  Triton attention too and show almost no big gaps). Next step: read
+  n_spills/shared from the compiled _dsa_attn_split metadata in
+  bc_attn's _compile_kernel; if spilling, retune num_warps/stages. The "-15% decode without graphs" recorded
   2026-08-15 does NOT reproduce today on either stack (system 7.2.4
   graphs-off matches historical graphs-on numbers exactly); treat it as
   stale — most plausibly it amortized the cooperative kernel's
