@@ -972,17 +972,36 @@ What is PROVEN vs SUSPECTED, so nobody re-litigates the wrong part:
   launches/token 1953 Laguna / 1622 Gemma / 2172 DS4; dispatch-gap
   3.5-5.2 ms/token everywhere, but as % of span it is 10.0 / 2.9 / 7.8 —
   fusion pays most on fast MoE tokens, least on big dense.
-  OPEN LEAD (DS4 only): 1271 big gaps (~41/token, once per layer,
-  ~100-500us each, ~5 ms/token ≈ 8%) sit between dsv4_compress_store and
-  _dsa_attn_split — SAME stream (tid 1), next kernel already enqueued
-  (host parked in one ~60 ms hipDeviceSynchronize per token), so it is a
-  DEVICE-side dispatch stall, unaffected by EXL3_ROCM_HIP_GRAPHS (1369
-  vs 1374 gaps A/B). Prime suspect: per-dispatch scratch/LDS
-  reconfiguration for the two big Triton DSA kernels alternating with
-  scratch-light exl3 kernels every layer (Laguna/Gemma module-launch
-  Triton attention too and show almost no big gaps). Next step: read
-  n_spills/shared from the compiled _dsa_attn_split metadata in
-  bc_attn's _compile_kernel; if spilling, retune num_warps/stages. The "-15% decode without graphs" recorded
+  RESOLVED (2026-08-28), DS4 per-layer stall: 1271 big gaps (~41/token,
+  once per layer, ~100-500us each, ~5 ms/token ≈ 8%) sat between
+  dsv4_compress_store and _dsa_attn_split — SAME stream (tid 1), next
+  kernel already enqueued (host parked in one ~60 ms hipDeviceSynchronize
+  per token), so a DEVICE-side dispatch stall, unaffected by
+  EXL3_ROCM_HIP_GRAPHS (1369 vs 1374 gaps A/B). Root cause confirmed by
+  compile inspection: _dsa_attn_split_kernel at upstream's CUDA tuning
+  (BLOCK_H=16, num_warps=4) sits at the 256-VGPR ceiling with 2050 VGPR
+  spills and 5332 B/item scratch — the only scratch user in the decode
+  stream, so every layer's dispatch after scratch-free kernels pays the
+  queue's scratch reconfiguration. 16-variant compile sweep
+  (scratch tracks spills; none reach zero — residual ~130 at w16/H4/N16):
+  BLOCK_H=8 + num_warps=8 (BLOCK_N untouched) is the bench winner —
+  spills 438, scratch 1756 B, big gaps 1369 -> 45, decode 15.6 -> 17.8
+  t/s on the 7.14 stack and 15.9 -> 17.9 on system 7.2.4 (+13-14%).
+  Deeper-spill variants bench WORSE (H4/w16 14.9, H4/w8 17.0): past the
+  stall threshold, tile shape matters more than residual spills. Shipped
+  as the EXL3_ROCM_DSA_TUNE rocm_py patch (default on; =0 restores
+  upstream tuning): bc_dsa.BLOCK_H=8 via module attr + num_warps=8 via a
+  _compile_kernel wrapper keyed on the kernel name, rebound in bc_attn,
+  bc_dsa AND bc_mla (each holds its own from-import reference). bc_mla's
+  DSA-on-MLA (GLM 5.2) hardcodes a local BLOCK_H=16, so it gets only the
+  warps half (~1428 spills) — no model small enough to test here anyway.
+  Watch item: tests/test_mla_dsa.py::test_dsa_selection[300] failed ONCE
+  ("row 2..." assertion) on the first tuned full-suite run, then passed 5
+  consecutive full-suite runs and in isolation; baseline also clean.
+  Unreproduced — if it recurs, bisect with EXL3_ROCM_DSA_TUNE=0 first.
+  Tools: spill sweep = scratchpad dsa_sweep.py pattern (triton.compile
+  interception, parse .vgpr_spill_count / .private_segment_fixed_size
+  from ck.asm["amdgcn"]); gap evidence = rocm_tools/gap_profile.py. The "-15% decode without graphs" recorded
   2026-08-15 does NOT reproduce today on either stack (system 7.2.4
   graphs-off matches historical graphs-on numbers exactly); treat it as
   stale — most plausibly it amortized the cooperative kernel's

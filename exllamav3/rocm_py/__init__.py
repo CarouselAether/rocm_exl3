@@ -132,6 +132,51 @@ def apply() -> list[str]:
         applied.append(f"!! FAILED triton hsaco alias: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
+    # DSA split kernel: RDNA tile/wave retune (spill + queue-stall fix)
+    # ------------------------------------------------------------------
+    # _dsa_attn_split_kernel at upstream's CUDA tuning (BLOCK_H=16, num_warps=4)
+    # compiles on gfx1151 at the 256-VGPR ceiling with ~2050 VGPR spills and
+    # 5332 B/work-item scratch -- the ONLY scratch user in the whole decode
+    # stream. Every layer then alternates it against scratch-free kernels, and
+    # the hardware queue pays a ~100-500us scratch-reconfiguration stall per
+    # dispatch: ~41x/token = ~5 ms/token on DeepSeek-V4-Flash, measured
+    # device-side (same stream, host parked in hipDeviceSynchronize, graphs-
+    # immune -- see RDNA_NOTES "DS4 per-layer stall" and rocm_tools/
+    # gap_profile.py). BLOCK_H=8 + num_warps=8 cuts spills to 438 and scratch
+    # to 1756 B: the stalls collapse (1369 -> 45 big gaps / 31 tokens) and
+    # decode goes 15.6 -> 17.8 t/s (+14%). Sweep of 16 variants in the notes;
+    # H4/w16 and BLOCK_N=16 shapes spill less still but bench worse (14.9-17.0).
+    #
+    # BLOCK_H is a bc_dsa module constant, so it can be retuned here; the
+    # split-kernel warps are an inline argument, so wrap _compile_kernel keyed
+    # on the kernel NAME -- and rebind the wrapper in every module that did
+    # `from .bc_attn import _compile_kernel` (bc_dsa, bc_mla), per the aliasing
+    # note above. bc_mla's DSA-on-MLA path (GLM 5.2) hardcodes a local
+    # BLOCK_H=16 inside _configure, so it gets only the warps half of the fix
+    # (~1428 spills); untestable here regardless -- no model fits.
+    # EXL3_ROCM_DSA_TUNE=0 restores upstream tuning.
+    if _env_on("EXL3_ROCM_DSA_TUNE", True):
+        try:
+            from ..modules.attention_fn import bc_attn as _bca
+            from ..modules.attention_fn import bc_dsa as _bcd
+            from ..modules.attention_fn import bc_mla as _bcm
+
+            _bcd.BLOCK_H = 8
+            _orig_compile_kernel = _bca._compile_kernel
+
+            def _compile_kernel_rdna(device, fn, signature, constexprs, num_warps, num_stages):
+                if fn.__name__ == "_dsa_attn_split_kernel":
+                    num_warps = 8
+                return _orig_compile_kernel(device, fn, signature, constexprs, num_warps, num_stages)
+
+            _bca._compile_kernel = _compile_kernel_rdna
+            _bcd._compile_kernel = _compile_kernel_rdna
+            _bcm._compile_kernel = _compile_kernel_rdna
+            applied.append("DSA split kernel retuned for RDNA (BLOCK_H=8, num_warps=8; spills 2050->438)")
+        except Exception as e:
+            applied.append(f"!! FAILED DSA retune patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
     # MultiLinear (mgemm) fusion
     # ------------------------------------------------------------------
     # attn.py fuses K/V (and Q/G) into one MultiLinear, and mlp.py fuses
