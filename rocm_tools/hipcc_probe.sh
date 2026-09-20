@@ -119,7 +119,7 @@ if [[ "${1:-}" == "--all" ]]; then
   # inline PTX in ptx.cuh (and, through exl3_dq.cuh, codebook.cuh) by *relative
   # quoted* include, which -I cannot intercept.
   mapfile -t SRCS < <( { find "$E" -name '*.cu' -o -name '*.cpp' \
-        | grep -vE "/(parallel|comp_units)/|/rocm/|/rope\.cu$|/reconstruct\.cu$|/moe_handoff\.cu$|/exl3_gemm\.cu$|/exl3_gemv\.cu$|/exl3_gemv_int8\.cu$|/exl3_kernel_map\.cu$|/quantize\.cu$|/cuda_drv\.cpp$|/exl3_moe\.cu$"
+        | grep -vE "/(parallel|comp_units)/|/rocm/|/rope\.cu$|/reconstruct\.cu$|/moe_handoff\.cu$|/exl3_gemm\.cu$|/exl3_gemv\.cu$|/exl3_gemv_int8\.cu$|/exl3_kernel_map\.cu$|/quantize\.cu$|/cuda_drv\.cpp$|/exl3_moe\.cu$|/hgemm_f16acc\.cu$|/exl3_moe_coop\.cu$"
       find "$E/rocm" -name '*.hip' 2>/dev/null; } | sort)
   pass=0; fail=0; declare -a FAILED=()
   for s in "${SRCS[@]}"; do

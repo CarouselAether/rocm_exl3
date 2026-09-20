@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ..util.device_copy import to_device
 from ..model.config import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
@@ -13,7 +14,6 @@ from .attention_fn.mla_triton import (
     mla_attn_triton_prefill_mha,
     mla_absorb,
     mla_unfold,
-    has_triton,
 )
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
 import os
@@ -102,6 +102,8 @@ class MLAttention(Module):
         index_head_dim: int = 0,
         index_topk: int = 0,
         index_norm_eps: float = 1e-6,
+        index_kpool: int = 0,
+        index_kpool_tail: bool = True,
         key_indexer: str = "indexer",
     ):
         super().__init__(config, key, None)
@@ -124,6 +126,7 @@ class MLAttention(Module):
         self.l4_original = 1
         self.out_dtype = out_dtype
         self.key_kv_b = key_kv_b
+        self.key_indexer = key_indexer
         self.norm_eps = rms_norm_eps
 
         # The softmax scale follows the *unabsorbed* head dim: absorption does not change the
@@ -196,8 +199,20 @@ class MLAttention(Module):
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
+        # GLM5.3-style k-pool compression: keys are pooled index_kpool at a time (softmax over
+        # cached per-token gate scores + a learned in-pool APE), scoring and selection run over
+        # pools, and selections expand back to raw token indices (plus the incomplete tail
+        # pool's tokens, appended raw, when index_kpool_tail). The cached plane then holds
+        # [k || gate_scores] per token
+        self.index_kpool = index_kpool
+        self.index_kpool_tail = index_kpool_tail
+        self.idx_kpool_ape = None
+        self.idx_kpool_gate = None
         # Cache layers allocate a per-token indexer-key plane for layers that score selections
-        self.idx_plane_dim = index_head_dim if indexer_mode == "full" else None
+        self.idx_plane_dim = (
+            None if indexer_mode != "full" else
+            index_head_dim * 2 if index_kpool else index_head_dim
+        )
         if indexer_mode == "full":
             assert q_lora_rank is not None, "DSA indexer queries project from the q_a latent"
             self.idx_wq_b = Linear(
@@ -277,6 +292,15 @@ class MLAttention(Module):
         for cl in self.cache_layers:
             cl.alloc(device)
 
+        if self.index_kpool:
+            stc = self.config.stc
+            self.idx_kpool_ape = stc.get_tensor(
+                f"{self.key}.{self.key_indexer}.index_kpool_compress_ape", device,
+                no_defer = True, allow_bf16 = True).float()
+            self.idx_kpool_gate = stc.get_tensor(
+                f"{self.key}.{self.key_indexer}.index_kpool_compress_gate", device,
+                no_defer = True, allow_bf16 = True).to(torch.half)
+
         if self.rope_settings:
             self.rope = RoPE(device, self.rope_settings)
             # The Llama-4 scale multiplies the FULL query post-rope (HF semantics, q only). Only
@@ -334,6 +358,12 @@ class MLAttention(Module):
             uv = self.w_uv_flat.view(D_c, H, v).permute(1, 2, 0)
             t[f"{self.key}.{self.key_kv_b}.weight"] = \
                 torch.cat([uk, uv], dim = 1).reshape(H * (nope + v), D_c).contiguous()
+        # K-pool compression parameters are raw (unquantized) module tensors, carried as-is
+        if self.idx_kpool_ape is not None:
+            t[f"{self.key}.{self.key_indexer}.index_kpool_compress_ape"] = \
+                self.idx_kpool_ape.contiguous()
+            t[f"{self.key}.{self.key_indexer}.index_kpool_compress_gate"] = \
+                self.idx_kpool_gate.contiguous()
         return t
 
 
@@ -345,6 +375,8 @@ class MLAttention(Module):
         self.rope = None
         self.w_uk_flat = None
         self.w_uv_flat = None
+        self.idx_kpool_ape = None
+        self.idx_kpool_gate = None
         self._scratch = {}
         self.dispatch_cache = {}
 
@@ -384,6 +416,8 @@ class MLAttention(Module):
         head stride, so no slice copy or writeback is made (the eager mirror of the BC
         path's rope_gr on its kidx4/qidx4 narrow views)."""
         from ..ext import exllamav3_ext as ext
+        if self.rope is None or self.qk_rope_head_dim == 0:
+            return
         rope = self.rope
         v = x4[..., : self.qk_rope_head_dim]
         ext.rope(
@@ -408,7 +442,13 @@ class MLAttention(Module):
         bsz, seqlen, D_i = k.shape
         k = k.view(bsz, seqlen, 1, D_i)
         self._indexer_rope_(k, position, positions, position_ids, inv_freq)
-        return k.view(bsz, seqlen, D_i)
+        k = k.view(bsz, seqlen, D_i)
+        if self.index_kpool:
+            # Pack the per-token pool-gate scores next to the key: pooled keys are rebuilt
+            # from this plane (a pool's members' gate scores feed the in-pool softmax)
+            gate = torch.nn.functional.linear(x.to(torch.half), self.idx_kpool_gate)
+            k = torch.cat((k, gate), dim = -1)
+        return k
 
 
     def _indexer_topk(self, x, params, q_resid, bsz, seqlen, host_seqlens,
@@ -469,10 +509,13 @@ class MLAttention(Module):
                     )
 
                 dev = x.device
-                s_backing = g_tensor_cache.get(dev, (slab * t_tile,), torch.half, "dsa_stile")
+                # One fixed score-row stride (the tile width) for every slab and tile: the
+                # stride is a kernel constexpr, so letting it follow the visible length
+                # recompiled the scoring kernel on every new 128-key boundary
+                s_stride = -(-t_tile // 128) * 128
+                s_backing = g_tensor_cache.get(dev, (slab * s_stride,), torch.half, "dsa_stile")
 
                 if t_slab <= t_tile:
-                    s_stride = -(-t_slab // 128) * 128
                     sc = tile_scores(0, t_slab, s_backing[: rows * s_stride].view(rows, s_stride))
                     ext.dsa_topk(sc, out_slab, k_sel, None, 0)
                     continue
@@ -484,7 +527,6 @@ class MLAttention(Module):
                 run_idx = torch.full((rows, k_sel), -1, dtype = torch.int32, device = dev)
                 for t0 in range(0, t_slab, t_tile):
                     t1 = min(t0 + t_tile, t_slab)
-                    s_stride = -(-(t1 - t0) // 128) * 128
                     sc = tile_scores(t0, t1, s_backing[: rows * s_stride].view(rows, s_stride))
                     k_t = min(k_sel, t1 - t0)
                     kp_t = -(-k_t // 32) * 32
@@ -502,6 +544,190 @@ class MLAttention(Module):
                     run_scr > -float("inf"), run_idx, run_idx.new_full((), -1))
         return indices
 
+
+    def _update_pool_plane(self, idx_layer, block_table, host_seqlens, seqlen):
+        """
+        Incrementally extend the pooled-key plane with the pools completed by this chunk's
+        append. A pool's key is the (gate_scores + APE)-softmax-weighted mean of its
+        index_kpool members' keys; members are read back from the packed per-token plane
+        (already appended), so pools straddling chunk boundaries resolve correctly. Complete
+        pools are immutable, so each is written exactly once.
+        """
+        P, D_i = self.index_kpool, self.index_head_dim
+        plane = idx_layer.get_idx()
+        epp = plane.shape[1]
+        flat = plane.view(-1, 2 * D_i)
+        ape = self.idx_kpool_ape
+        for b in range(block_table.shape[0] if block_table.dim() == 2 else 1):
+            pos0 = host_seqlens[b]
+            first_pool = pos0 // P
+            last_pool = (pos0 + seqlen) // P
+            n_new = last_pool - first_pool
+            if n_new <= 0:
+                continue
+            bt = block_table[b]
+            tok = torch.arange(first_pool * P, last_pool * P, device = plane.device)
+            rows = bt[tok // epp].long() * epp + tok % epp
+            members = flat[rows].view(n_new, P, 2 * D_i).float()
+            keys, gates = members[..., :D_i], members[..., D_i:]
+            probs = torch.softmax(gates + ape.unsqueeze(0), dim = 1)
+            pool_keys = (probs * keys).sum(dim = 1).to(torch.half)
+            idx_layer.update_pool_direct(
+                torch.tensor([first_pool], dtype = torch.int32, device = plane.device),
+                bt.unsqueeze(0) if bt.dim() == 1 else bt,
+                pool_keys.unsqueeze(0),
+            )
+
+
+    def _indexer_topk_kpool(self, x, params, q_resid, bsz, seqlen, host_seqlens,
+                            k_idx_chunk = None, idx_pool = None, pool_plane = None,
+                            block_table = None):
+        """
+        K-pool indexer selection (GLM5.3): scoring and top-k run over pooled keys
+        (index_kpool consecutive tokens per entry), selections expand back to raw indices,
+        and the query's incomplete tail pool is appended as raw tokens. Paged path scores
+        the incrementally maintained pooled plane through the tiled scorer (compress_rate
+        gives the per-query causal pool bound); the cache-less path (k_idx_chunk, packed
+        [k || gate] rows) builds pools eagerly. Returns -1-padded int32 indices.
+        """
+        import torch.nn.functional as F
+        from .attention_fn.dsa_triton import dsa_indexer_scores
+        from ..ext import exllamav3_ext as ext
+        from ..util.tensor import g_tensor_cache
+
+        H_i, D_i, P = self.index_n_heads, self.index_head_dim, self.index_kpool
+        q_idx = self.idx_wq_b.forward(q_resid, params).view(bsz, seqlen, H_i, D_i).contiguous()
+        w = self.idx_weights.forward(x, params)
+
+        t_max = max(host_seqlens) + seqlen
+        sel_pools_max = min(self.index_topk // P, t_max // P)
+        out_w = max(sel_pools_max * P + (P - 1 if self.index_kpool_tail else 0), 1)
+        k_pad = -(-out_w // 32) * 32
+        indices = torch.full((bsz * seqlen, k_pad), -1, dtype = torch.int32, device = x.device)
+
+        def append_tail(b, base_cols):
+            if not self.index_kpool_tail or P <= 1:
+                return
+            q_pos = host_seqlens[b] + torch.arange(seqlen, device = x.device)
+            vis = q_pos + 1
+            tail_count = vis.remainder(P)
+            tail_start = vis - tail_count
+            toff = torch.arange(P - 1, device = x.device)
+            tail = tail_start.unsqueeze(1) + toff.unsqueeze(0)
+            tail = torch.where(toff.unsqueeze(0) < tail_count.unsqueeze(1),
+                               tail, tail.new_full((), -1))
+            rows = indices[b * seqlen : (b + 1) * seqlen]
+            rows[:, base_cols : base_cols + P - 1] = tail.int()
+
+        if pool_plane is not None:
+            # Paged pooled plane: same slab/tile structure as _indexer_topk, entries are
+            # pools. dsa_indexer_scores' causal bound (q_pos0 + r + 1) // compress_rate is
+            # exactly the visible-complete-pool count
+            wf = w  # raw head weights, scales folded in-kernel
+            epp = pool_plane.shape[1]
+            slab = 256
+            t_tile = max(epp, _score_tile // epp * epp)
+            for b in range(bsz):
+                pools_b = (host_seqlens[b] + seqlen) // P
+                base_cols = 0
+                for r0 in range(0, seqlen, slab):
+                    r1 = min(r0 + slab, seqlen)
+                    rows = r1 - r0
+                    pos0 = host_seqlens[b] + r0
+                    pools_slab = (host_seqlens[b] + r1) // P
+                    k_sel = min(self.index_topk // P, pools_slab)
+                    if k_sel <= 0:
+                        continue
+                    out_slab = indices[b * seqlen + r0 : b * seqlen + r1]
+
+                    def tile_scores(t0, t1, scores_out = None):
+                        bt = block_table[b]
+                        if t0:
+                            bt = bt[t0 // epp : -(-t1 // epp)]
+                        return dsa_indexer_scores(
+                            q_idx[b, r0:r1], wf[b, r0:r1], pool_plane.view(-1, D_i),
+                            pos0 - t0 * P, P, t1 - t0, scores = scores_out,
+                            block_table = bt, epp = epp,
+                        )
+
+                    dev = x.device
+                    # Fixed score-row stride (see _indexer_topk): a constexpr in the kernel
+                    s_stride = -(-t_tile // 128) * 128
+                    s_backing = g_tensor_cache.get(dev, (slab * s_stride,), torch.half, "dsa_stile")
+                    kp_sel = -(-k_sel // 32) * 32
+
+                    if pools_slab <= t_tile:
+                        sc = tile_scores(0, pools_slab,
+                                         s_backing[: rows * s_stride].view(rows, s_stride))
+                        pool_idx = torch.empty((rows, kp_sel), dtype = torch.int32, device = dev)
+                        ext.dsa_topk(sc, pool_idx, k_sel, None, 0)
+                        pool_idx = pool_idx[:, :k_sel]
+                    else:
+                        i_backing = g_tensor_cache.get(dev, (slab * kp_sel,), torch.int32, "dsa_itile")
+                        run_scr = torch.full((rows, k_sel), -float("inf"), dtype = torch.half, device = dev)
+                        run_idx = torch.full((rows, k_sel), -1, dtype = torch.int32, device = dev)
+                        for t0 in range(0, pools_slab, t_tile):
+                            t1 = min(t0 + t_tile, pools_slab)
+                            sc = tile_scores(t0, t1, s_backing[: rows * s_stride].view(rows, s_stride))
+                            k_t = min(k_sel, t1 - t0)
+                            kp_t = -(-k_t // 32) * 32
+                            ti = i_backing[: rows * kp_t].view(rows, kp_t)
+                            ext.dsa_topk(sc, ti, k_t, None, 0)
+                            t_scr = sc.gather(1, ti.clamp_min(0).long())
+                            t_scr = t_scr.masked_fill(ti < 0, -float("inf"))
+                            t_idx = torch.where(ti >= 0, ti + t0, ti)
+                            cand_scr = torch.cat((run_scr, t_scr), dim = 1)
+                            cand_idx = torch.cat((run_idx, t_idx), dim = 1)
+                            run_scr, sel = cand_scr.topk(k_sel, dim = 1)
+                            run_idx = cand_idx.gather(1, sel)
+                        pool_idx = torch.where(
+                            run_scr > -float("inf"), run_idx, run_idx.new_full((), -1))
+
+                    # Expand pools to raw token indices
+                    exp = (pool_idx.unsqueeze(-1) * P +
+                           torch.arange(P, dtype = torch.int32, device = dev)).flatten(1)
+                    exp = torch.where(
+                        pool_idx.unsqueeze(-1).expand(-1, -1, P).flatten(1) >= 0,
+                        exp, exp.new_full((), -1))
+                    out_slab[:, : exp.shape[1]] = exp
+                    base_cols = max(base_cols, exp.shape[1])
+                append_tail(b, base_cols)
+            return indices
+
+        # Cache-less eager path (parity/compare): pools built from the packed chunk rows
+        for b in range(bsz):
+            t_total = host_seqlens[b] + seqlen
+            plane = k_idx_chunk[b][:t_total]
+            keys, gates = plane[:, :D_i].float(), plane[:, D_i:].float()
+
+            n_pools = t_total // P
+            base_cols = 0
+            if n_pools:
+                gk = keys[: n_pools * P].view(n_pools, P, D_i)
+                gg = gates[: n_pools * P].view(n_pools, P, D_i)
+                probs = torch.softmax(gg + self.idx_kpool_ape.unsqueeze(0), dim = 1)
+                pool_keys = (probs * gk).sum(dim = 1)
+
+                sc = torch.einsum("shd,pd->shp", q_idx[b].float(), pool_keys)
+                sc = F.relu(sc * (D_i ** -0.5))
+                sc = torch.einsum("sh,shp->sp", w[b].float() * (H_i ** -0.5), sc)
+
+                q_pos = host_seqlens[b] + torch.arange(seqlen, device = x.device)
+                pool_end = torch.arange(n_pools, device = x.device) * P + (P - 1)
+                sc = sc.masked_fill(pool_end.unsqueeze(0) > q_pos.unsqueeze(1), -float("inf"))
+
+                select_k = min(self.index_topk // P, n_pools)
+                top_sc, top_pool = sc.topk(select_k, dim = -1)
+                exp = (top_pool.unsqueeze(-1) * P +
+                       torch.arange(P, device = x.device)).view(seqlen, -1)
+                exp = torch.where(
+                    (top_sc > -float("inf")).unsqueeze(-1).expand(-1, -1, P).reshape(seqlen, -1),
+                    exp, exp.new_full((), -1))
+                indices[b * seqlen : (b + 1) * seqlen, : exp.shape[1]] = exp.int()
+                base_cols = exp.shape[1]
+            append_tail(b, base_cols)
+
+        return indices
 
     def _l4_scale(self, bsz, seqlen, position, positions, position_ids, device) -> torch.Tensor:
         """Llama-4 query scale, 1 + beta * ln(1 + pos // original_max), as (R, 1, 1) fp16.
@@ -591,25 +817,35 @@ class MLAttention(Module):
             k_idx = self._indexer_keys(x, params, position, positions, position_ids, inv_freq)
             if idx_layer is not None:
                 idx_layer.update_idx_direct(cache_seqlens, block_table, k_idx, seqlen)
+                if self.index_kpool:
+                    self._update_pool_plane(idx_layer, block_table, host_seqlens, seqlen)
 
         if sparse:
             if self.indexer_mode == "full":
-                indices = self._indexer_topk(
-                    x, params, q_resid, bsz, seqlen, host_seqlens,
-                    position, positions, position_ids, inv_freq,
-                    k_idx_chunk = k_idx if idx_layer is None else None,
-                    idx_pool = idx_layer.get_idx() if idx_layer is not None else None,
-                    block_table = block_table,
-                )
+                if self.index_kpool:
+                    indices = self._indexer_topk_kpool(
+                        x, params, q_resid, bsz, seqlen, host_seqlens,
+                        k_idx_chunk = k_idx if idx_layer is None else None,
+                        pool_plane = idx_layer.get_pool() if idx_layer is not None else None,
+                        block_table = block_table,
+                    )
+                else:
+                    indices = self._indexer_topk(
+                        x, params, q_resid, bsz, seqlen, host_seqlens,
+                        position, positions, position_ids, inv_freq,
+                        k_idx_chunk = k_idx if idx_layer is None else None,
+                        idx_pool = idx_layer.get_idx() if idx_layer is not None else None,
+                        block_table = block_table,
+                    )
                 params["dsa_topk_indices"] = indices
             else:
                 indices = params.get("dsa_topk_indices")
                 assert indices is not None, \
                     "shared-indexer DSA layer found no top-k selection in params"
-                if indices.device != x.device:
-                    indices = indices.to(x.device)
+                indices = to_device(indices, x.device)
             return self._attend_sparse(
                 q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,
+                pool_len = max(host_seqlens) + seqlen,
             )
 
         if use_mha:
@@ -659,18 +895,16 @@ class MLAttention(Module):
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,
-                       block_table, indices, qc):
+                       block_table, indices, qc, pool_len = 0):
         """Gathered attention over the top-k selected latent rows (V3.2-on-MLA form of
         dsa_attn: no window, no sinks, V is the latent). The chunk's own rows are already in
-        the paged pool and the indexer's causal bound keeps the selection causal, so the
+        the paged pool (fp16 or packed-quantized; the packed form is dequantized online by the
+        gather kernel) and the indexer's causal bound keeps the selection causal, so the
         kernel needs no mask of its own. The kernel reads the head-major absorbed queries and
         the token-major rope queries directly and emits the head-major latent output the
         unfold consumes: no packed query copy, no output slice/transpose, and the rope half
         of the weighted sum is never accumulated."""
         from .attention_fn.dsa_triton import dsa_attn
-
-        assert qc is None, \
-            "sparse DSA over a quantized MLA cache is not supported yet; use an fp16 cache"
 
         H = self.num_q_heads
         R = bsz * seqlen
@@ -686,6 +920,8 @@ class MLAttention(Module):
             indices = indices, k_len = indices.shape[1],
             scale = self.sm_scale, page_size = ckv_cache.shape[1],
             q_pe = q_pe.reshape(R, H, D_r), out_latent = True,
+            qc = qc,   # packed latent pages read online (scales, bits), or staged for prefill
+            pool_len = pool_len,   # entries the selection can reference (context, not pool)
         )
         o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
@@ -712,8 +948,7 @@ class MLAttention(Module):
 
         # Graph-captured C++ path for the whole decode block (projections through o_proj as one
         # replayed CUDA graph). Falls back to the dispatch path for unsupported configurations,
-        # including per-step declines (sparse DSA over a quantized cache, missing shared
-        # selection)
+        # including per-step declines (missing shared selection)
         if (
             seqlen <= MAX_DECODE_QLEN and bsz <= _bc_max_bsz and
             params.get("causal", True) and params.get("inv_freq") is None
@@ -845,25 +1080,30 @@ class MLAttention(Module):
             bcm = build_bc_mla(self, layer)
         if bcm:
             from .attention_fn.bc_attn import MAX_BSZ
-            regimes = (0, 1) if self.indexer_mode is not None and not quant else (0,)
+            regimes = (0, 1) if self.indexer_mode is not None else (0,)
             for b, q in ((1, 1), (MAX_BSZ, MAX_DECODE_QLEN)):
                 for rg in regimes:
                     bcm._configure(b, q, rg)
 
-        # Sparse prefill at maximum context (the sparse path only serves fp16-cache indexer
-        # layers). Synthetic state: every block-table entry aliases page 0, zeroed so the
-        # math stays finite
-        if self.indexer_mode is None or quant:
+        # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
+        # page 0, zeroed so the math stays finite
+        if self.indexer_mode is None:
             return
         from ..constants import PAGE_SIZE
-        num_pages = layer.k.shape[0]
+        num_pages = (layer.qk if quant else layer.k).shape[0]
         t_syn = num_pages * PAGE_SIZE - chunk
         if t_syn + chunk <= self.index_topk:
             return   # cache too small to ever reach the sparse regime
-        layer.k[0].zero_()
+        if quant:
+            layer.qk[0].zero_()
+            layer.sk[0].zero_()
+        else:
+            layer.k[0].zero_()
         layer.v[0].zero_()
         if self.idx_plane_dim:
             layer.get_idx()[0].zero_()
+            if self.index_kpool:
+                layer.get_pool()[0].zero_()
         p2 = {k2: v2 for k2, v2 in params.items() if k2 not in
               ("dev_cache", "_mla_host_seqlens", "positions", "position_ids")}
         p2["cache_seqlens"] = torch.tensor([t_syn], dtype = torch.int32)

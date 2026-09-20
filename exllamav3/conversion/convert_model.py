@@ -5,7 +5,7 @@ import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
 from ..modules.linear import convert_exl3_group
-from ..modules.quant.exl3_lib.quantize import auto_split
+from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
 from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem, malloc_trim
@@ -28,6 +28,44 @@ col_red = "\u001b[31;1m"
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
+
+def monkeypatch_triton_autotuner_thread_safety():
+    """
+    Triton's Autotuner.run() stores the call's arguments as `self.nargs` on the shared
+    kernel object and nulls the attribute on exit.
+
+    capture_module_parallel / advance_state_parallel run one worker thread per device
+    through the same JIT kernels, so a thread finishing run() while another is still inside
+    the seconds-long benchmark loop poisons {**self.nargs, ...}
+
+    Every use of nargs is confined to the calling thread's run() frame, so rebinding the
+    attribute to thread-local storage removes the race with no behavioral change
+    single-threaded. A data descriptor on the class also overrides pre-existing instance
+    attributes, so the patch is safe to apply at any point.
+    """
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return
+    if getattr(Autotuner, "_exl3_tls_nargs", False):
+        return
+
+    def _get_nargs(self):
+        tls = self.__dict__.get("_exl3_nargs_tls")
+        return getattr(tls, "value", None) if tls is not None else None
+
+    def _set_nargs(self, value):
+        tls = self.__dict__.get("_exl3_nargs_tls")
+        if tls is None:
+            tls = self.__dict__.setdefault("_exl3_nargs_tls", threading.local())
+        tls.value = value
+
+    Autotuner.nargs = property(_get_nargs, _set_nargs)
+    Autotuner._exl3_tls_nargs = True
+
+monkeypatch_triton_autotuner_thread_safety()
+
+
 parser = argparse.ArgumentParser(allow_abbrev = False)
 parser.add_argument("-i", "--in_dir", type = str, default = None, help = "Input (model) directory")
 parser.add_argument("-w", "--work_dir", type = str, default = None, help = "Working directory")
@@ -39,6 +77,8 @@ parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bi
 parser.add_argument("-mb", "--mtp_bits", type = int, default = None, help = "Bits per weight, MTP layers, default: 4")
 parser.add_argument("-vb", "--vision_bits", type = int, default = None, help = "Bits per weight, vision model layers, 1-8, or 16 to store unquantized, default: architecture's default (6 for validated towers, else 16)")
 parser.add_argument("-hq", "--hq", action = "store_true", help = "Increase bitrate of select layers for supported models (MoE mostly)")
+parser.add_argument("-ngb", "--ngram_bits", type = int, default = None, help = "Bits per weight for hashed n-gram embedding tables, 1-8, default: --bits rounded")
+parser.add_argument("-ngf", "--ngram_file", type = str, default = None, help = "Pre-quantized n-gram table file (from util/convert_ngram.py) to use instead of quantizing the table")
 parser.add_argument("-r", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cd", "--cal_data", type = str, default = None, help = "Calibration data file (safetensors with packed token rows, e.g. from sc_trace.py) used instead of the bundled corpus mix")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 250")
@@ -187,19 +227,24 @@ def prepare(args) -> (dict, dict, bool, str):
             else:
                 raise ValueError(f" ## Missing required argument: {arg}")
         if arg in args and vars(args)[arg] is not None:
-            if arg in in_args and vars(args)[arg] and in_args[arg] != vars(args)[arg]:
+            new = vars(args)[arg]
+            if arg in in_args and in_args[arg] != new:
+                if not new:
+                    # An unset store_true flag (or a zero default) can't be told from "unspecified":
+                    # the resumed job's saved value stands (e.g. --hq stays on when resuming without it)
+                    return
                 if can_override:
                     print(
                         f" !! Warning: Overriding {arg} from existing job, was: {in_args[arg]}, "
-                        f"new value: {vars(args)[arg]}"
+                        f"new value: {new}"
                     )
                 else:
                     raise ValueError(
                         f" ## Error: Resuming job with {arg} = {in_args[arg]}, "
-                        f"cannot override with new value of {vars(args)[arg]}. "
+                        f"cannot override with new value of {new}. "
                         f"Please start a new job to change this value."
                     )
-            in_args[arg] = vars(args)[arg]
+            in_args[arg] = new
 
     for arg_, can_override, default in [
         ("in_dir", True, None),
@@ -211,6 +256,8 @@ def prepare(args) -> (dict, dict, bool, str):
         ("mtp_bits", True, 4),
         ("vision_bits", True, 0),  # 0 = auto: architecture's default_vision_bits cap, or 16
         ("hq", False, False),
+        ("ngram_bits", False, 0),  # 0 = auto: --bits rounded
+        ("ngram_file", False, ""),
         ("cal_data", False, ""),
         ("cal_rows", False, 250),
         ("cal_cols", False, 2048),
@@ -312,7 +359,10 @@ def get_base_model(args):
     else:
         tokenizer = None
     if hasattr(config, "rope_settings"):
-        config.rope_settings.print()
+        if config.rope_settings:
+            config.rope_settings.print()
+        else:
+            print(f" -- No RoPE settings")
     return config, model, mtp_model, vision_model, tokenizer, use_reference_state
 
 
@@ -535,8 +585,18 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
         curr_progress = 0
         max_progress = len(linears)
 
-    # Worker thread
+    # Worker thread. An uncaught exception in a worker must abort the whole job: a thread that
+    # dies mid-module would otherwise leave its linears unquantized while the job carries on,
+    # compiling a broken model at the end with only a warning in the scrollback
+    errors = []
+
     def work_thread(device_idx, dev_groups):
+        try:
+            work_thread_(device_idx, dev_groups)
+        except BaseException as e:
+            errors.append(e)
+
+    def work_thread_(device_idx, dev_groups):
         global curr_progress
 
         with torch.inference_mode():
@@ -593,7 +653,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
 
     try:
         with ProgressBar(" -- Quantizing (parallel)", max_progress, transient = True) as progress:
-            while any(t.is_alive() for t in threads):
+            while any(t.is_alive() for t in threads) and not errors:
                 progress.update(curr_progress)
                 time.sleep(0.1)
     except KeyboardInterrupt as e:
@@ -603,6 +663,12 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
             pthread_kill(t.ident, SIGKILL)
         print("Aborted.")
         sys.exit()
+
+    if errors:
+        # Abort immediately (the other workers' remaining groups are wasted work); the traceback
+        # of the failing worker is what the user needs to see
+        print(f" !! Quantization worker failed, aborting job")
+        raise errors[0]
 
     for t in threads:
         t.join(timeout = 0.1)
@@ -995,6 +1061,12 @@ def main(args, job_state):
     # Get model
     config, model, mtp_model, vision_model, tokenizer, use_reference_state = get_base_model(args)
 
+    # Models with a hashed n-gram embedding table get it quantized (or copied from --ngram_file)
+    # into the output directory up front, so the calibration forward pass runs on the quantized
+    # table; resumable and skipped when already complete
+    from .ngram import prepare_ngram_table_for_conversion
+    prepare_ngram_table_for_conversion(args, config, model)
+
     # Check caps
     can_resume_quant = model.caps.get("can_resume_quant", use_reference_state)
     if not can_resume_quant:
@@ -1061,6 +1133,9 @@ def main(args, job_state):
 
     # Iterate over modules
     for idx, module in enumerate(model.modules):
+
+        get_temp_buffers.cache_clear()
+        free_mem()
 
         start_module_time = time.time()
         if idx == model.first_block_idx:
@@ -1217,7 +1292,7 @@ def main(args, job_state):
             # (single large tensors, e.g. lm_head)
             if (
                 len(linears) >= len(devices) and
-                all(b <= 8 for _, b in strategy.items())
+                all(strategy[l.key] <= 8 for l in linears)
             ):
                 quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), capture_H, state)
             else:
@@ -1357,6 +1432,8 @@ def main(args, job_state):
 
         for idx, module in enumerate(side_model.modules):
             assert module.num_slices <= 1
+            get_temp_buffers.cache_clear()   # see main loop
+            free_mem()
             start_module_time = time.time()
 
             q_tensors = {}
@@ -1390,7 +1467,7 @@ def main(args, job_state):
             # Quantize (same dispatch as the main loop)
             if (
                 len(linears) >= len(devices) and
-                all(b <= 8 for _, b in strategy.items())
+                all(strategy[l.key] <= 8 for l in linears)
             ):
                 quantize_linears_parallel(args, linears, config, strategy, idx, devices, eff_ratios("quant_thread"), None, None)
             else:

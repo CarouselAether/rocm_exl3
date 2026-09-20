@@ -103,6 +103,15 @@ static inline hipError_t exl3_hip_func_set_attribute(FuncT* func, hipFuncAttribu
     return hipFuncSetAttribute(reinterpret_cast<const void*>(func), attr, value);
 }
 #define cudaFuncSetAttribute                exl3_hip_func_set_attribute
+// v1.5.0: quantize.cu reads the compiled kernel's block size back through
+// cudaFuncGetAttributes. hipFuncGetAttributes takes const void*, so the same
+// function-pointer adapter as cudaFuncSetAttribute above.
+template <typename FuncT>
+static inline hipError_t exl3_hip_func_get_attributes(hipFuncAttributes* attr, FuncT* func)
+{
+    return hipFuncGetAttributes(attr, (const void*) func);
+}
+#define cudaFuncGetAttributes               exl3_hip_func_get_attributes
 
 // Cooperative launch. Same const void* issue as above.
 template <typename FuncT>

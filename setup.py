@@ -32,9 +32,8 @@ if precompile and not torch:
     # Detected without torch (which is the thing that is missing): an explicit
     # EXL3_BACKEND, or ROCm being installed on the machine at all.
     #
-    # The usual cause is pip's build isolation: there is no pyproject.toml here,
-    # but modern pip still builds in an isolated env by default, and torch is not
-    # in it. Hence --no-build-isolation, which needs torch already installed in
+    # The usual cause is pip's build isolation: pyproject.toml's build-system
+    # requirements cannot name a ROCm torch, so the isolated build env has none. Hence --no-build-isolation, which needs torch already installed in
     # the target env (true by construction on ROCm -- see requirements_rocm.txt).
     _rocm_intended = (
         os.environ.get("EXL3_BACKEND", "").strip().lower() == "rocm"
@@ -156,6 +155,14 @@ ROCM_EXCLUDE = (
     # sibling runs the BC step eagerly by default; EXL3_ROCM_HIP_GRAPHS=1
     # restores capture for A/B against future ROCm stacks.
     "graph.cu",                  # -> rocm/graph_rdna.hip
+    # v1.5.0: fp16-accumulator tensor-core GEMM (cp.async + mma.sync PTX). The
+    # stub sibling keeps hgemm_recon / hgemm_batched on hipBLAS.
+    "hgemm_f16acc.cu",           # -> rocm/hgemm_f16acc_rdna.hip (disabled stub)
+    # v1.5.0: fused decode-shaped MoE kernel built on exl3_gemv_kernel.cuh (PTX
+    # mma + cp.async). Not ported: the sibling stubs the entry points and
+    # rocm_py routes bsz <= MAX_BSZN MoE decode to the fused exl3_moe kernel
+    # instead. Its comp_units instances are already covered by "quant/comp_units/".
+    "quant/exl3_moe_coop.cu",    # -> rocm/quant/exl3_moe_coop_rdna.hip (disabled stub)
 )
 
 def _collect_sources():
@@ -595,99 +602,16 @@ else:
     }
 
 # ---------------------------------------------------------------------------
-# Dependencies
+# Metadata and dependencies live in pyproject.toml (upstream since v1.5.0),
+# including torch>=2.6.0. On ROCm that requirement is satisfied by the
+# pre-installed ROCm wheel (see requirements_rocm.txt), and a torch-less ROCm
+# build stops above rather than letting pip resolve torch from PyPI (the CUDA
+# build). `exllamav3.rocm_py` is picked up by pyproject's package discovery on
+# both backends; it is pure Python whose first act is `if not is_rocm(): return`.
 # ---------------------------------------------------------------------------
-# On ROCm, "torch" is dropped from install_requires. PyPI's torch is the CUDA
-# build; ROCm torch comes from download.pytorch.org/whl/rocmX.Y and carries the
-# same version string. A plain `pip install .` would therefore see the
-# requirement as satisfiable from PyPI and could pull the CUDA wheel straight
-# over a working ROCm install -- turning a build into a broken environment.
-#
-# Dropping it is safe here in a way it would not be generally: a ROCm build
-# cannot even be configured without torch already importable (setup.py imports
-# it for the include paths and the backend probe), so the dependency is
-# structurally guaranteed rather than merely declared.
-#
-# requirements_rocm.txt carries the real ROCm install line, index URL included.
-def _install_requires(reqs):
-    if not IS_ROCM:
-        return reqs
-    kept = [r for r in reqs if not r.split(">=")[0].split("==")[0].strip() == "torch"]
-    print("exllamav3: ROCm build -- 'torch' omitted from install_requires "
-          "(see requirements_rocm.txt); install ROCm torch first")
-    return kept
 
-
-version_py = {}
-with open("exllamav3/version.py", encoding="utf8") as fp:
-    exec(fp.read(), version_py)
-version = version_py["__version__"]
-print("Version:", version)
 
 setup(
-    name="exllamav3",
-    version=version,
-    packages=[
-        "exllamav3",
-        "exllamav3.generator",
-        "exllamav3.generator.sampler",
-        "exllamav3.generator.filter",
-        "exllamav3.conversion",
-        "exllamav3.conversion.standard_cal_data",
-        "exllamav3.integration",
-        "exllamav3.architecture",
-        "exllamav3.architecture.mm_processing",
-        "exllamav3.model",
-        "exllamav3.modules",
-        "exllamav3.modules.attention_fn",
-        "exllamav3.modules.arch_specific",
-        "exllamav3.modules.gated_delta_net_fn",
-        "exllamav3.modules.quant",
-        "exllamav3.modules.quant.exl3_lib",
-        "exllamav3.tokenizer",
-        "exllamav3.cache",
-        "exllamav3.loader",
-        "exllamav3.util",
-        # Shipped on BOTH backends, deliberately. It is pure Python whose first
-        # act is `if not is_rocm(): return`, so it costs a CUDA install one inert
-        # import and nothing else. Making it ROCm-only would mean the
-        # `from .rocm_py import apply` in exllamav3/__init__.py has to become
-        # conditional -- i.e. a second upstream file carrying a permanent ROCm
-        # edit, to save ~8 KB. The build side is where the backends genuinely
-        # separate: _collect_sources() drops the whole rocm/ tree and every .hip
-        # file on CUDA, and none of the ROCm flags, include paths or the
-        # hip_compat force-include exist outside the HIPBuildExtension branch.
-        "exllamav3.rocm_py",
-    ],
-    url="https://github.com/turboderp-org/exllamav3",
-    license="MIT",
-    author="turboderp",
-    # Declared so an unsupported interpreter fails here, with a message naming
-    # Python, rather than later as "No matching distribution found for torch" --
-    # which is what a user on an interpreter the ROCm wheel index does not yet
-    # publish for actually hits, and which reads like a broken requirements file.
-    # The floor is upstream's; the practical ceiling is whatever
-    # download.pytorch.org/whl/rocmX.Y has a cp3XX wheel for.
-    python_requires=">=3.10",
-    install_requires=_install_requires([
-        "torch>=2.6.0",
-        "tokenizers>=0.21.1",
-        "numpy>=2.1.0",
-        "rich",
-        "typing_extensions",
-        "safetensors>=0.3.2",
-        "ninja",
-        "pillow",
-        "pyyaml",
-        "marisa_trie",
-        "pydantic",
-        "llguidance>=1.7.0",
-        "flash-linear-attention>=0.5.0",
-    ]),
-    include_package_data=True,
-    package_data={
-        "": ["py.typed"],
-    },
     verbose=verbose,
     **setup_kwargs,
 )

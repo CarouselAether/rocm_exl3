@@ -28,6 +28,24 @@ Environment switches (all default to the safe value for this backend):
                            path instead of the fused kernel (NOT advised -- see
                            the note at the patch itself)
 
+  Added at the v1.5.0 sync (2026-09-20). Each keeps a v1.4.4-validated path as
+  the default and makes the new upstream path opt-in until it has been run on
+  RDNA:
+
+  EXL3_ROCM_MOE_BSZN=1     let bsz <= MAX_BSZN MoE decode take upstream's
+                           BC_BlockSparseMLP.run_bszN route. On ROCm that route
+                           is the unported exl3_moe_coop kernel and raises;
+                           default off reroutes to the fused exl3_moe kernel
+  EXL3_ROCM_QKV_SLICE=1    enable the one-launch sliced Q/K/V bundle
+                           (SlicedMultiLinear, exl3_mgemm sliced mode). Ported
+                           into the WMMA kernels, unvalidated on RDNA
+  EXL3_ROCM_BATCH_RECON=1  enable the batched expert-reconstruct prefill tier
+                           (reconstruct_*_batch + hgemm_batched). Ported
+                           mechanically, unvalidated on RDNA
+  EXL3_ROCM_MOE_MTILE=1    let Python split fused-MoE launches into 16/32/64-row
+                           tiers. Pointless on RDNA, which only builds the
+                           16-row instance and runs every tier through it
+
 These are bisect handles, not permanent policy -- turn one on, run a prompt, see
 whether the output degrades. Each one's justification is a measurement recorded
 at the patch, not an inherited assumption; a guard whose reason has gone stale
@@ -363,6 +381,106 @@ def apply() -> list[str]:
             applied.append("fused block-sparse MoE disabled (exl3_moe unvalidated on RDNA)")
         except Exception as e:
             applied.append(f"!! FAILED MoE patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # v1.5.0: MoE decode for bsz <= MAX_BSZN -- keep off the cooperative kernel
+    # ------------------------------------------------------------------
+    # Upstream v1.5.0 replaced BC_BlockSparseMLP.run_bszN's three exl3_mgemm
+    # graph launches with exl3_moe_coop, a fused decode kernel built on
+    # exl3_gemv_kernel.cuh (PTX mma + cp.async). It has no RDNA sibling; the
+    # ROCm build links a stub that raises if reached (rocm/quant/
+    # exl3_moe_coop_rdna.hip). block_sparse_mlp.forward takes that route
+    # whenever `self.bc is not None and bsz <= MAX_BSZN`, and its else-branch
+    # asserts bszn_eligible, so the dispatch has to be steered from outside:
+    #
+    #   - MAX_BSZN is read from the module globals inside forward. It is set to
+    #     0 for the duration of each call (and restored), which makes
+    #     bszn_eligible false without touching the load-time buffer sizing
+    #     that also reads it.
+    #   - f_threshold is set to 1 after load_local, so every batch size takes
+    #     the fused / per-expert branch instead of the bszN else-branch.
+    #
+    # self.bc is kept: the per-expert graph and dequant paths
+    # (run_single_expert, run_single_expert_dq) still use it, unlike the
+    # retired v1.4.4 patch above which set it to None.
+    #
+    # Net effect: bsz 1..8 MoE decode runs the fused exl3_moe kernel, which
+    # matched an fp32 reference on this port after the 2026-08-08 split-K fixes
+    # (RDNA_NOTES.md). Correct, and slower than the v1.4.4 mgemm decode route
+    # that upstream removed; porting exl3_moe_coop is the item that gets it
+    # back. EXL3_ROCM_MOE_BSZN=1 restores upstream dispatch for that day.
+    if not _env_on("EXL3_ROCM_MOE_BSZN", False):
+        try:
+            from ..modules import block_sparse_mlp as _bsn
+            _bsn_cls = _bsn.BlockSparseMLP
+            _orig_bsn_load = _bsn_cls.load_local
+            _orig_bsn_forward = _bsn_cls.forward
+
+            def _load_no_bszn(self, *args, **kwargs):
+                r = _orig_bsn_load(self, *args, **kwargs)
+                self.f_threshold = 1
+                return r
+
+            def _forward_no_bszn(self, *args, **kwargs):
+                saved = _bsn.MAX_BSZN
+                _bsn.MAX_BSZN = 0
+                try:
+                    return _orig_bsn_forward(self, *args, **kwargs)
+                finally:
+                    _bsn.MAX_BSZN = saved
+
+            _bsn_cls.load_local = _load_no_bszn
+            _bsn_cls.forward = _forward_no_bszn
+            applied.append("MoE bsz<=MAX_BSZN decode -> fused exl3_moe (exl3_moe_coop not ported to RDNA)")
+        except Exception as e:
+            applied.append(f"!! FAILED MoE bszN patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # v1.5.0: sliced Q/K/V bundle -- opt-in until validated
+    # ------------------------------------------------------------------
+    # attn.py, sliding_attn.py and gated_delta_net.py bundle every attention
+    # projection into ONE exl3_mgemm launch of equal-width column slices
+    # (SlicedMultiLinear; the C++ BC attention step takes the same tables).
+    # The sliced mode -- per-source input Hadamard, strided B/C rows -- is
+    # ported into exl3_gemm_kernel_rdna.hip.h / exl3_gemm_inner_rdna.hip.h but
+    # has not been run on RDNA. Each module gates it on its own module-level
+    # `_qkv_slice_enable` (upstream env EXL3_QKV_SLICE), read at load time, so
+    # clearing that flag here leaves the v1.4.4 pairwise bundles in charge.
+    # Numerically both routes compute the same projections.
+    if not _env_on("EXL3_ROCM_QKV_SLICE", False):
+        try:
+            from ..modules import attn as _sa, sliding_attn as _ss, gated_delta_net as _sg
+            n = 0
+            for _m in (_sa, _ss, _sg):
+                if hasattr(_m, "_qkv_slice_enable"):
+                    _m._qkv_slice_enable = False
+                    n += 1
+            applied.append(f"sliced Q/K/V bundle (SlicedMultiLinear) off in {n} modules (mgemm sliced mode unvalidated on RDNA)")
+        except Exception as e:
+            applied.append(f"!! FAILED QKV slice patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # v1.5.0: batched expert reconstruct tier and MoE row-tile tiers -- opt-in
+    # ------------------------------------------------------------------
+    # BATCH_RECON (default on upstream) dequantizes heavy experts in batches
+    # through reconstruct_had_batch / hgemm_batched (moe_batch_recon.py). Both
+    # kernels are mechanical batch wrappers of code that runs here, but the
+    # tier is unexercised on RDNA, so the v1.4.4 per-expert loop stays default.
+    #
+    # MTILE makes Python issue up to three fused-MoE launches per layer, one per
+    # 16/32/64-row tier. exl3_moe_rdna.hip runs every tier through the 16-row
+    # instance (the only one built), so the split only adds launches.
+    # Both flags are module globals read at load / call time.
+    try:
+        from ..modules import block_sparse_mlp as _bst2
+        if not _env_on("EXL3_ROCM_BATCH_RECON", False):
+            _bst2.BATCH_RECON = False
+            applied.append("batched expert reconstruct tier off (unvalidated on RDNA; EXL3_ROCM_BATCH_RECON=1)")
+        if not _env_on("EXL3_ROCM_MOE_MTILE", False):
+            _bst2.MTILE = False
+            applied.append("fused-MoE row-tile tiers off (only the 16-row instance exists on RDNA)")
+    except Exception as e:
+        applied.append(f"!! FAILED batch-recon/mtile patch: {type(e).__name__}: {e}")
 
     globals()['_applied_list'] = applied
     return applied

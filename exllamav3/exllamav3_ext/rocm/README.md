@@ -119,6 +119,18 @@ lanes at a shuffle would need the real masked forms.
   kernels. The int8 WMMA wrappers it would need (`mma_sync_i8`) are implemented
   and validated in `rocm/rdna_wmma.hip.h`.
 
+- `hgemm_f16acc.cu` (v1.5.0) — fp16-accumulator tensor-core GEMM, `cp.async` +
+  `mma.sync` PTX. **Not ported.** `rocm/hgemm_f16acc_rdna.hip` stubs the four entry
+  points so `hgemm_recon` / `hgemm_batched` stay on hipBLAS.
+
+- `quant/exl3_moe_coop.cu` (v1.5.0) — the fused decode-shaped MoE kernel that now
+  backs `BC_BlockSparseMLP::run_bszN` upstream. Built on `exl3_gemv_kernel.cuh`
+  (PTX GEMV), so it needs a re-derivation, not an include swap. **Not ported.**
+  `rocm/quant/exl3_moe_coop_rdna.hip` stubs the entry points; `rocm_py` keeps
+  `block_sparse_mlp.forward` off that route (`EXL3_ROCM_MOE_BSZN`), so bsz ≤ 8 MoE
+  decode runs the fused `exl3_moe` kernel. This is the largest open item of the
+  v1.5.0 sync: upstream removed the mgemm decode route this port used at v1.4.4.
+
 ## LDS budget on non-Strix RDNA parts
 
 Strix Halo (gfx1151) has **64 KB** of LDS per workgroup, measured. Other RDNA
@@ -156,6 +168,14 @@ shapes, never a failed launch. Verified with
 - [x] `ROCM_EXCLUDE` covers every replaced source (verified: setup.py keeps 102
       sources, the probe compiles 102, no upstream twins remain)
 - [ ] int8 GEMV — currently a disabled stub
+- [ ] **v1.5.0 sync (source-level, not yet compiled or run on RDNA):** sliced
+      mgemm (`had_src_list` / `n_stride_list`) ported into the WMMA inner and the
+      mgemm kernel, default-off in Python; MoE `count_lo`/`count_hi` tiers and the
+      deterministic `output_scratch` path plus `exl3_moe_gather`; batched
+      `reconstruct[_had]_batch`; quantize tile length 160 and the
+      `quantize_tiles_scratch` query. Re-run `rocm_tools/hipcc_probe.sh --all` and
+      the smoke checks before trusting any of it.
+- [ ] `exl3_moe_coop` (fused bsz ≤ 8 MoE decode) — stub; see above
 - [ ] End-to-end validation (perplexity, TabbyAPI)
 
 `ROCM_EXCLUDE` and `rocm_tools/hipcc_probe.sh`'s exclusion regex are the same

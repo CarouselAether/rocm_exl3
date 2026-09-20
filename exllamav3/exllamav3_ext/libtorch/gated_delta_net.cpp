@@ -104,6 +104,23 @@ void BC_GatedDeltaNetSplit::configure_slot
     s.o_xh            = std::move(o_xh);
     s.z_flat = s.z.view({bsz, seqlen, -1});
 
+    // Sliced qkv+z bundle: output pointers into this slot's statics, one per slice
+    if (qkvz_ptrs_trellis)
+    {
+        int R = bsz * seqlen;
+        const at::Tensor& meta = qkvz_meta.value();
+        int slices = (int) meta.size(1);
+        auto t = meta.accessor<int, 2>();
+        std::vector<int64_t> ptrs(slices);
+        for (int j = 0; j < slices; ++j)
+        {
+            float* base = (float*) (t[0][j] == 0 ? s.qkv.data_ptr() : s.z_flat.data_ptr());
+            ptrs[j] = (int64_t) (base + t[1][j]);
+        }
+        s.qkvz_c_ptrs = at::tensor(ptrs, at::TensorOptions().dtype(at::kLong)).to(s.qkv.device());
+        s.qkvz_xh = at::empty({2, R, s.qkv_xh.size(-1)}, s.qkv_xh.options());
+    }
+
     TORCH_CHECK(s.qkv.is_contiguous() && s.z.is_contiguous() && s.ba.is_contiguous() &&
                 s.beta.is_contiguous() && s.g.is_contiguous() && s.mixed_qkv.is_contiguous() &&
                 s.conv_out.is_contiguous() && s.core_attn_out.is_contiguous() &&
@@ -112,6 +129,88 @@ void BC_GatedDeltaNetSplit::configure_slot
 
     s.graph = std::make_unique<Graph>();
     s.configured = true;
+}
+
+void BC_GatedDeltaNetSplit::configure_slot_kda
+(
+    int bsz,
+    int seqlen,
+    bool history,
+    at::Tensor qkv,
+    at::Tensor z,
+    at::Tensor b_out,
+    at::Tensor fa_out,
+    at::Tensor fb_out,
+    at::Tensor ga_out,
+    at::Tensor beta,
+    at::Tensor g,
+    at::Tensor mixed_qkv,
+    at::Tensor conv_out,
+    at::Tensor core_attn_out,
+    at::Tensor core_attn_out_f,
+    at::Tensor qkv_xh,
+    at::Tensor o_xh
+)
+{
+    Slot& s = slot(bsz, seqlen, history);
+
+    s.qkv             = std::move(qkv);
+    s.z               = std::move(z);
+    s.b_out           = std::move(b_out);
+    s.fa_out          = std::move(fa_out);
+    s.fb_out          = std::move(fb_out);
+    s.ga_out          = std::move(ga_out);
+    s.beta            = std::move(beta);
+    s.g               = std::move(g);
+    s.mixed_qkv       = std::move(mixed_qkv);
+    s.conv_out        = std::move(conv_out);
+    s.core_attn_out   = std::move(core_attn_out);
+    s.core_attn_out_f = std::move(core_attn_out_f);
+    s.qkv_xh          = std::move(qkv_xh);
+    s.o_xh            = std::move(o_xh);
+    s.z_flat = s.z.view({bsz, seqlen, -1});
+
+    TORCH_CHECK(s.qkv.is_contiguous() && s.z.is_contiguous() && s.b_out.is_contiguous() &&
+                s.fa_out.is_contiguous() && s.fb_out.is_contiguous() && s.ga_out.is_contiguous() &&
+                s.beta.is_contiguous() && s.g.is_contiguous() && s.mixed_qkv.is_contiguous() &&
+                s.conv_out.is_contiguous() && s.core_attn_out.is_contiguous() &&
+                s.core_attn_out_f.is_contiguous(),
+                "BC_GatedDeltaNetSplit (KDA): statics must be contiguous");
+
+    s.graph = std::make_unique<Graph>();
+    s.configured = true;
+}
+
+void BC_GatedDeltaNetSplit::set_qkvz_bundle
+(
+    at::Tensor ptrs_trellis,
+    at::Tensor ptrs_suh,
+    at::Tensor ptrs_svh,
+    at::Tensor meta,
+    int K,
+    bool mcg,
+    bool mul1
+)
+{
+    TORCH_CHECK(!kda, "BC_GatedDeltaNetSplit: qkvz bundle is for the split (non-KDA) projections");
+    TORCH_CHECK(meta.device().is_cpu() && meta.dtype() == at::kInt && meta.dim() == 2 && meta.size(0) == 5,
+                "BC_GatedDeltaNetSplit: qkvz_meta must be a CPU int32 (5, slices) tensor");
+    int slices = (int) meta.size(1);
+    TORCH_CHECK(ptrs_trellis.size(0) == slices && ptrs_svh.size(0) == slices && ptrs_suh.size(0) == 2,
+                "BC_GatedDeltaNetSplit: qkvz pointer tables must cover every slice / both sources");
+    auto dev = ptrs_trellis.device();
+    qkvz_size_n = meta.select(0, 2).contiguous().to(dev);
+    qkvz_n_stride = meta.select(0, 3).contiguous().to(dev);
+    qkvz_had_src = meta.select(0, 4).contiguous().to(dev);
+    int width = meta[2][0].item<int>();
+    qkvz_carrier = at::empty({slices, MAX_BSZ * MAX_QLEN, width}, at::TensorOptions().dtype(at::kFloat).device(dev));
+    qkvz_ptrs_trellis = std::move(ptrs_trellis);
+    qkvz_ptrs_suh = std::move(ptrs_suh);
+    qkvz_ptrs_svh = std::move(ptrs_svh);
+    qkvz_meta = std::move(meta);
+    qkvz_K = K;
+    qkvz_mcg = mcg;
+    qkvz_mul1 = mul1;
 }
 
 void BC_GatedDeltaNetSplit::run_bszN_gr
@@ -126,26 +225,67 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     Graph* graph
 )
 {
+    int R = (int) (x.size(0) * x.size(1));
+    bool use_qkvz = qkvz_ptrs_trellis.has_value() && !kda && R <= 32;
+
     // qkv/z projections: bypass BC_LinearEXL3::run_gr, which hard-refuses graph capture above 1
     // row -- call exl3_gemm_gr directly with this slot's own xh scratch instead, exactly like
     // BC_GatedMLP::run_bszN_gr does for shared-expert projections
-    exl3_gemm_gr(x, qkv_proj->trellis, s.qkv, qkv_proj->suh, s.qkv_xh, qkv_proj->svh, -1, qkv_proj->mcg, qkv_proj->mul1, 0, graph);
-    if (qkv_proj->bias)
-        add_gr(s.qkv, qkv_proj->bias.value(), s.qkv, graph);
-    exl3_gemm_gr(x, z_proj->trellis, s.z_flat, z_proj->suh, s.z_xh, z_proj->svh, -1, z_proj->mcg, z_proj->mul1, 0, graph);
-    if (z_proj->bias)
-        add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
+    if (use_qkvz)
+    {
+        // Both projections as one sliced mgemm into the qkv / z statics (no biases by construction)
+        TORCH_CHECK(x.is_contiguous(), "BC_GatedDeltaNetSplit: input must be contiguous");
+        at::Tensor x3 = x.view({1, R, x.size(2)});
+        at::Tensor carrier = qkvz_carrier.narrow(1, 0, R);
+        exl3_mgemm_gr(x3, qkvz_ptrs_trellis.value(), carrier, qkvz_ptrs_suh.value(), s.qkvz_xh, qkvz_ptrs_svh.value(),
+                      c10::nullopt, c10::nullopt, qkvz_K, -1, qkvz_mcg, qkvz_mul1, -1, -1, 0, graph,
+                      1, qkvz_size_n, s.qkvz_c_ptrs, qkvz_n_stride, qkvz_had_src, 2);
+    }
+    else
+    {
+        exl3_gemm_gr(x, qkv_proj->trellis, s.qkv, qkv_proj->suh, s.qkv_xh, qkv_proj->svh, -1, qkv_proj->mcg, qkv_proj->mul1, 0, graph);
+        if (qkv_proj->bias)
+            add_gr(s.qkv, qkv_proj->bias.value(), s.qkv, graph);
+    }
 
-    gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+    if (kda)
+    {
+        // KDA: three fp16 GEMVs off x (patched inputs), low-rank second stages and the gate op
+        // run entirely on graph statics. z (the sigmoid norm gate) is the g_b output
+        gdn_ba_gemv_gr(x, b_weight_t, {}, s.b_out, graph);
+        gdn_ba_gemv_gr(x, f_a_weight_t, {}, s.fa_out, graph);
+        gdn_ba_gemv_gr(x, g_a_weight_t, {}, s.ga_out, graph);
+        gdn_lowrank_gemv_f_gr(s.fa_out, f_b_weight_t, s.fb_out, graph);
+        gdn_lowrank_gemv_f_gr(s.ga_out, g_b_weight_t, s.z_flat, graph);
+        kda_gate_op_gr
+        (
+            s.qkv, s.b_out, s.fb_out,
+            dt_bias, a_log,
+            s.mixed_qkv, s.beta, s.g,
+            lower_bound, beta_scale,
+            graph
+        );
+    }
+    else
+    {
+        if (!use_qkvz)
+        {
+            exl3_gemm_gr(x, z_proj->trellis, s.z_flat, z_proj->suh, s.z_xh, z_proj->svh, -1, z_proj->mcg, z_proj->mul1, 0, graph);
+            if (z_proj->bias)
+                add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
+        }
 
-    gated_delta_net_fused_op_3_gr
-    (
-        s.qkv, s.ba,
-        dt_bias, a_log,
-        s.mixed_qkv, s.beta, s.g,
-        beta_scale,
-        graph
-    );
+        gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+
+        gated_delta_net_fused_op_3_gr
+        (
+            s.qkv, s.ba,
+            dt_bias, a_log,
+            s.mixed_qkv, s.beta, s.g,
+            beta_scale,
+            graph
+        );
+    }
 
     cuda_causal_conv1d_update_gr
     (
@@ -208,15 +348,16 @@ void BC_GatedDeltaNetSplit::run_bszN
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         s.graph->ready_to_record = true;
-        graph_state_size = (int) conv_state.size(2);
-        graph_hist_stride = (int) recurrent_state.size(1);
+        s.graph_state_size = (int) conv_state.size(2);
+        s.graph_hist_stride = (int) recurrent_state.size(1);
         return;
     }
 
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions falls back to the eager path
-    if ((int) conv_state.size(2) != graph_state_size ||
-        (int) recurrent_state.size(1) != graph_hist_stride)
+    // so a cache with different dimensions falls back to the eager path. The snapshot is per slot:
+    // another slot's eager run against a second cache must not re-arm this slot's replay
+    if ((int) conv_state.size(2) != s.graph_state_size ||
+        (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         return;
@@ -229,17 +370,43 @@ void BC_GatedDeltaNetSplit::run_bszN
         s.graph->capture_end();
     }
 
-    auto args = std::vector<PPTR>
-    {
-        PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
-        PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // z_proj input
-        PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
-        PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
-        PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
-        PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-        PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
-        PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
-    };
+    std::vector<PPTR> args;
+    if (kda)
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // b_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // f_a input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // g_a input
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
+    else if (qkvz_ptrs_trellis.has_value() && (int) (x.size(0) * x.size(1)) <= 32)
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_mgemm_A,        (void*) x.data_ptr()),          // sliced qkv+z bundle input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
+    else
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // z_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
     s.graph->launch(args, stream);
 }
 
@@ -410,15 +577,16 @@ void BC_Mamba2::run_bszN
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         s.graph->ready_to_record = true;
-        graph_state_size = (int) conv_state.size(2);
-        graph_hist_stride = (int) recurrent_state.size(1);
+        s.graph_state_size = (int) conv_state.size(2);
+        s.graph_hist_stride = (int) recurrent_state.size(1);
         return;
     }
 
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions falls back to the eager path
-    if ((int) conv_state.size(2) != graph_state_size ||
-        (int) recurrent_state.size(1) != graph_hist_stride)
+    // so a cache with different dimensions falls back to the eager path. The snapshot is per slot:
+    // another slot's eager run against a second cache must not re-arm this slot's replay
+    if ((int) conv_state.size(2) != s.graph_state_size ||
+        (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         return;

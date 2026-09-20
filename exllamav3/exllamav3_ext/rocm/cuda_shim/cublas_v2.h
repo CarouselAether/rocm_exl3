@@ -17,6 +17,7 @@ using cublasComputeType_t = hipblasComputeType_t;
 #define cublasSetPointerMode  hipblasSetPointerMode
 #define cublasSetWorkspace    hipblasSetWorkspace
 #define cublasGemmEx          hipblasGemmEx
+#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx   // v1.5.0: hgemm_batched
 #define cublasCreate          hipblasCreate
 #define cublasDestroy         hipblasDestroy
 

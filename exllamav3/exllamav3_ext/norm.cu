@@ -130,6 +130,11 @@ __device__ __forceinline__ float _silu(float x)
     return x * recip;
 }
 
+__device__ __forceinline__ float _sigmoid_f(float x)
+{
+    return __fdividef(1.0f, 1.0f + __expf(-x));
+}
+
 
 // Block-size-agnostic reduction (any multiple of 32 threads)
 __device__ inline float reduce_dyn(float sum, int warp_id, int lane_id)
@@ -164,7 +169,8 @@ void rms_norm_kernel
     const int rows,
     const int dim,
     const float constant_bias,
-    const float constant_scale
+    const float constant_scale,
+    const int w_groups          // weight spans w_groups rows, cycled by row index (grouped norm)
 )
 {
     constexpr bool input_fp32 = std::is_same_v<input_t, float>;
@@ -180,6 +186,10 @@ void rms_norm_kernel
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int row = blockIdx.x;
+    const size_t row_off = (size_t) row * dim;   // 64-bit: rows * dim can exceed 2^31 elements
+
+    if (w && w_groups > 1)
+        w += (size_t) (row % w_groups) * dim;
 
     int columns = dim / 4;
     bool single = columns <= blockDim.x;
@@ -194,8 +204,8 @@ void rms_norm_kernel
     {
         // r += x, rounded to the residual dtype so the result matches an unfused add
         float4 r4;
-        if constexpr (residual_fp16) read_half4<false>(r4, ((const half4*) (r + row * dim)) + column);
-        else                         read_float4(r4, ((const float4*) (r + row * dim)) + column);
+        if constexpr (residual_fp16) read_half4<false>(r4, ((const half4*) (r + row_off)) + column);
+        else                         read_float4(r4, ((const float4*) (r + row_off)) + column);
         x4.x += r4.x;
         x4.y += r4.y;
         x4.z += r4.z;
@@ -207,14 +217,14 @@ void rms_norm_kernel
                 __halves2half2(__float2half_rn(x4.x), __float2half_rn(x4.y)),
                 __halves2half2(__float2half_rn(x4.z), __float2half_rn(x4.w))
             );
-            WRITE64(((half4*) (r + row * dim)) + column, h4);
+            WRITE64(((half4*) (r + row_off)) + column, h4);
             x4.x = LOW_TO_FLOAT(h4.x);
             x4.y = HIGH_TO_FLOAT(h4.x);
             x4.z = LOW_TO_FLOAT(h4.y);
             x4.w = HIGH_TO_FLOAT(h4.y);
         }
         else
-            write_float4(x4, ((float4*) (r + row * dim)) + column);
+            write_float4(x4, ((float4*) (r + row_off)) + column);
     };
 
     auto apply_out = [&] (float4& x4, int column, float rmf)
@@ -241,16 +251,16 @@ void rms_norm_kernel
         if constexpr (res_mode == RES_POST)
         {
             float4 r4;
-            if constexpr (output_fp16) read_half4<false>(r4, ((half4*) (y + row * dim)) + column);
-            if constexpr (output_fp32) read_float4(r4, ((float4*) (y + row * dim)) + column);
+            if constexpr (output_fp16) read_half4<false>(r4, ((half4*) (y + row_off)) + column);
+            if constexpr (output_fp32) read_float4(r4, ((float4*) (y + row_off)) + column);
             x4.x += r4.x;
             x4.y += r4.y;
             x4.z += r4.z;
             x4.w += r4.w;
         }
 
-        if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
-        if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
+        if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row_off)) + column);
+        if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row_off)) + column);
     };
 
     if (single)
@@ -260,7 +270,7 @@ void rms_norm_kernel
         float sum = 0.0f;
         if (t < columns)
         {
-            read_in(x4, x + row * dim + 4 * t);
+            read_in(x4, x + row_off + 4 * t);
             if constexpr (res_mode == RES_IN) add_resid_in(x4, t);
             sum = sum_sq4(sum, x4);
         }
@@ -275,7 +285,7 @@ void rms_norm_kernel
         for (int column = t; column < columns; column += blockDim.x)
         {
             float4 x4;
-            read_in(x4, x + row * dim + 4 * column);
+            read_in(x4, x + row_off + 4 * column);
             if constexpr (res_mode == RES_IN) add_resid_in(x4, column);
             sum = sum_sq4(sum, x4);
         }
@@ -288,11 +298,11 @@ void rms_norm_kernel
             // For RES_IN the summed values were written back to r in the first pass
             if constexpr (res_mode == RES_IN)
             {
-                if constexpr (residual_fp16) read_half4<false>(x4, ((const half4*) (r + row * dim)) + column);
-                else                         read_float4(x4, ((const float4*) (r + row * dim)) + column);
+                if constexpr (residual_fp16) read_half4<false>(x4, ((const half4*) (r + row_off)) + column);
+                else                         read_float4(x4, ((const float4*) (r + row_off)) + column);
             }
             else
-                read_in(x4, x + row * dim + 4 * column);
+                read_in(x4, x + row_off + 4 * column);
             apply_out(x4, column, rmf);
         }
     }
@@ -316,7 +326,8 @@ void rms_norm_impl
     float constant_scale,
     bool span_heads,
     int res_mode,
-    Graph* graph = nullptr
+    Graph* graph = nullptr,
+    int w_groups = 1
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -330,6 +341,7 @@ void rms_norm_impl
 
     TORCH_CHECK_DIV(x, -1, 4);
     TORCH_CHECK_SHAPES_FULL(x, y);
+    TORCH_CHECK(w_groups == 1 || !span_heads, "rms_norm: w_groups and span_heads are exclusive");
 
     auto tx = x.scalar_type();
     auto tw = at::kHalf;  // intentional, type is irrelevant if w is None
@@ -338,7 +350,15 @@ void rms_norm_impl
     const half* w_ptr = (const half*) OPTPTR(w);
     if (w_ptr)
     {
-        TORCH_CHECK_SHAPES(x, -1, w.value(), 0, 1);
+        if (w_groups == 1)
+        {
+            TORCH_CHECK_SHAPES(x, -1, w.value(), 0, 1);
+        }
+        else
+        {
+            TORCH_CHECK(w.value().numel() == (int64_t) w_groups * x.size(-1),
+                        "rms_norm: w must have w_groups * dim elements");
+        }
         tw = w.value().scalar_type();
     }
 
@@ -374,7 +394,8 @@ void rms_norm_impl
             rows,                                                                   \
             dim,                                                                    \
             constant_bias,                                                          \
-            constant_scale                                                          \
+            constant_scale,                                                         \
+            w_groups                                                                \
         );
 
     //      x_type________ w_type_____________  y_type_______        mode      r_type
@@ -435,11 +456,12 @@ void rms_norm
     float constant_bias,
     float constant_scale,
     bool span_heads,
-    bool add_residual
+    bool add_residual,
+    int w_groups
 )
 {
     rms_norm_impl(x, w, y, {}, epsilon, constant_bias, constant_scale, span_heads,
-                  add_residual ? RES_POST : RES_NONE);
+                  add_residual ? RES_POST : RES_NONE, nullptr, w_groups);
 }
 
 // Graphable variant: launches on the capture stream, records nothing (BC callers norm between
@@ -487,9 +509,11 @@ void gated_rms_norm_kernel
     const int dim,
     float constant_bias,
     const int w_groups,         // weight spans w_groups rows, cycled by row index (Mamba2 group norm)
-    const bool gate_first       // apply silu(g) before the norm instead of after (Mamba2 style)
+    const bool gate_first,      // apply silu(g) before the norm instead of after (Mamba2 style)
+    const int gate_act          // 0 = silu (GDN/Mamba2), 1 = sigmoid (KDA)
 )
 {
+    #define _gate_fn(v) (gate_act == 1 ? _sigmoid_f(v) : _silu(v))
     constexpr bool output_fp32 = std::is_same_v<output_t, float>;
     constexpr bool output_fp16 = std::is_same_v<output_t, half>;
     constexpr bool weight_bf16 = std::is_same_v<weight_t, bfloat16>;
@@ -499,6 +523,7 @@ void gated_rms_norm_kernel
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     int row = blockIdx.x;
+    const size_t row_off = (size_t) row * dim;   // 64-bit: rows * dim can exceed 2^31 elements
 
     int columns = dim / 4;
     const weight_t* w_row = w + (size_t) (row % w_groups) * dim;
@@ -508,16 +533,16 @@ void gated_rms_norm_kernel
     for (int column = t; column < columns; column += num_threads)
     {
         float4 x4;
-        read_bfloat164(x4, ((const bfloat164*) (x + row * dim)) + column);
+        read_bfloat164(x4, ((const bfloat164*) (x + row_off)) + column);
         if (gate_first)
         {
             float4 g4;
-            if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
-            else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
-            x4.x *= _silu(g4.x);
-            x4.y *= _silu(g4.y);
-            x4.z *= _silu(g4.z);
-            x4.w *= _silu(g4.w);
+            if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row_off)) + column);
+            else                       read_bfloat164(g4, ((const bfloat164*) (g + row_off)) + column);
+            x4.x *= _gate_fn(g4.x);
+            x4.y *= _gate_fn(g4.y);
+            x4.z *= _gate_fn(g4.z);
+            x4.w *= _gate_fn(g4.w);
         }
         sum = sum_sq4(sum, x4);
     }
@@ -533,11 +558,11 @@ void gated_rms_norm_kernel
         float4 w4;
         float4 g4;
 
-        read_bfloat164(x4, ((const bfloat164*) (x + row * dim)) + column);
+        read_bfloat164(x4, ((const bfloat164*) (x + row_off)) + column);
         if constexpr (weight_bf16) read_bfloat164(w4, ((const bfloat164*) w_row) + column);
         else                       read_float4   (w4, ((const float4*)    w_row) + column);
-        if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row * dim)) + column);
-        else                       read_bfloat164(g4, ((const bfloat164*) (g + row * dim)) + column);
+        if constexpr (gate_fp32)   read_float4   (g4, ((const float4*)    (g + row_off)) + column);
+        else                       read_bfloat164(g4, ((const bfloat164*) (g + row_off)) + column);
 
         if (constant_bias != 0.0f)
         {
@@ -549,10 +574,10 @@ void gated_rms_norm_kernel
 
         if (gate_first)
         {
-            x4.x *= _silu(g4.x);
-            x4.y *= _silu(g4.y);
-            x4.z *= _silu(g4.z);
-            x4.w *= _silu(g4.w);
+            x4.x *= _gate_fn(g4.x);
+            x4.y *= _gate_fn(g4.y);
+            x4.z *= _gate_fn(g4.z);
+            x4.w *= _gate_fn(g4.w);
 
             apply4(x4, w4, rmf);
         }
@@ -560,20 +585,21 @@ void gated_rms_norm_kernel
         {
             apply4(x4, w4, rmf);
 
-            x4.x *= _silu(g4.x);
-            x4.y *= _silu(g4.y);
-            x4.z *= _silu(g4.z);
-            x4.w *= _silu(g4.w);
+            x4.x *= _gate_fn(g4.x);
+            x4.y *= _gate_fn(g4.y);
+            x4.z *= _gate_fn(g4.z);
+            x4.w *= _gate_fn(g4.w);
         }
 
-        if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row * dim)) + column);
-        if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row * dim)) + column);
+        if constexpr (output_fp16) write_half4(x4, ((half4*) (y + row_off)) + column);
+        if constexpr (output_fp32) write_float4(x4, ((float4*) (y + row_off)) + column);
     }
+    #undef _gate_fn
 }
 
 
 /*
-Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon) * silu(g)
+Compute RMSNorm: y = x * w / sqrt(row_mean(x * x) + epsilon) * act(g), act = silu or sigmoid
 - bfloat16 input only, half/float output
 - w_groups > 1: w holds w_groups weight rows of size dim, selected by (row % w_groups). Used for
   Mamba2 group norm where the norm spans dim channels but the weight covers the full inner dim
@@ -589,7 +615,8 @@ void gated_rms_norm_gr
     float constant_bias,
     Graph* graph,
     int w_groups,
-    bool gate_first
+    bool gate_first,
+    int gate_act
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -635,7 +662,8 @@ void gated_rms_norm_gr
             dim,                                                                                \
             constant_bias,                                                                      \
             w_groups,                                                                           \
-            gate_first                                                                          \
+            gate_first,                                                                         \
+            gate_act                                                                            \
         );
 
     //      x_type_____________  w_type_____________  y_type_______  g_type_____________  small  num_threads
@@ -671,8 +699,9 @@ void gated_rms_norm
     float epsilon,
     float constant_bias,
     int w_groups,
-    bool gate_first
+    bool gate_first,
+    int gate_act
 )
 {
-    gated_rms_norm_gr(x, w, y, g, epsilon, constant_bias, nullptr, w_groups, gate_first);
+    gated_rms_norm_gr(x, w, y, g, epsilon, constant_bias, nullptr, w_groups, gate_first, gate_act);
 }

@@ -112,8 +112,15 @@ class Tokenizer:
         self.missing_special_delimiters = None
 
         # Get control token IDs
-        ut = self.tokenizer.model.unk_token
-        self.unk_token_id = None if ut is None else self.tokenizer.token_to_id(ut)
+        if isinstance(m, models.Unigram):
+            # Unigram stores the unknown token as an ID in tokenizer.json
+            model_config = maybe_read_json(self.path_tokenizer_json).get("model", {})
+            unk_id = model_config.get("unk_id")
+            ut = None if unk_id is None else self.tokenizer.id_to_token(unk_id)
+        else:
+            ut = m.unk_token
+            unk_id = None if ut is None else self.tokenizer.token_to_id(ut)
+        self.unk_token_id = unk_id
         self.eos_token_id = self.config.eos_token_id
         self.bos_token_id = self.config.bos_token_id
         self.pad_token_id = self.config.pad_token_id
@@ -140,8 +147,9 @@ class Tokenizer:
         self.bos_token_id = get_default_token_id("bos_token", self.bos_token_id, 1)
         self.eos_token_id = get_default_token_id("eos_token", self.eos_token_id, 2)
 
-        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json
-        e = get_default_token_id("eos_token", None, 2)
+        # Update EOS token ID in config if tokenizer_config.json disagrees with config.json (no eos_token there:
+        # leave config.json alone rather than forcing the id-2 fallback onto it)
+        e = get_default_token_id("eos_token", None, None)
         if e:
             if config.eos_token_id != e:
                 config.eos_token_id = e
@@ -158,7 +166,7 @@ class Tokenizer:
                     config.eos_token_id_list.append(e)
 
         # Get control token strings
-        self.unk_token = self.tokenizer.model.unk_token
+        self.unk_token = ut
         self.bos_token = None if self.bos_token_id is None else \
             (self.extended_id_to_piece.get(self.bos_token_id) or self.tokenizer.id_to_token(self.bos_token_id))
         self.eos_token = None if self.eos_token_id is None else \
@@ -167,7 +175,7 @@ class Tokenizer:
         # Use "<pad>" or BOS token as fallback for padding token
         if self.pad_token_id is None:
             pad_test = self.tokenizer.token_to_id("<pad>")
-            if pad_test:
+            if pad_test is not None:   # id 0 is a valid <pad>
                 self.pad_token_id = pad_test
             elif self.eos_token_id != self.bos_token_id:
                 self.pad_token_id = self.eos_token_id
@@ -304,8 +312,11 @@ class Tokenizer:
         self,
         text: str,
         special: bool,
-        embeddings: list[MMEmbedding]
+        embeddings: list[MMEmbedding],
+        position_offset: int = 0,
     ):
+        """position_offset: prompt position of the first id produced here (1 when a BOS token
+        will be prepended), so position-aligned embeddings land on the right phase."""
         out_parts = []
 
         if embeddings:
@@ -318,7 +329,7 @@ class Tokenizer:
 
         for text in in_parts:
             if text in aliases:
-                out_parts += aliases[text].token_list
+                out_parts += aliases[text].token_list_at(position_offset + len(out_parts))
             else:
                 out_parts += self.encode_part(text, special)
 
@@ -369,7 +380,8 @@ class Tokenizer:
 
             # text is a list of strings
 
-            list_ids = [self.encode_special_or_unspecial(t, encode_special_tokens, embeddings) for t in text]
+            pos0 = 1 if add_bos and self.bos_token_id is not None else 0
+            list_ids = [self.encode_special_or_unspecial(t, encode_special_tokens, embeddings, pos0) for t in text]
 
             if add_bos and self.bos_token_id is not None:
                 for ids in list_ids: ids.insert(0, self.bos_token_id)
@@ -398,7 +410,8 @@ class Tokenizer:
             # text is a single string
 
             # ids = self.encode_special(text) if encode_special_tokens else self.encode_unspecial(text)
-            ids = self.encode_special_or_unspecial(text, encode_special_tokens, embeddings)
+            pos0 = 1 if add_bos and self.bos_token_id is not None else 0
+            ids = self.encode_special_or_unspecial(text, encode_special_tokens, embeddings, pos0)
             if add_bos and self.bos_token_id is not None:
                 ids.insert(0, self.bos_token_id)
             if add_eos and self.eos_token_id is not None:
@@ -451,7 +464,7 @@ class Tokenizer:
             end = 0
             while end < len(seq):
                 if seq[end] in self.extended_id_to_piece:
-                    if end > start: text += self.tokenizer.decode(seq[start: end], decode_special_tokens)
+                    if end > start: text += self.tokenizer.decode(seq[start: end], skip_special_tokens = not decode_special_tokens)
                     text += self.extended_id_to_piece[seq[end]]
                     end += 1
                     start = end

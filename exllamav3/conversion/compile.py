@@ -98,7 +98,7 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
     for key, data in extra_tensors.items():
         size = data["n_bytes"]
         if size > max_shard_bytes:
-            print(f" !! Warning, unable to fit module {module.key} in single shard of {args['shard_size']} MB")
+            print(f" !! Warning, unable to fit tensor {key} in single shard of {args['shard_size']} MB")
         if current_shard_size + size > max_shard_bytes and current_shard_size > 0:
             current_shard_size = 0
             out_map.append([])
@@ -130,6 +130,20 @@ def compile_model(args, model, config, tokenizer, mtp_model = None, vision_model
         save_file(file_dict, os.path.join(out_dir, filename))
         del file_dict
         free_mem()
+
+    # Every tensor the quantizer produced must have reached the shards: a module whose compile
+    # collection misses its own outputs (e.g. a submodule-owned tensor outside the parent's key
+    # prefix) would otherwise ship a silently incomplete model
+    if not args.get("model_stc"):
+        dropped = sorted(k for k in qtensors_stc.tensor_file_map
+                         if k != "__metadata__" and k not in map_dict)
+        if dropped:
+            print(f" !! {len(dropped)} quantized tensor(s) were not collected by any module:")
+            for k in dropped[:10]:
+                print(f"     - {k}")
+            if len(dropped) > 10:
+                print(f"     - (+ {len(dropped) - 10} more)")
+            raise RuntimeError("Compile dropped quantized tensors, output model is incomplete (see above)")
 
     # Copy non-tensor files
     print(f" -- Copying non-tensor files from {in_dir}")

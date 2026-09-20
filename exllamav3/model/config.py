@@ -53,6 +53,10 @@ class InferParams:
         # pinned host memory instead of VRAM, computing straight from a zero-copy device alias.
         # Set before loading the vision component
         self.vision_pinned = os.environ.get("EXL3_VISION_PINNED", "0") != "0"
+        # Stream an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) from disk with
+        # per-forward row gathers instead of loading the whole table into system RAM (tens of
+        # GB). Set before loading the model
+        self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
@@ -150,7 +154,14 @@ class Config(ABC):
         self.num_q_heads = -1
         self.num_kv_heads = -1
         self.pos_encoding_mode = "NONE"
-        self.max_position_embeddings = self.read_cfg(int, "max_position_embeddings", self.default_max_position_embeddings())
+        # Multimodal configs keep the text model's limit under text_config (Qwen3.5/3.8, Gemma4,
+        # Mistral3, GLM-4v/5, Muse, Step3.7 ...); the RoPE settings already read the nested dict,
+        # this keeps the public value in step with them
+        self.max_position_embeddings = self.read_cfg(
+            int,
+            ["max_position_embeddings", "text_config->max_position_embeddings"],
+            self.default_max_position_embeddings()
+        )
 
         # Main RoPE module (for MRoPE, individual attn layers have their own modules)
         self.g_rope = None

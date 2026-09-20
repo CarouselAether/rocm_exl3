@@ -330,7 +330,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K, false, 1, 1) : force_shape_idx;
 
-    TORCH_CHECK(shape_idx > 0, "exl3_gemm: no compatible kernel");
+    TORCH_CHECK(shape_idx > 0 && shape_idx <= EXL3_GEMM_NUM_SHAPES, "exl3_gemm: no compatible kernel (or invalid forced shape index)");
     // The inner kernel floors size_n / TILESIZE_N with no remainder pass, so a
     // shape whose tile does not divide the problem silently skips the tail
     // columns. The selector never picks such a shape; a forced one must fail

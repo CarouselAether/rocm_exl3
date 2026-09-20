@@ -1,5 +1,9 @@
 // =============================================================================
 // exl3_gemm_inner for RDNA 3.5 -- re-derived against upstream v1.3.0
+//
+// v1.5.0 sync: size_n_stride / blocks_n_full for sliced mgemm, mirrored from
+// upstream. The 32 / 64-row MoE tiles (TILEBLOCKS_M > 1) are NOT ported; the
+// static_assert(TILESIZE_M == 16) below is the guard.
 // =============================================================================
 //
 // This is NOT a port of upstream quant/exl3_gemm_inner.cuh. It keeps upstream's
@@ -84,9 +88,14 @@ void exl3_gemm_kernel_inner
     const int size_k,
     const int size_n,
     int* __restrict__ locks,
-    const half* post_scale
+    const half* post_scale,
+    int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
 )
 {
+    // Sliced mode (v1.5.0 exl3_mgemm): B and C rows are size_n_stride wide while this call
+    // covers only size_n columns of them. Mirrors upstream exl3_gemm_inner.cuh.
+    if (size_n_stride == 0) size_n_stride = size_n;
+
     constexpr int TILEBLOCKS_M = TILESIZE_M / 16;
     constexpr int TILEBLOCKS_K = TILESIZE_K / 16;
     constexpr int TILEBLOCKS_N = TILESIZE_N / 16;
@@ -172,6 +181,9 @@ void exl3_gemm_kernel_inner
     const int tiles_k  = size_k / TILESIZE_K;
     const int tiles_n  = size_n / TILESIZE_N;
     const int blocks_n = tiles_n * TILEBLOCKS_N;
+    // Column blocks of the full-width B row: slices index B relative to their own column
+    // offset, but a k-tile row still spans the whole matrix (blocks_n keeps the lock index)
+    const int blocks_n_full = size_n_stride / 16;
 
     const int num_slices = gridDim.x;
     const int slice_beg  = tiles_k * tiles_n * blockIdx.x / num_slices;
@@ -213,7 +225,7 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = (idx < TILESIZE_M * A_VEC_PER_ROW) && (m < size_m);
     }
 
-    const int gl_b_stride_k = blocks_n * TILEBLOCKS_K * 256 / 16 * bits;
+    const int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * 256 / 16 * bits;
     const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
     uint16_t* sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
@@ -227,7 +239,7 @@ void exl3_gemm_kernel_inner
         int idx = i * EXL3_GEMM_BASE_THREADS + t;
         int n = idx % (gl_b_stride_n / 8);
         int k = idx / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n_full * 256 / 16 * bits / 8) + n;
         pred_b_gl[i] = idx < sh_b_stage_size / 8;
     }
 
@@ -281,7 +293,7 @@ void exl3_gemm_kernel_inner
     int slice2_iters = slice0_iters;
 
     const int gl_c_stride_n = TILESIZE_N;
-    const int gl_c_stride_m = TILESIZE_M * size_n;
+    const int gl_c_stride_m = TILESIZE_M * size_n_stride;
 
     half*  gl_c_ptr_16 = ((half*)  C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
     float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
@@ -504,9 +516,9 @@ void exl3_gemm_kernel_inner
                 {
                     int col = out_col(n, j);
                     if constexpr (c_fp32)
-                        frag_c[m][n][j] += gl_c_ptr_32[row * size_n + col];
+                        frag_c[m][n][j] += gl_c_ptr_32[row * size_n_stride + col];
                     else
-                        frag_c[m][n][j] += __half2float(gl_c_ptr_16[row * size_n + col]);
+                        frag_c[m][n][j] += __half2float(gl_c_ptr_16[row * size_n_stride + col]);
                 }
         }
     };
@@ -525,9 +537,9 @@ void exl3_gemm_kernel_inner
                 {
                     int col = out_col(n, j);
                     if constexpr (c_fp32)
-                        gl_c_ptr_32[row * size_n + col] = frag_c[m][n][j];
+                        gl_c_ptr_32[row * size_n_stride + col] = frag_c[m][n][j];
                     else
-                        gl_c_ptr_16[row * size_n + col] = __float2half(frag_c[m][n][j]);
+                        gl_c_ptr_16[row * size_n_stride + col] = __float2half(frag_c[m][n][j]);
                 }
         }
     };
@@ -563,12 +575,12 @@ void exl3_gemm_kernel_inner
 
             if constexpr (c_fp32)
             {
-                float* had_out = gl_c_ptr_32 + row * size_n + col * 128;
+                float* had_out = gl_c_ptr_32 + row * size_n_stride + col * 128;
                 had_ff_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
             }
             else
             {
-                half* had_out = gl_c_ptr_16 + row * size_n + col * 128;
+                half* had_out = gl_c_ptr_16 + row * size_n_stride + col * 128;
                 had_fh_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
             }
         }

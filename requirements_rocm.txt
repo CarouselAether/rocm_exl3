@@ -4,9 +4,10 @@
 #   pip install .
 #
 # Do NOT use requirements.txt on ROCm: it resolves torch from PyPI, and PyPI's
-# torch is the CUDA build. setup.py drops `torch` from install_requires on ROCm
-# for the same reason, so `pip install .` will not pull it either -- this file is
-# where the real torch dependency lives.
+# torch is the CUDA build. pyproject.toml declares torch>=2.6.0 (upstream, since
+# v1.5.0); the ROCm wheel installed from here satisfies it, so `pip install
+# --no-build-isolation .` leaves it alone. Without a torch installed, the ROCm
+# setup.py refuses to configure rather than let pip fetch the CUDA build.
 #
 # Why --extra-index-url is enough (verified, not assumed): pip merges candidates
 # from every index and picks the highest version, and the ROCm wheel carries a
@@ -57,4 +58,5 @@ pyyaml
 marisa_trie
 pydantic
 llguidance>=1.7.0
-flash-linear-attention>=0.5.0
+# flash-linear-attention is no longer needed: upstream v1.5.0 vendors the FLA
+# chunk kernels it uses (exllamav3/vendor/fla), with its own AMD/HIP detection.

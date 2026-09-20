@@ -1,54 +1,21 @@
-// RDNA/ROCm port of rope.cu.
+// =============================================================================
+// rope.cu for RDNA -- one line differs
+// =============================================================================
 //
-// EXL3_RDNA_NORM_LANE0 -- fused RMS norm: guard the sums[] write to lane 0
-// ------------------------------------------------------------------------
-// apply_norm() does:
+// Generated from upstream v1.5.0 rope.cu. The single change is marked RDNA
+// below: `((half2*) p)[t] = {}` does not compile under hipcc (ambiguous
+// __half2 assignment), so the zero is spelled out. Same exported symbols, same
+// behaviour.
 //
-//     sums[warps * t_head + warp_id] = warp_reduce_sum_f(sum);
+// History: through v1.4.4 this sibling also guarded the fused RMS-norm's
+// warp-sum store to lane 0 (EXL3_RDNA_NORM_LANE0: warp_reduce_sum_f is a
+// __shfl_down reduction, so only lane 0 holds the total, and on RDNA lane 31
+// won the unguarded race and corrupted q/k norm). Upstream v1.5.0 carries that
+// guard itself, so the sibling is back to a one-line delta. The measurement is
+// kept in RDNA_NOTES.md.
 //
-// warp_reduce_sum_f is a __shfl_down reduction, so only lane 0 holds the warp
-// total -- yet all 32 lanes execute that store to the same address. The value
-// that survives is whichever lane wins the race, and that differs by vendor.
-// Measured on gfx1151 with lane values 0..31 (true sum 496):
-//
-//     __shfl_down : lane0=496  lane1=512  lane16=752  lane31=992
-//     __shfl_xor  : every lane 496
-//     unguarded store lands 992   <- lane 31 wins on RDNA
-//
-// On NVIDIA lane 0 wins, so upstream is correct there by accident. Here the
-// slot got a partial sum, making the RMS scale wrong by a constant factor per
-// head -- q/k norm silently corrupted, attention garbage, and a model that
-// loads and generates a single repeated token. pytest tests/test_rope.py showed
-// 56 of 58 use_norm=True cases failing while every use_norm=False case passed.
-//
-// The fix matches what norm.cu already does for the same reduction
-// (`if (lane_id == 0) sums[warp_id] = sum;`), and rope.cu even has the
-// `int lane_id` line present but commented out. Guarding the store is the
-// minimal change; switching warp_reduce_sum_f to __shfl_xor would also work and
-// would fix every other caller, but that is a shared header and out of scope
-// for a sibling.
-//
-// This is an upstream latent bug, not a porting artifact -- worth reporting.
-//
-// half2 zero-init in load_head()
-// ------------------------------------------------------------------------
-// `((half2*)p)[t] = {}` compiles on CUDA but is ambiguous against HIP's __half2
-// assignment overloads, and no amount of shimming reaches it -- it is a
-// language-level overload-resolution difference, not a missing symbol.
-//
-// Kept as a sibling rather than patching upstream so rope.cu stays byte-identical
-// to the CUDA branch and future rebases remain fast-forwards. setup.py excludes
-// rope.cu from the ROCm build (ROCM_EXCLUDE) and compiles this instead; the
-// exported symbols (rope, rope_gr) are unchanged, so bindings.cpp is unaffected.
-//
-// When syncing a new upstream release: re-copy rope.cu over this file and
-// re-apply the two edits above -- the half2 zero-init, and the `int lane_id`
-// declaration plus guarded store in apply_norm. `diff` against upstream should
-// show exactly this header block and those two sites, nothing else. Regenerated
-// for v1.4.4, which removed post_rope_norm/apply_norm_uw and the Nanochat rope
-// mode (that deletion took the bug's second call site with it); apply_norm and
-// all the anchor lines remain intact -- including the commented-out
-// `int lane_id`, so the bug is still live upstream at the surviving site.
+// Regenerate with: apply the `= {}` substitution to upstream rope.cu.
+// =============================================================================
 
 #include <cuda_fp16.h>
 #include "rope.cuh"
@@ -190,9 +157,8 @@ void rope_kernel
             if (t < head_dim / 2)
                 ((half2*) sh_head)[t] = ((half2*)g_head_in_ptr)[t];
             else
-                // RDNA: `= {}` is ambiguous against HIP's __half2 assignment
-                // overloads (with or without __HIP_NO_HALF_OPERATORS__). Explicit
-                // zero-init instead -- bit-identical, no behaviour change.
+                // RDNA: `= {}` is ambiguous against HIP's __half2 assignment overloads (with or
+                // without __HIP_NO_HALF_OPERATORS__). Explicit zero-init instead; bit-identical.
                 ((half2*) sh_head)[t] = __floats2half2_rn(0.0f, 0.0f);
             __syncthreads();
         };
@@ -243,8 +209,6 @@ void rope_kernel
         auto apply_norm = [&] ()
         {
             half2 *tptr = (half2*)(sh_head + t * 2);
-            // EXL3_RDNA_NORM_LANE0: see the header block. warp_reduce_sum_f is a
-            // __shfl_down reduction, so ONLY lane 0 ends up with the warp total.
             int lane_id = threadIdx.x % 32;
             int warp_id = threadIdx.x / 32;
             int warps = blockDim.x / 32;
@@ -254,8 +218,8 @@ void rope_kernel
             float v1 = __low2float(v);
             float v2 = __high2float(v);
             float sum = v1 * v1 + v2 * v2;
-            float warp_sum = warp_reduce_sum_f(sum);
-            if (lane_id == 0) sums[warps * t_head + warp_id] = warp_sum;
+            sum = warp_reduce_sum_f(sum);
+            if (lane_id == 0) sums[warps * t_head + warp_id] = sum;
             __syncthreads();
 
             sum = sums[warps * t_head];
@@ -266,27 +230,31 @@ void rope_kernel
             v1 *= rmf;
             v2 *= rmf;
 
-            // Downcast, apply weight and store
-            if constexpr (norm_bf16)
+            // Downcast, apply weight and store. Lanes past head_dim / 2 (block rounded up to whole warps)
+            // hold padding and must not read the weight
+            if (t * 2 < head_dim)
             {
-                bfloat162 *wptr = (bfloat162*)(((bfloat16*)norm_weight) + t * 2);
-                float2 w = __bfloat1622float2(*wptr);
-                w.x += norm_constant_bias;
-                w.y += norm_constant_bias;
-                v1 *= w.x;
-                v2 *= w.y;
-                v = __floats2half2_rn(v1, v2);
-            }
-            else
-            {
-                half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
-                half2 *wptr = (half2*)(((half*)norm_weight) + t * 2);
-                half2 w = __hadd2(*wptr, norm_constant_bias_h2);
-                v = __floats2half2_rn(v1, v2);
-                v = __hmul2(w, v);
-            }
+                if constexpr (norm_bf16)
+                {
+                    bfloat162 *wptr = (bfloat162*)(((bfloat16*)norm_weight) + t * 2);
+                    float2 w = __bfloat1622float2(*wptr);
+                    w.x += norm_constant_bias;
+                    w.y += norm_constant_bias;
+                    v1 *= w.x;
+                    v2 *= w.y;
+                    v = __floats2half2_rn(v1, v2);
+                }
+                else
+                {
+                    half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
+                    half2 *wptr = (half2*)(((half*)norm_weight) + t * 2);
+                    half2 w = __hadd2(*wptr, norm_constant_bias_h2);
+                    v = __floats2half2_rn(v1, v2);
+                    v = __hmul2(w, v);
+                }
 
-            *tptr = v;
+                *tptr = v;
+            }
             __syncthreads();
         };
 
@@ -398,7 +366,7 @@ void rope_gr
     bool inv_freq_table = false;
     if (inv_freq.dim() > 1)
     {
-        TORCH_CHECK(inv_freq.dim() >= 2 || inv_freq.dim() <= 3);
+        TORCH_CHECK(inv_freq.dim() >= 2 && inv_freq.dim() <= 3, "inv_freq table must be 2-D or 3-D");
         // TORCH_CHECK_SHAPES(q, 3, inv_freq, -1, 2);
         inv_freq_table = true;
         inv_freq_stride = inv_freq.size(-1) * inv_freq.size(-2);
@@ -487,7 +455,7 @@ void rope_gr
         graph->record_param(kernel_ptr, GP_rope_position, 13, 4);
         graph->record_param(kernel_ptr, GP_rope_positions, 14);
         graph->record_param(kernel_ptr, GP_rope_position_ids, 15);
-        graph->record_param(kernel_ptr, GP_rope_pid_stride, 26, 4);
+        graph->record_param(kernel_ptr, GP_rope_pid_stride, 25, 4);   // ARGPTRS index of position_ids_stride
         graph->record_param(kernel_ptr, GP_end, 0);
     }
 

@@ -2,45 +2,8 @@ import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
 
-try:
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-except ModuleNotFoundError:
-    chunk_gated_delta_rule = None
-
-# """
-# fla wrapper, reduce overhead by bypassing input_guard and torch custom ops stuff
-# """
-#
-# def fused_recurrent_gated_delta_rule(
-#     q: torch.Tensor,
-#     k: torch.Tensor,
-#     v: torch.Tensor,
-#     g: torch.Tensor,
-#     beta: torch.Tensor,
-#     initial_state: torch.Tensor = None,
-#     output_final_state: bool = False,
-#     use_qk_l2norm_in_kernel: bool = False,
-# ):
-#     from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_fwd
-#
-#     scale = k.shape[-1] ** -0.5
-#     with torch.cuda.device(q.device.index):
-#         o, final_state = fused_recurrent_gated_delta_rule_fwd(
-#             q,
-#             k,
-#             v.contiguous(),
-#             g,
-#             None,
-#             None,
-#             beta,
-#             scale,
-#             initial_state.contiguous() if initial_state is not None else None,
-#             output_final_state,
-#             use_qk_l2norm_in_kernel,
-#             None,
-#         )
-#     return o, final_state
-
+# The vendored fla chunk kernels (exllamav3.vendor.fla) query the devices and Triton at import, so
+# they are imported on first use rather than with the library
 
 def torch_recurrent_gated_delta_rule(
     query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
@@ -98,6 +61,30 @@ def torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+def torch_recurrent_kda(q, k, v, g, beta, state):
+    """Sequential per-channel-decay (KDA) delta rule, fp32, mirroring the GLM5.3/Kimi
+    reference. q/k/v: (b, s, h, d); g: (b, s, h, d) log-decay per k-channel; beta: (b, s, h);
+    state: (b, h, dk, dv), updated in place. Returns (b, s, h, dv) bf16."""
+    b, s, h, dk = k.shape
+    dv = v.shape[-1]
+    q, k, v, g, beta = [t.float() for t in (q, k, v, g, beta)]
+
+    def l2norm(x):
+        return x * torch.rsqrt((x * x).sum(dim = -1, keepdim = True) + 1e-6)
+    q = l2norm(q) * (dk ** -0.5)
+    k = l2norm(k)
+
+    out = torch.empty((b, s, h, dv), dtype = torch.float, device = v.device)
+    for i in range(s):
+        g_i = g[:, i].exp().unsqueeze(-1)                       # (b, h, dk, 1)
+        state *= g_i
+        kv_mem = (state * k[:, i].unsqueeze(-1)).sum(dim = -2)  # (b, h, dv)
+        delta = (v[:, i] - kv_mem) * beta[:, i].unsqueeze(-1)
+        state += k[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
+        out[:, i] = (state * q[:, i].unsqueeze(-1)).sum(dim = -2)
+    return out.to(torch.bfloat16)
+
+
 def gated_delta_rule_fn(
     mixed_qkv: torch.Tensor,
     beta: torch.Tensor,
@@ -113,14 +100,71 @@ def gated_delta_rule_fn(
     k_head_dim: int,
     v_head_dim: int,
     params: dict = None,
+    channelwise_g: bool = False,
 ):
     if params is None:
         params = {}
 
     bsz, seqlen, _ = mixed_qkv.shape
 
+    # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
+    # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
+    if channelwise_g:
+        if seqlen >= num_v_heads and not history:
+            from ...vendor.fla import chunk_kda
+            q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+            q = q.view(bsz, seqlen, -1, k_head_dim)
+            k = k.view(bsz, seqlen, -1, k_head_dim)
+            v = v.view(bsz, seqlen, -1, v_head_dim)
+
+            recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
+            if recurrent_slots_cpu is None:
+                recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
+            core_attn_out = []
+            for i, s in enumerate(recurrent_slots_cpu.tolist()):
+                state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+                core_attn, new_state = chunk_kda(
+                    q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                    g = g[i:i + 1],
+                    beta = beta[i:i + 1],
+                    initial_state = state,
+                    output_final_state = save_state,
+                    use_qk_l2norm_in_kernel = True,
+                )
+                if save_state and state is not None:
+                    state.copy_(new_state)
+                core_attn_out.append(core_attn)
+            return torch.cat(core_attn_out, dim = 0).to(torch.bfloat16)
+
+        core_attn_out = torch.empty(
+            (bsz, seqlen, num_v_heads, v_head_dim),
+            dtype = torch.bfloat16,
+            device = mixed_qkv.device,
+        )
+        if recurrent_state is None:
+            recurrent_state = torch.zeros(
+                (bsz, 1, num_v_heads, k_head_dim, v_head_dim),
+                dtype = torch.float,
+                device = mixed_qkv.device
+            )
+        ext.cuda_recurrent_gated_delta_rule(
+            mixed_qkv.contiguous(),
+            g.contiguous(),
+            beta.contiguous(),
+            recurrent_state,
+            core_attn_out,
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            recurrent_slots,
+            history,
+        )
+        return core_attn_out
+
     # Chunked rule
-    if seqlen >= num_v_heads and chunk_gated_delta_rule is not None and not history:
+    if seqlen >= num_v_heads and not history:
+        from ...vendor.fla import chunk_gated_delta_rule
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
         q = q.view(bsz, seqlen, -1, k_head_dim)

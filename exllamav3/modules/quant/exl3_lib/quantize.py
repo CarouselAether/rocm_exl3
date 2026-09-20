@@ -50,16 +50,31 @@ def tensor_core_perm_i(device):
 
 
 @lru_cache
-def get_temp_buffers(device, K: int):
+def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
+    index = torch.device(device).index if not isinstance(device, int) else device
+    if index is None:
+        index = torch.cuda.current_device()
+    # The extension picks the kernel per architecture / K / codebook and reports the wave it can
+    # keep resident (blocks per SM x SMs); the dense specializations keep costs in shared memory
+    # and store one branch bit (K = 1) or byte (K >= 2) per state
+    optimized, wave = ext.quantize_tiles_scratch(index, K, cb == 1, cb == 2, tile_len)
+    if optimized:
+        history_cols = (65536 >> K) // (8 if K == 1 else 1)
+        temp_costs = torch.empty((1,), dtype = torch.half, device = device)
+        temp_edges = torch.empty((wave, tile_len, history_cols), dtype = torch.uint8, device = device)
+        return temp_costs, temp_edges
+
     # The kernel runs one block per tile and caps each wave at min(temp_costs.size(0), 2 * SMs). At K >= 4 the
     # temp buffers are cheap enough to size for full occupancy on large GPUs (+17% throughput on GB202 at big
     # batches); at lower K, temp_edges is multiple GB already and 256 stays the cap
     max_batch_size = 256
     if K >= 4:
         mp_count = torch.cuda.get_device_properties(device).multi_processor_count
-        max_batch_size = max(256, 2 * mp_count)
+        # The kernel may run up to 1024 / threads blocks per SM (see quantize_tiles_kernel.cuh)
+        blocks_per_sm = {7: 4, 8: 8}.get(K, 2)
+        max_batch_size = max(256, blocks_per_sm * mp_count)
     temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.half, device = device)
-    temp_edges = torch.zeros((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = device)
+    temp_edges = torch.zeros((max_batch_size, tile_len, 65536 >> K), dtype = torch.short, device = device)
     return temp_costs, temp_edges
 
 
@@ -68,18 +83,20 @@ def quantize_tiles(tiles, quant_args: dict):
     Quantize a batch of 16x16 tiles on the current device.
 
     tiles is shaped (num_tiles, 256) in the kernel's expected element order. The CUDA extension returns both the
-    reconstructed float tile values and the short encoded indices used later for packing.
+    reconstructed float tile values and the short encoded indices used later for packing. Length-160 rows
+    (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting rings.
     """
     tiles = tiles.contiguous()
-    assert tiles.shape[1] == 256
+    assert tiles.shape[1] in (256, 160)
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
     mcg = "mcg" in quant_args
     mul1 = "mul1" in quant_args
+    cb = 2 if mul1 else 1 if mcg else 0
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
-    temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
+    temp_costs, temp_edges = get_temp_buffers(tiles.device, K, tiles.shape[1], cb)
     ext.quantize_tiles(
         tiles,
         quantized_tiles,
@@ -263,7 +280,7 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                 K = quant_args["K"]
                 mcg = "mcg" in quant_args
                 mul1 = "mul1" in quant_args
-                temp_costs, temp_edges = get_temp_buffers(device, K)
+                temp_costs, temp_edges = get_temp_buffers(device, K, 256, 2 if mul1 else 1 if mcg else 0)
 
                 ext.quantize_tiles(
                     dev_tiles,
@@ -1216,6 +1233,7 @@ def regularize(
         g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
     else:
         g_scale = 1.0
+        mse_scale = None
     weight *= g_scale
     su /= g_scale
 
@@ -1225,7 +1243,7 @@ def regularize(
     if verbose:
         print(f"     - su/sv std: {su.std().item():.6f}   {sv.std().item():.6f}")
         print(f"     - global scale: {g_scale:.6f}")
-        print(f"     - sample mse: {mse_scale.item():.6f}")
+        if mse_scale is not None: print(f"     - sample mse: {mse_scale.item():.6f}")
         print(f"     - apply_out_scales: {str(apply_out_scales)}")
 
     return apply_out_scales, weight, g_scale, su, sv
@@ -1265,7 +1283,8 @@ def quantize_exl3(
         Dump extra stats
 
     :param swap_to_device:
-        If input tensor is on CPU, move to this device before quantization
+        Device a CPU-swapped weight came from. Accepted for API compatibility; the work always
+        happens on quant_args["devices"][0] and the weight is moved there
 
     :param save_reg:
         Save regularized tensor as image to the provided path
@@ -1287,10 +1306,9 @@ def quantize_exl3(
             torch.manual_seed(quant_args["seed"])
 
         devices = quant_args["devices"]
-        if weight.device != torch.device(devices[0]):
-            weight = weight.to(devices[0])
-
-        device = weight.device if swap_to_device is None else swap_to_device
+        device = torch.device(devices[0])
+        if weight.device != device:
+            weight = weight.to(device)
         k, n = weight.shape
 
         # Get H, LDL decomp. and input/output sign flips
@@ -1311,8 +1329,6 @@ def quantize_exl3(
         if L is not None:
             L = L.to(device)
 
-        if swap_to_device is not None:
-            weight = weight.to(swap_to_device)
         if verbose:
             weight_copy = weight.cpu()
         weight_r = weight

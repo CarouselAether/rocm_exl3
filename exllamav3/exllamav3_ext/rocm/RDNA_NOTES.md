@@ -898,3 +898,33 @@ What is PROVEN vs SUSPECTED, so nobody re-litigates the wrong part:
   driver stack segfaults in rocr GpuAgent::InitDma at hsa_init. When a Linux
   7.14 pairing ships: run stream_wedge_check + the graph checks first, then
   A/B EXL3_ROCM_HIP_GRAPHS=1 on real multi-turn chat.
+
+## v1.5.0 sync (2026-09-20) -- what changed under the siblings, and what is unverified
+
+Brought forward by `git merge v1.5.0` plus, for each sibling whose upstream twin
+changed, applying upstream's own v1.4.4 -> v1.5.0 diff to the sibling (it applied
+cleanly to nine of ten; `quantize_rdna.hip` and `rope_rdna.hip` were regenerated
+from the v1.5.0 twins instead). **None of this has been compiled or executed on
+RDNA yet** -- the machine that did the sync has no ROCm toolchain. Treat every
+item below as a build candidate.
+
+| Area | What upstream did | What the RDNA layer does now |
+|---|---|---|
+| `exl3_mgemm` sliced mode | New `n_stride_list` / `had_src_list` / `num_had_src` args; per-source input Hadamard, strided B/C rows (`SlicedMultiLinear`, used for one-launch Q/K/V decode) | Mirrored into `exl3_gemm_kernel_rdna.hip.h` and `exl3_gemm_inner_rdna.hip.h` (`size_n_stride`, `blocks_n_full`). The m == 1 mgemv shortcut is bypassed in sliced mode. **Python keeps it off** (`EXL3_ROCM_QKV_SLICE=1` to test): the v1.4.4 pairwise bundles are the validated path. |
+| Fused MoE (`exl3_moe`) | `count_lo`/`count_hi` expert tiers, `output_scratch`/`fused_base` deterministic slots + `exl3_moe_gather` (on by default: `EXL3_MOE_FUSED_DET`), 32/64-row tile instances (mul1) | Tiers and scratch path applied verbatim (they are addressing, not tensor-core work). 32/64-row tiles **fall back to the 16-row instance** over the same expert range -- identical numerics. `rocm_py` sets `MTILE=False` so Python issues one launch, not three. |
+| MoE decode (bsz <= 8) | `BC_BlockSparseMLP::run_bszN` now calls `exl3_moe_coop` (PTX GEMV based); the three-mgemm graph route is gone | Stub + `rocm_py` reroute to the fused `exl3_moe` kernel (`EXL3_ROCM_MOE_BSZN`). Correct per the 2026-08-08 fp32 comparison, slower than the removed mgemm route. **Porting `exl3_moe_coop` is the decode-throughput item.** |
+| Batched expert reconstruct | `reconstruct_had_batch` / `reconstruct_batch` (blockIdx.z over a pointer table), `hgemm_batched` (`cublasGemmStridedBatchedEx`), `had_r_128_batch` | Batch kernels applied to `reconstruct_rdna.hip` (same tile body); shim maps the strided-batched hipBLAS call. **Python keeps the tier off** (`EXL3_ROCM_BATCH_RECON=1` to test). |
+| `hgemm_f16acc` | fp16-accumulate MMA GEMM for GeForce | Stub; `hgemm_recon` = `hgemm`. RDNA has no fp32-accumulate rate penalty, so nothing is lost. |
+| Quantizer | Tile length 160 (n-gram rows), block geometry per K, `quantize_tiles_scratch`, sm_120 "optimized" specialisations with a codebook LUT | `quantize_tiles_kernel_rdna.hip.h` regenerated (include swap only); instance files gain the `bool optimized` parameter and `_l160` getters; `quantize_tiles_use_optimized()` is hard `false` and the LUT code is dropped. Note `__CUDA_ARCH__` is 1 under the shim, so `qt_num_threads` takes the `arch < 1000` branch in both passes. |
+| `rope.cu` | Adopted the lane-0 guard on the norm warp-sum store, padding guard, `record_param` index 26 -> 25 | Sibling regenerated; back to the single `= {}` line. |
+| `graph.cu` | Error checks on node update / launch | Applied; only reachable with `EXL3_ROCM_HIP_GRAPHS=1`. |
+| Shim | new `cublasGemmStridedBatchedEx`, `cudaFuncGetAttributes`, `__threadfence` (native) | Added the first two to `cuda_shim/cublas_v2.h` and `hip_compat.hip.h`. |
+
+Files whose twins did not change: `exl3_gemv_rdna.hip`, `exl3_gemv_kernel_rdna.hip.h`,
+`exl3_gemv_int8_rdna.hip`, `exl3_mgemv_rdna.hip`, `exl3_dq_rdna.hip.h`,
+`codebook_rdna.hip.h`, `rdna_wmma.hip.h`, `cuda_drv_rdna.cpp`, `cpu/moe_handoff_rdna.hip`.
+
+First things to run on hardware, in order: `rocm_tools/hipcc_probe.sh --all`; a
+dense model (Gemma-4) for the sliced-free attention path; an MoE model (GLM-4.6V)
+at bsz 1 to exercise the rerouted decode and the deterministic gather; then flip
+`EXL3_ROCM_QKV_SLICE=1` and `EXL3_ROCM_BATCH_RECON=1` one at a time and compare.

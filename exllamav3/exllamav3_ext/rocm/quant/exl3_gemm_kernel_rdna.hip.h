@@ -1,7 +1,9 @@
 // =============================================================================
 // exl3_gemm_kernel / exl3_mgemm_kernel for RDNA -- generated from upstream
-// v1.4.1 quant/exl3_gemm_kernel.cuh with the changes listed below and nothing
-// else. Keeping it mechanical keeps the diff auditable across rebases.
+// v1.4.1 quant/exl3_gemm_kernel.cuh, then brought to v1.5.0 by applying upstream's
+// own v1.4.4 -> v1.5.0 diff (sliced mode: had_src_list / n_stride_list /
+// num_had_src) plus one bounds guard marked RDNA below. Otherwise the changes
+// listed here and nothing else. Keeping it mechanical keeps the diff auditable across rebases.
 //
 //  1. Includes point at the RDNA kernel map and GEMM inner.
 //
@@ -182,6 +184,29 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         bszm = bszm_sync;
     }
 
+    // Sliced mode: the entries are equal-width column slices of fewer source matrices, so the
+    // input transform runs once per source (suh_list is per source, A_had holds one slab per
+    // source) with every block cooperating, and each slice then reads its source's slab
+    if (had_src_list)
+    {
+        int total_warps = size_m * size_k / 128;
+        int warps_grid = gridDim.x * gridDim.z * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * (blockIdx.x + gridDim.x * blockIdx.z);
+        for (; this_warp < num_had_src * total_warps; this_warp += warps_grid)
+        {
+            int src = this_warp / total_warps;
+            int w = this_warp - src * total_warps;
+            had_hf_r_128_inner<true, false>
+            (
+                A + w * 128,
+                A_had + src * size_m * size_k + w * 128,
+                suh_list[src] + (w * 128) % size_k,
+                0.088388347648f  // 1/sqrt(128)
+            );
+        }
+        grid.sync();
+    }
+
     for (int i = 0; i < bszm; i += gridDim.z)
     {
         int j = i + blockIdx.z;
@@ -197,9 +222,9 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             }
         }
 
-        // Had and input scales
+        // Had and input scales (sliced mode: done once per source above)
 
-        if (B)
+        if (B && !had_src_list)
         {
             int total_warps = size_m * size_k / 128;
             int warps_grid = gridDim.x * blockDim.x / 32;
@@ -230,8 +255,12 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         // resolved once per matrix, outside all inner loops
 
         int n_j = (size_n_list && mat_index >= 0) ? size_n_list[mat_index] : size_n;
+        // Column slices write into a wider row (their source matrix's full width)
+        int n_stride_j = (n_stride_list && mat_index >= 0) ? n_stride_list[mat_index] : n_j;
         int size_m_ = size_m;
-        half* A_ = A_had + j * size_m * size_k;
+        // RDNA: guarded on mat_index >= 0 (upstream indexes had_src_list[-1] for the idle
+        // z-slots past bszm; A_ is unused there, but the read is out of bounds)
+        half* A_ = A_had + ((had_src_list && mat_index >= 0) ? had_src_list[mat_index] : j) * size_m * size_k;
         void* C_;
         if (C_list && mat_index >= 0) C_ = C_list[mat_index];
         else if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);
@@ -246,12 +275,12 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
                 exl3_gemm_kernel_inner
                 <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr);
+                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
             }
 
             A_ += 16 * size_k;
-            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * n_j);
-            else                  C_ = (void*) (((half*) C_) + 16 * n_j);
+            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * n_stride_j);
+            else                  C_ = (void*) (((half*) C_) + 16 * n_stride_j);
             size_m_ -= 16;
 
             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
@@ -275,22 +304,26 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
             C_ = C_base;
 
+            int cols = n_j / 128;
             for(; this_warp < total_warps; this_warp += warps_grid)
             {
+                int row = this_warp / cols;
+                int col = this_warp - row * cols;
+                int offs = row * n_stride_j + col * 128;
                 if constexpr (c_fp32)
                     had_ff_r_128_inner<false, true>
                     (
-                        ((const float*) C_) + this_warp * 128,
-                        ((float*) C_) + this_warp * 128,
-                        svh + (this_warp * 128) % n_j,
+                        ((const float*) C_) + offs,
+                        ((float*) C_) + offs,
+                        svh + col * 128,
                         scale
                     );
                 else
                     had_hf_r_128_inner<false, true>
                     (
-                        ((const half*) C_) + this_warp * 128,
-                        ((half*) C_) + this_warp * 128,
-                        svh + (this_warp * 128) % n_j,
+                        ((const half*) C_) + offs,
+                        ((half*) C_) + offs,
+                        svh + col * 128,
                         scale
                     );
             }
