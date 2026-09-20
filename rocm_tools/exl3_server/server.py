@@ -527,7 +527,7 @@ async def lifespan(app: FastAPI):
         num_draft_tokens = a.num_draft_tokens,
         ngram_match_min = a.ngram_match_min,
         dynamic_draft_tokens = a.dynamic_draft,
-        dynamic_draft_skip_ema = a.draft_skip_ema,
+        draft_confidence = a.draft_confidence,
         cpu_cache_size = int(a.cpu_cache_size * 1024 ** 3),
         recurrent_cache_size = int(a.recurrent_cache_size * 1024 ** 3),
     )
