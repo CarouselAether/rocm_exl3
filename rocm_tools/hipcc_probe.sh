@@ -121,17 +121,32 @@ if [[ "${1:-}" == "--all" ]]; then
   mapfile -t SRCS < <( { find "$E" -name '*.cu' -o -name '*.cpp' \
         | grep -vE "/(parallel|comp_units)/|/rocm/|/rope\.cu$|/reconstruct\.cu$|/moe_handoff\.cu$|/exl3_gemm\.cu$|/exl3_gemv\.cu$|/exl3_gemv_int8\.cu$|/exl3_kernel_map\.cu$|/quantize\.cu$|/cuda_drv\.cpp$|/exl3_moe\.cu$|/hgemm_f16acc\.cu$|/exl3_moe_coop\.cu$"
       find "$E/rocm" -name '*.hip' 2>/dev/null; } | sort)
-  pass=0; fail=0; declare -a FAILED=()
+  # PROBE_JOBS parallel compiles (default 4). Each job is a subshell: it
+  # prints its own ok/FAIL line as it finishes (interleaved, therefore
+  # unordered) and drops "rc|src|log" into a temp file for the ordered tally
+  # below -- compile_one's status-code channel does not survive
+  # backgrounding, so the file is the only reliable way back.
+  jobs_max=${PROBE_JOBS:-4}
+  resd=$(mktemp -d); running=0; idx=0
   for s in "${SRCS[@]}"; do
-    log=$(compile_one "$s"); rc=$?
-    if (( rc == 0 || rc == 2 )); then
-      pass=$((pass+1))
-      if (( rc == 2 )); then printf "  ok*   %s   (needs -fgpu-rdc)\n" "${s#$E/}"
-      else printf "  ok    %s\n" "${s#$E/}"; fi
-    else
-      fail=$((fail+1)); FAILED+=("${s#$E/}|$log"); printf "  FAIL  %s\n" "${s#$E/}"
-    fi
+    (
+      log=$(compile_one "$s"); rc=$?
+      if (( rc == 0 )); then printf "  ok    %s\n" "${s#$E/}"
+      elif (( rc == 2 )); then printf "  ok*   %s   (needs -fgpu-rdc)\n" "${s#$E/}"
+      else printf "  FAIL  %s\n" "${s#$E/}"; fi
+      echo "$rc|${s#$E/}|$log" > "$resd/$idx"
+    ) &
+    running=$((running+1)); idx=$((idx+1))
+    if (( running >= jobs_max )); then wait -n; running=$((running-1)); fi
   done
+  wait
+  pass=0; fail=0; declare -a FAILED=()
+  for (( k=0; k<idx; k++ )); do
+    IFS='|' read -r rc srcrel log < "$resd/$k"
+    if (( rc == 0 || rc == 2 )); then pass=$((pass+1))
+    else fail=$((fail+1)); FAILED+=("$srcrel|$log"); fi
+  done
+  rm -rf "$resd"
   echo
   echo "=== $pass passed, $fail failed of ${#SRCS[@]} ==="
   if (( fail )); then

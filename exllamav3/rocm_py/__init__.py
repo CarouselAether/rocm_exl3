@@ -436,6 +436,41 @@ def apply() -> list[str]:
             applied.append(f"!! FAILED MoE bszN patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
+    # RDNA4 (gfx120x): fused MoE kernel unavailable -- per-expert fallback
+    # ------------------------------------------------------------------
+    # The fused exl3_moe kernel's WMMA sits on gfx11 intrinsics that have no
+    # gfx12 encoding; rdna_wmma.hip.h compiles a __builtin_trap() there so the
+    # comp units build, and this steer keeps the trap unreachable: clearing
+    # fused_mode_buffers after load_local sets min_rows = 0 in the fused
+    # branch, so every expert falls through to the per-expert exl3 Linear
+    # path -- the same GEMM/GEMV kernels dense models run (all of which
+    # compile and select for gfx120x; verified by GPU_ARCH=gfx1201
+    # hipcc_probe --all, 2026-08-28). Correct, slower on MoE models, dense
+    # models unaffected. UNVALIDATED ON REAL RDNA4 HARDWARE -- compile-level
+    # fix only; numerics need a gfx120x tester.
+    # EXL3_ROCM_RDNA4_FUSED_MOE=1 skips this steer (future gfx12 WMMA port).
+    if not _env_on("EXL3_ROCM_RDNA4_FUSED_MOE", False):
+        try:
+            import torch as _t
+            _is_gfx12 = _t.cuda.is_available() and any(
+                "gfx120" in _t.cuda.get_device_properties(i).gcnArchName
+                for i in range(_t.cuda.device_count()))
+            if _is_gfx12:
+                from ..modules import block_sparse_mlp as _bs4
+                _bs4_cls = _bs4.BlockSparseMLP
+                _orig_bs4_load = _bs4_cls.load_local
+
+                def _load_no_fused_gfx12(self, *args, **kwargs):
+                    r = _orig_bs4_load(self, *args, **kwargs)
+                    self.fused_mode_buffers = None
+                    return r
+
+                _bs4_cls.load_local = _load_no_fused_gfx12
+                applied.append("RDNA4: fused MoE -> per-expert path (gfx11 WMMA has no gfx12 encoding)")
+        except Exception as e:
+            applied.append(f"!! FAILED RDNA4 MoE fallback: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
     # v1.5.0: sliced Q/K/V bundle -- opt-in until validated
     # ------------------------------------------------------------------
     # attn.py, sliding_attn.py and gated_delta_net.py bundle every attention

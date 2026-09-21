@@ -41,7 +41,7 @@ That is the whole surface. Rebasing onto a new upstream means re-applying four f
 | | |
 |---|---|
 | ROCm | **7.2.4 or newer** — the build hard-fails below this |
-| GPU | RDNA3 / RDNA3.5 / RDNA4: `gfx1100`, `gfx1101`, `gfx1102`, `gfx1150`, `gfx1151`, `gfx1200`, `gfx1201` |
+| GPU | RDNA3 / RDNA3.5: `gfx1100`, `gfx1101`, `gfx1102`, `gfx1150`, `gfx1151` — developed and validated on gfx1151. RDNA4 (`gfx1200`, `gfx1201`): builds and should run, but MoE models take a slower per-expert path (the fused MoE kernel's WMMA has no gfx12 encoding) and no RDNA4 hardware has validated the port — reports welcome. |
 | Python | 3.10+ (whatever the ROCm torch index publishes a wheel for) |
 | Torch | ROCm build, from `download.pytorch.org/whl/rocmX.Y` — see below |
 
@@ -73,15 +73,17 @@ machine).
 
 Developed on a Ryzen AI Max 395+ (Strix Halo, **gfx1151**, 128 GB unified) — Ubuntu 24.04, ROCm 7.2.4,
 torch 2.13.0+rocm7.2, triton-rocm 3.7.1, Python 3.12. Verified end to end with GLM-4.6V (MoE, 3.55 bpw),
-Gemma-4-31B (dense) and DeepSeek-V4-Flash (DSA sparse attention, 2.04 bpw). The other architectures in the
+Gemma-4-31B (dense), DeepSeek-V4-Flash (DSA sparse attention, 2.04 bpw) and Qwen 3.8-Flash-Next
+(QSA sparse attention + PLE n-gram embeddings + 512-expert MoE, 4 bpw). The other architectures in the
 supported list above should work but are untested — reports welcome.
 
-**v1.5.0 sync status (2026-09-20):** the port was brought from v1.4.4 to v1.5.0 by source-level merge —
-upstream's own diffs applied to the RDNA siblings, two siblings regenerated, two new CUDA-only kernels
-stubbed — on a machine without a ROCm toolchain. **It has not yet been compiled or run on RDNA at this
-version.** Treat it as a build candidate: `rocm_tools/hipcc_probe.sh --all`, then a dense and an MoE model
-end to end, before trusting output. `exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md` lists exactly what changed
-and what is unverified.
+**v1.5.0 sync status (2026-09-20, validated on gfx1151):** the port was brought from v1.4.4 to v1.5.0 by
+source-level merge — upstream's own diffs applied to the RDNA siblings, two siblings regenerated, two new
+CUDA-only kernels stubbed. Validated end to end on gfx1151: full build, sibling drift audit, numeric ladder
+(`mgemv_check`, `test_reconstruct_had`, `test_dsa_kernels` all PASS, pytest suites 161/161), and coherent
+generation on the four models in the verified list — including Qwen 3.8-Flash-Next, the architecture this
+sync targets. `exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md` lists exactly what changed and what remains
+unexercised (the opt-in gates below).
 
 ### Known limitations on ROCm
 
@@ -93,6 +95,11 @@ and what is unverified.
   `EXL3_ROCM_MOE_BSZN=1` restores upstream dispatch and raises in the stub.
 - **The one-launch sliced Q/K/V bundle is off by default** (`EXL3_ROCM_QKV_SLICE=1` to enable): the sliced mgemm
   mode is ported into the WMMA kernels but unvalidated on RDNA; the pairwise bundles from v1.4.4 are used.
+- **RDNA4 (gfx1200/gfx1201) runs MoE through the per-expert path**: the fused MoE kernel's WMMA uses gfx11
+  intrinsics that have no gfx12 encoding (LLVM cannot select them), so `rdna_wmma.hip.h` traps on gfx12 and
+  `rocm_py` steers MoE off the fused kernel there. Dense models are unaffected. Compile-verified for gfx1201
+  (`GPU_ARCH=gfx1201 rocm_tools/hipcc_probe.sh --all`); **never run on real RDNA4 hardware** — testers welcome.
+  `EXL3_ROCM_RDNA4_FUSED_MOE=1` re-enables the fused route for a future gfx12 WMMA port.
 - **MoE 32/64-row tiles fall back to the 16-row kernel** (same numerics; slower prefill on mul1 MoE models).
 - **The batched expert-reconstruct tier is off by default** (`EXL3_ROCM_BATCH_RECON=1` to enable): ported
   mechanically, untested.

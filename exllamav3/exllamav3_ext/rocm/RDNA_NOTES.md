@@ -928,3 +928,36 @@ First things to run on hardware, in order: `rocm_tools/hipcc_probe.sh --all`; a
 dense model (Gemma-4) for the sliced-free attention path; an MoE model (GLM-4.6V)
 at bsz 1 to exercise the rerouted decode and the deterministic gather; then flip
 `EXL3_ROCM_QKV_SLICE=1` and `EXL3_ROCM_BATCH_RECON=1` one at a time and compare.
+
+### v1.5.0 validated on gfx1151 (2026-09-20), and the RDNA4 fallback
+
+The "first things to run" above all ran, plus more; everything passed:
+hipcc_probe --all clean; sibling drift audit exact against the documented
+deviation sets (rope's lane-0 fix is upstream now, so the sibling is down to
+the header block and the `= {}` line); mgemv_check full PASS incl. the
+masked-2tok bitwise case; test_reconstruct_had 12/12 against the +227-line
+batched rework; test_dsa_kernels ALL PASS; pytest suites 161/161; coherent
+generation on Gemma-4-31B, Laguna, GLM-4.6V, DeepSeek-V4-Flash and
+Qwen 3.8-Flash-Next (ngram table load, QSA attention, 512-expert fused-MoE
+steer, single and multi-job). test_ple_prefetch_gen_ / test_ngram_prefetch_
+need upstream's /mnt/str stub models and could not run; Qwen 3.8 loading its
+PLE table end to end is the working coverage. Benchmarks deliberately not
+taken yet: the MoE decode reroute is a known regression to quantify
+separately (see the table above; exl3_moe_coop is the item).
+
+**RDNA4 (gfx1200/gfx1201) compile fix.** A gfx1201 build died in all 20
+fused-MoE comp units: "Cannot select: intrinsic llvm.amdgcn.wmma.f32.16x16x16.f16"
+— the gfx11 WMMA intrinsics have no gfx12 encoding, and the fused-MoE
+instantiations of exl3_gemm_inner_rdna.hip.h are the ONLY live WMMA users
+left (the GEMM/GEMV instantiations take the dot-core paths and compile
+clean; classic dead-code-that-wasn't, in reverse). Fix shipped:
+`rdna_wmma::mma_sync` compiles to `__builtin_trap()` under
+`__gfx1200__/__gfx1201__` (loud, never silently wrong; the other wrappers
+keep the bare gfx11 builtins so any future gfx12 instantiation fails at
+compile, which is correct), and rocm_py clears `fused_mode_buffers` on
+gfx120x devices so MoE runs the per-expert path and the trap is unreachable
+(`EXL3_ROCM_RDNA4_FUSED_MOE=1` bypasses the steer for a future gfx12 port).
+Verified by `GPU_ARCH=gfx1201 hipcc_probe.sh --all` — compile-level only;
+**no RDNA4 hardware has ever run this port.** A real gfx12 WMMA port means
+half-size fragments (no operand duplication across wave halves) and new
+lane mappings in rdna_wmma.hip.h — hardware required to validate.
