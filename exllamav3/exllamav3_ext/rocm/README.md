@@ -128,6 +128,11 @@ the other nine entries are one-for-one `_rdna` siblings, each justified in its
   `mma.sync` PTX. **Not ported.** `rocm/hgemm_f16acc_rdna.hip` stubs the four entry
   points so `hgemm_recon` / `hgemm_batched` stay on hipBLAS.
 
+- `hgemm.cu` — `rocm/hgemm_rdna.hip`. Verbatim copy plus a narrow-output fast path:
+  m ≤ 8, N ≤ 512 products (BC_Attention's headwise gate, 1 × 3072 @ 3072 × 48 once
+  per layer per token) go to an fp32 GEMV outside graph capture instead of the
+  hipBLASLt 128×128 tile kernel (~50× off its bandwidth bound). +8.5% Laguna decode.
+
 - `quant/exl3_moe_coop.cu` (v1.5.0) — the fused decode-shaped MoE kernel that now
   backs `BC_BlockSparseMLP::run_bszN` upstream. Built on `exl3_gemv_kernel.cuh`
   (PTX GEMV), so it needs a re-derivation, not an include swap. **Not ported.**

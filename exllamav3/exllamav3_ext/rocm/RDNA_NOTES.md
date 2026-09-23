@@ -1195,3 +1195,40 @@ the same profile exposes, both independent of the MoE route:
   BOTH profiles: an unquantized linear is going through hgemm at m == 1 on a
   tile kernel. Identify the caller; a GEMV-shaped path would recover most of
   it.
+
+## The narrow-output hgemm (2026-09-23): 21.1 -> 22.9 t/s on Laguna
+
+The 15%-of-decode `Cijk_..._MT128x128x32_MI16x16x16` kernel above is
+`BC_Attention`'s headwise attention gate: `hgemm_gr(x2, g_weight, s.g2)` in
+`libtorch/attention.cpp`, a (1 x 3072) @ (3072 x 48) fp16 product once per
+layer per token (Laguna stores `g_proj` unquantized). hipBLASLt answers it
+with a 128x128 WMMA tile kernel: ~56 us unprofiled per call for a 295 KB
+matrix, ~50x its bandwidth bound. It is not the Python `LinearFP16` path
+(a patch there never fired -- the BC step issues the GEMM from C++), and an
+LD_PRELOAD interposer on `hipblasGemmEx` sees nothing because hipBLAS's
+headers map that entry point to a versioned symbol; the caller was found by
+reading `attention.cpp`, not by tracing.
+
+Micro-benchmarks at the gate's shape (torch, 7.2.4): fp16 GEMM 56 us flat
+from m == 1 to 8; `torch.mv` on an fp32 copy 8 us (m == 1); broadcast
+multiply + fp32 sum 15-30 us (m == 2..8); fp32 GEMM 108 us (the tile kernel
+again). A wide 3072 x 6144 fp16 product at m == 1 runs at 159 GB/s on the
+GEMM path, so the pathology is narrow N, not m == 1 as such.
+
+Fix: `rocm/hgemm_rdna.hip` (sibling of `hgemm.cu`, which setup.py now
+excludes): `hgemm_gemmex_impl` steers m <= 8 and N <= 512
+(`EXL3_RDNA_HGEMM_NARROW_N`, 0 disables) to an fp32 GEMV through ATen on the
+caller's stream, and ONLY when `hipStreamIsCapturing` says no capture is
+active -- under HIP graph capture (ROCm 10 with graphs on) the captured BC
+step keeps the cuBLAS node, because ATen allocations mid-capture are the
+allocator-state-in-graph interaction graph_rdna.hip's header describes.
+Result on 7.2.4: decode 21.1 -> **22.9 t/s** (+8.5%, above the ~5% floor),
+prefill unchanged, the tile kernel gone from the decode profile, GPU kernel
+time 0.912 -> 0.838 s per 24 tokens, chat_probe coherent. Under the
+profiler the wall time did not move (host-bound there), which is why a
+kernel-time win must be confirmed with the unprofiled bench.
+
+Open on `rocm-10`: with graphs on the captured BC step still runs the tile
+GEMM, so the 10.x line does not get this gain until either the captured node
+is replaced by a GEMV kernel launch (a plain HIP kernel, capture-safe: no
+allocator) or the gate moves out of the capture.
