@@ -1073,3 +1073,69 @@ Verified by `GPU_ARCH=gfx1201 hipcc_probe.sh --all` — compile-level only;
 **no RDNA4 hardware has ever run this port.** A real gfx12 WMMA port means
 half-size fragments (no operand duplication across wave halves) and new
 lane mappings in rdna_wmma.hip.h — hardware required to validate.
+
+## ROCm 10.0 (2026-09-22): stack up, graphs on by default via a runtime gate
+
+Branch `rocm-10` (worktree `rocm_exl3_10/`), venv `.venv10`. Stack: AMD's
+stable index `https://stable.repo.amd.com/rocm/whl-next/` -- `torch
+2.13.0+rocm10.0.0` (same torch as the 7.2.4 production venv, so an A/B
+isolates the ROCm change), `triton 3.8.0+git4cff872c.rocm10.0.0` (NOT the
+3.7.1 the pre-install research predicted), `rocm[libraries,devel,device-gfx1151]
+==10.0.0`. `rocm-sdk init` expands `site-packages/_rocm_sdk_devel` (hipcc,
+device libs, `.info/version` = 10.0.0), a drop-in `ROCM_PATH`. The ROCm 10.0
+runtime is HIP 7.15: `torch.version.hip` = 7.15.26333, `hipRuntimeGetVersion`
+= 71526333 (7.2.4: 70253211, 7.14 wheel: 71460850).
+
+Build: `env -i ... PATH=$SDK/bin:... ROCM_PATH=$SDK ROCM_HOME=$SDK pip install
+-e . --no-build-isolation`. Scrub the login shell's /opt/rocm leakage first.
+**ROCM_HOME matters**: torch's extension builder takes the rpath from it, not
+from ROCM_PATH; without it the .so carries RUNPATH /opt/rocm-7.2.4/lib. That
+was inert here (torch loads its bundled libamdhip64.so.7 first and the loader
+reuses it by soname -- verified via /proc/self/maps: only the wheel's runtime
+is mapped) but it is the duplicate-runtime trap waiting to happen.
+
+Results, all on gfx1151 / this kernel: hsa_init gate PASS; `hipcc_probe.sh
+--all` 117/117 under LLVM 24 with no new warnings; full `-fgpu-rdc` build
+links (the new-offload-driver RDC ABI concern did not materialise);
+exl3_stack_check PASS; all seven rocm_py patches apply (DSA retune included);
+graphpatch_check / graphpatch_module_check / graphpatch_multinode_check all
+EFFECTIVE and graph_order_check 0/300 violations, run against the wheel
+runtime (`LD_LIBRARY_PATH=_rocm_sdk_core/lib` -- the harness binaries carry no
+rpath and would otherwise pick up /opt/rocm-7.2.4); `EXL3_ROCM_HIP_GRAPHS=1`
+Laguna generation coherent with no capture errors.
+
+**Triton 3.8 does not need the `__del__` no-op** (trap 4 above): its
+`CompiledKernel.__del__` unloads only when `self.module` was initialised by a
+launch, and `bc_attn._compile_kernel` never launches the Triton object (it
+copies the hsaco into ext.TritonKernel). No "operation not permitted when
+stream is capturing" spam observed with graphs on.
+
+**Default policy (the point of this branch):** `graph_rdna.hip` now gates
+capture on the loaded runtime -- `hipRuntimeGetVersion() >= 71400000` (7.14+)
+turns graphs ON, anything older stays eager passthrough. So a 7.2.4 user can
+never hit the 7.2.x capture hang, and a ROCm 10 user gets graphs without an
+environment flag. `EXL3_ROCM_HIP_GRAPHS=1/0` overrides either way (bisect
+handle). rocm_py reports the effective state in `describe()`.
+
+Not done yet: decode A/B 7.2.4 vs 10.0 (graphs were flat on 7.14 -- see
+"7.14 retest" -- so expect no headline change; the ROCm 10 gains, if any,
+will come from the profiler (rocprofv3 1.3.5: 228 gfx1151 counters vs 31 on
+7.2.4) pointing at fusion targets), `stream_wedge_check` (never run without
+asking -- machine-wedge risk), rocm-systems PR #10714 (kernarg-exhaustion
+stale-packet bug: graph_rdna.hip checks every update rc, keep it that way).
+Pre-existing, unrelated to ROCm 10: loading DeepSeek-V4-Flash prints Triton
+"no matching matrix core intrinsic for wmma version 1" diagnostics from
+dsa_triton.py's tl.dot shapes on both stacks; Triton falls back to a non-WMMA
+dot and generation is coherent.
+
+**Multi-turn acceptance (2026-09-22, `rocm_tools/chat_probe.py`, Laguna
+4bpw, six turns to ~1.5K ctx + two concurrent jobs):** graphs-on ROCm 10,
+graphs-off ROCm 10 and 7.2.4 produce the same per-turn token counts and the
+same repetition scores for the same seed -- replay is token-identical to eager.
+With proper stop ids the worst rep4 is 0.03. The "replay repeats itself over
+and over on longer context" symptom remembered from earlier sessions
+reproduced here on ALL THREE stacks with no stop ids: Laguna ends turns with
+`</assistant>` (id 24, in `config.eos_token_id_list`), and a client that stops
+only on the tokenizer's EOS runs past the finished answer and repeats it
+verbatim (rep4 0.51-0.55 by turn 6). It was a client stop-token gap, not
+graphs. exl3_server already unions `eos_token_id_list` with `eos_token_id`.

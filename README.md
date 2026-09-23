@@ -108,8 +108,9 @@ unexercised (the opt-in gates below).
 - **fp16-accumulate `hgemm` and the sm_120 quantizer specialisations are CUDA-only.** hipBLAS and the original
   quantizer kernels are used; nothing is lost on RDNA, which has no fp32-accumulate rate penalty.
 - **The int8-activation GEMV is not ported** (a disabled stub); every call uses the fp16 GEMV/GEMM kernels.
-- **HIP graph capture is off by default**: capture/replay corrupts BC decode across generator jobs and can hang at
-  capture on ROCm 7.2.x. `EXL3_ROCM_HIP_GRAPHS=1` re-enables it for A/B against newer ROCm stacks.
+- **HIP graph capture is gated on the HIP runtime**: capture/replay corrupts BC decode across generator jobs and
+  can hang at capture on ROCm 7.2.x, so on runtimes older than 7.14 the BC step runs eagerly. On ROCm 7.14 / 10.x
+  (validated) graphs are on with no flag needed. `EXL3_ROCM_HIP_GRAPHS=1` / `=0` overrides the gate either way.
 - **Quantization (`convert.py`) is built but not yet exercised on RDNA.** Convert on CUDA if you can; reports welcome.
 - Kernel behaviour can be bisected at runtime with the `EXL3_ROCM_*` environment switches — see
   `exllamav3/rocm_py/__init__.py`, whose module docstring lists each one and why it exists.

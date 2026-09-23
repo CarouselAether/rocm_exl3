@@ -150,8 +150,9 @@ ROCM_EXCLUDE = (
     # HIP graph capture/replay corrupts BC decode across generator jobs and
     # intermittently hangs at capture on ROCm 7.2.x (runtime-level, not this
     # codebase -- see the sibling's header for the exclusion experiments). The
-    # sibling runs the BC step eagerly by default; EXL3_ROCM_HIP_GRAPHS=1
-    # restores capture for A/B against future ROCm stacks.
+    # sibling gates capture on the loaded HIP runtime: eager passthrough below
+    # 7.14, capture/replay on from 7.14 / ROCm 10 (validated there);
+    # EXL3_ROCM_HIP_GRAPHS=1/0 overrides.
     "graph.cu",                  # -> rocm/graph_rdna.hip
     # v1.5.0: fp16-accumulator tensor-core GEMM (cp.async + mma.sync PTX). The
     # stub sibling keeps hgemm_recon / hgemm_batched on hipBLAS.

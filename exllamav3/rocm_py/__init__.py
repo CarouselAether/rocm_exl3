@@ -573,6 +573,27 @@ def apply() -> list[str]:
     except Exception as e:
         applied.append(f"!! FAILED batch-recon/mtile patch: {type(e).__name__}: {e}")
 
+    # ------------------------------------------------------------------
+    # HIP graphs: report the effective state (the decision is made in C++)
+    # ------------------------------------------------------------------
+    # rocm/graph_rdna.hip gates capture/replay on hipRuntimeGetVersion of the
+    # runtime actually loaded: off below 7.14 (system 7.2.x: capture hangs,
+    # replays corrupt), on from 7.14 / ROCm 10 (validated). This block only
+    # mirrors that decision into describe() so a log shows which mode a run
+    # used; EXL3_ROCM_HIP_GRAPHS=1/0 is the override, read by both sides.
+    try:
+        import torch as _torch
+        _hip = str(getattr(_torch.version, "hip", "") or "")
+        _mm = tuple(int(x) for x in _hip.split(".")[:2]) if _hip else (0, 0)
+        _ov = os.environ.get("EXL3_ROCM_HIP_GRAPHS", "").strip()
+        _on = (_ov == "1") if _ov else (_mm >= (7, 14))
+        applied.append(
+            f"HIP graphs {'ON' if _on else 'OFF (eager passthrough)'}: HIP runtime {_hip or '?'}"
+            + (", EXL3_ROCM_HIP_GRAPHS override" if _ov else ", runtime gate >= 7.14")
+        )
+    except Exception as e:
+        applied.append(f"!! FAILED HIP graphs state report: {type(e).__name__}: {e}")
+
     globals()['_applied_list'] = applied
     return applied
 

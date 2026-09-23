@@ -1,6 +1,7 @@
 // =============================================================================
 // graph_rdna.hip -- Graph class sibling for ROCm: HIP graph capture/replay
-// disabled by default, replaced by eager passthrough
+// gated on the loaded HIP runtime (off below 7.14, on from 7.14 / ROCm 10),
+// with eager passthrough when off
 // =============================================================================
 //
 // Generated from graph.cu (which stays byte-identical to upstream; setup.py
@@ -54,9 +55,8 @@
 // preserved; only hipGraph replay is dropped, along with capture hangs, by
 // construction.
 //
-// EXL3_ROCM_HIP_GRAPHS=1 restores upstream capture/replay behavior (bisect
-// handle for future ROCm stacks; retest the multiturn probe in
-// RDNA_NOTES.md before trusting it).
+// On runtimes >= 7.14 the gate below turns capture/replay back on by default;
+// EXL3_ROCM_HIP_GRAPHS=1 / =0 overrides it either way (bisect handle).
 // =============================================================================
 
 #include <Python.h>
@@ -73,14 +73,40 @@
 
 //#define GRAPHDEBUG 1
 
-// ROCm sibling: HIP graph capture is opt-in (see file header)
+// ROCm sibling: HIP graph capture is gated on the HIP runtime that is actually
+// loaded into the process, not on a build-time constant, so one binary does the
+// right thing on both stacks this port supports:
+//
+//   runtime <  7.14  (system ROCm 7.2.x)   eager passthrough. Capture hangs and
+//                                          replays corrupt across jobs there; see
+//                                          the file header.
+//   runtime >= 7.14  (ROCm 7.14, 10.x)     capture/replay ON. Validated 2026-08-27
+//                                          on 7.14 and 2026-09-22 on 10.0 (HIP
+//                                          7.15): all graphpatch checks, ordering
+//                                          check 0/300, coherent generation.
+//
+// hipRuntimeGetVersion packs MAJOR*10^7 + MINOR*10^5 + PATCH. Measured: 7.2.4
+// reports 70253211, 7.14 reports 71460850, ROCm 10.0 (HIP 7.15) reports 71526333.
+//
+// EXL3_ROCM_HIP_GRAPHS=1 / =0 overrides the gate in either direction (bisect
+// handle); unset or empty means "decide from the runtime".
+#define EXL3_ROCM_GRAPHS_MIN_RUNTIME 71400000
+
 static bool hip_graphs_enabled()
 {
     static int v = -1;
     if (v < 0)
     {
         const char* e = getenv("EXL3_ROCM_HIP_GRAPHS");
-        v = (e && *e == '1') ? 1 : 0;
+        if (e && *e)
+        {
+            v = (*e == '1') ? 1 : 0;
+        }
+        else
+        {
+            int rt = 0;
+            v = (hipRuntimeGetVersion(&rt) == hipSuccess && rt >= EXL3_ROCM_GRAPHS_MIN_RUNTIME) ? 1 : 0;
+        }
     }
     return v == 1;
 }
