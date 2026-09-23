@@ -1246,3 +1246,44 @@ chat_probe coherent (worst rep4 0.02), profile: the gate is now
 (16 us each) against 134 ms before. Under the profiler the wall time does not
 move (host-bound there); a kernel-time win must be confirmed with the
 unprofiled bench.
+
+## Next: launch-count fusion (brief for the next session, 2026-09-23)
+
+Decode on Laguna is host-bound: ~1720 launches/token, GPU idle ~20% of wall
+unprofiled (from 23.3 t/s = 43 ms/token against ~33 ms of kernel time), 36-40%
+under Kineto. The restored MoE route issues ~9 launches per MoE layer: three
+`exl3_mgemm` calls (gate, up, down) x three kernels each
+(`exl3_mgemv_had_in_kernel` -> `exl3_mgemv_dot_kernel_splitk` ->
+`exl3_mgemv_had_out_kernel`, all in `rocm/quant/exl3_mgemv_rdna.hip`; the
+single-warp and graph-captured variants have the same shape). The 2026-08
+dispatch-gap census measured the CP's ~2.1 us gap between dependent kernels
+and found graph replay does not remove it, so the lever is fewer kernels, on
+every runtime, and it matters more on a discrete card where kernels are
+shorter and the gap and host cost are the same.
+
+Plan, in order of return per risk:
+1. Fold `had_in` into the dot kernel's prologue. A is m x K halfs (tiny); each
+   warp can rotate the 128-blocks of its own K-segment on the fly (128-point
+   Hadamard + suh scale), redundantly across N-tiles. Cost is trivial; saves
+   one launch per call. Keep bit-identity with the current path (the same
+   arithmetic order) so mgemv_check's bitwise cases still pass.
+2. Fold `had_out` into the dot kernel's epilogue with a last-arriving-block
+   pattern per N-tile: split-K partials as today, an atomic counter per
+   N-tile, and the block that observes count == splits applies svh + the
+   output Hadamard + routing weights and writes C. The counter array can live
+   in the DevCtx workspace or the existing `Exl3MgemvParams` block; it must be
+   zeroed by the last block itself (self-resetting) so graph replay needs no
+   patch. Saves the third launch.
+3. Gate + up in one call: same A, same indices, two B pointer tables; one
+   launch with a z-dimension of 2 (or a matrix-list of 2*top_k entries)
+   writing interm_g and interm_u. With 1 and 2 done this takes a MoE layer
+   from 9 launches to 2 (gate+up, down).
+4. Then the same for `exl3_mgemv` on the dense/attention side (q/k/v,
+   gate/up bundles) -- it is the same kernel family.
+
+Acceptance: `rocm_tools/gemv_check` and `mgemv_check.py` full PASS incl. the
+masked-2tok bitwise case; `exl3_stack_check` PASS; `moe_ref32`-style route vs
+fp32 at bsz 1/3/8; `chat_probe.py` clean; `bench_model.py` decode up with
+prefill flat; `profile_decode.py` showing the launch count per token drop.
+Noise floor ~5%: repeat runs. Do it on `main` (7.2.4), merge to `rocm-10`,
+rebuild `.venv10`.
