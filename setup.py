@@ -157,9 +157,10 @@ ROCM_EXCLUDE = (
     # v1.5.0: fp16-accumulator tensor-core GEMM (cp.async + mma.sync PTX). The
     # stub sibling keeps hgemm_recon / hgemm_batched on hipBLAS.
     "hgemm_f16acc.cu",           # -> rocm/hgemm_f16acc_rdna.hip (disabled stub)
-    # hipBLASLt runs narrow fp16 products (BC_Attention's headwise gate: 1 x 3072 @ 3072 x 48,
-    # once per layer per token) on a 128x128 tile kernel at ~50x their bandwidth bound. The
-    # sibling steers m <= 8, N <= 512 to an fp32 GEMV outside graph capture; see its header.
+    # rocBLAS answers narrow fp16 products (BC_Attention's headwise gate: 1 x 3072 @ 3072 x 48,
+    # once per layer per token) with one 128x128 tile workgroup at ~50x their bandwidth bound,
+    # and hipBLASLt costs prefill. The sibling runs m <= 8, N <= 256 on its own split-K GEMV
+    # kernels (capture-safe, no allocations); everything else stays on rocBLAS. See its header.
     "hgemm.cu",                  # -> rocm/hgemm_rdna.hip
     # v1.5.0: fused decode-shaped MoE kernel built on exl3_gemv_kernel.cuh (PTX
     # mma + cp.async). Not ported: the sibling stubs the entry points and

@@ -1196,39 +1196,53 @@ the same profile exposes, both independent of the MoE route:
   tile kernel. Identify the caller; a GEMV-shaped path would recover most of
   it.
 
-## The narrow-output hgemm (2026-09-23): 21.1 -> 22.9 t/s on Laguna
+## The narrow-output hgemm (2026-09-23): 21.1 -> 23.3 t/s on Laguna
 
 The 15%-of-decode `Cijk_..._MT128x128x32_MI16x16x16` kernel above is
 `BC_Attention`'s headwise attention gate: `hgemm_gr(x2, g_weight, s.g2)` in
 `libtorch/attention.cpp`, a (1 x 3072) @ (3072 x 48) fp16 product once per
-layer per token (Laguna stores `g_proj` unquantized). hipBLASLt answers it
-with a 128x128 WMMA tile kernel: ~56 us unprofiled per call for a 295 KB
-matrix, ~50x its bandwidth bound. It is not the Python `LinearFP16` path
-(a patch there never fired -- the BC step issues the GEMM from C++), and an
-LD_PRELOAD interposer on `hipblasGemmEx` sees nothing because hipBLAS's
-headers map that entry point to a versioned symbol; the caller was found by
-reading `attention.cpp`, not by tracing.
+layer per token (Laguna stores `g_proj` unquantized). It is not the Python
+`LinearFP16` path (a patch there never fired: the BC step issues the GEMM
+from C++), and an LD_PRELOAD interposer on `hipblasGemmEx` sees nothing
+because hipBLAS's headers map that entry point to a versioned symbol; the
+caller was found by reading `attention.cpp`.
 
-Micro-benchmarks at the gate's shape (torch, 7.2.4): fp16 GEMM 56 us flat
-from m == 1 to 8; `torch.mv` on an fp32 copy 8 us (m == 1); broadcast
-multiply + fp32 sum 15-30 us (m == 2..8); fp32 GEMM 108 us (the tile kernel
-again). A wide 3072 x 6144 fp16 product at m == 1 runs at 159 GB/s on the
-GEMM path, so the pathology is narrow N, not m == 1 as such.
+What the libraries do with it (`rocm_tools/hgemm_narrow_probe.py`, K = 3072,
+rotating working sets, 7.2.4 unless noted):
+- rocBLAS (hipBLAS's default backend, what `cublasGemmEx` reaches): ONE
+  128x128 tile workgroup walking K in 96 serial LDS round trips on one WGP,
+  63-75 us flat from m = 1 to 32 for a 295 KB matrix, ~50x its bandwidth
+  bound. Wide N is fine on the same path (N = 12288 at m = 1: 371 us =
+  ~200 GB/s), so the pathology is narrow N without a K split.
+- `ROCBLAS_USE_HIPBLASLT=1`: the same entry point takes 10-22 us at narrow N
+  and ~40% less at N = 2048, on 7.2.4 and 10.0 alike -- but hipBLASLt loses
+  to rocBLAS at m >= 128 and at wide N on this part, and as a process-wide
+  switch it cost prefill 13-17% (192 -> 167, 314 -> 259 t/s). There is no
+  per-call backend switch in rocBLAS or hipBLAS, and linking hipBLASLt
+  directly would add a second copy of a library torch already bundles.
+- An fp32 GEMV recipe through ATen (torch.mv / broadcast multiply + sum,
+  shipped briefly as the first sibling) wins only up to N = 192 / 128 / 96 /
+  64 at m = 1 / 2 / 4 / 8, is 2-5x SLOWER above that, and cannot run inside
+  graph capture (caching-allocator state in the graph, see graph_rdna.hip).
+- torch.matmul on the 7.2.4 wheel also goes through rocBLAS (74 us); on the
+  10.0 wheel it goes through hipBLASLt (10 us). That is why ROCm 10 looked
+  "fixed" in torch and not in the ext.
 
-Fix: `rocm/hgemm_rdna.hip` (sibling of `hgemm.cu`, which setup.py now
-excludes): `hgemm_gemmex_impl` steers m <= 8 and N <= 512
-(`EXL3_RDNA_HGEMM_NARROW_N`, 0 disables) to an fp32 GEMV through ATen on the
-caller's stream, and ONLY when `hipStreamIsCapturing` says no capture is
-active -- under HIP graph capture (ROCm 10 with graphs on) the captured BC
-step keeps the cuBLAS node, because ATen allocations mid-capture are the
-allocator-state-in-graph interaction graph_rdna.hip's header describes.
-Result on 7.2.4: decode 21.1 -> **22.9 t/s** (+8.5%, above the ~5% floor),
-prefill unchanged, the tile kernel gone from the decode profile, GPU kernel
-time 0.912 -> 0.838 s per 24 tokens, chat_probe coherent. Under the
-profiler the wall time did not move (host-bound there), which is why a
-kernel-time win must be confirmed with the unprofiled bench.
+Fix: `rocm/hgemm_rdna.hip` (sibling of `hgemm.cu`, which setup.py excludes)
+runs m <= 8, N <= 256 (`EXL3_RDNA_HGEMM_NARROW_N`, 0 disables) on two plain
+kernels: split-K partials (one block per 64-row K-slice, thread = column x
+row-lane, LDS reduce over lanes) into the DevCtx workspace, then a reduce
+into C in its dtype and row stride. No allocations, so it is capture-safe and
+the captured BC gate node takes it too. Everything else stays on rocBLAS.
+Measured (ext.hgemm column): 8 / 12 / 13 / 16 / 24 us at m = 1 for N = 16 /
+48 / 64 / 128 / 256, 14-45 us at m = 8 -- below both libraries and the
+recipe at every shape in the regime. `--check` compares against fp32 at every
+shape, fp16 and fp32 outputs.
 
-Open on `rocm-10`: with graphs on the captured BC step still runs the tile
-GEMM, so the 10.x line does not get this gain until either the captured node
-is replaced by a GEMV kernel launch (a plain HIP kernel, capture-safe: no
-allocator) or the gate moves out of the capture.
+Result on 7.2.4 (bench_model -p 512 2048 -n 128 -r 4): decode 21.1 ->
+**23.3 t/s** (+10%), prefill unchanged (192 / 308), exl3_stack_check PASS,
+chat_probe coherent (worst rep4 0.02), profile: the gate is now
+`hgemm_narrow_partial_kernel` + `_reduce_kernel` at 19 ms per 1152 calls
+(16 us each) against 134 ms before. Under the profiler the wall time does not
+move (host-bound there); a kernel-time win must be confirmed with the
+unprofiled bench.
