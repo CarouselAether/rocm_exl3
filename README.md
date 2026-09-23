@@ -91,10 +91,11 @@ unexercised (the opt-in gates below).
 
 - **Tensor-parallel is not available.** The `parallel/` kernels are excluded from the ROCm build.
 - **Vision/multimodal is untested.** Text generation is what has been verified.
-- **MoE decode at bsz ≤ 8 uses the fused `exl3_moe` kernel**, not upstream v1.5.0's new cooperative decode kernel
-  (`exl3_moe_coop`, inline-PTX GEMV based, not ported). Numerically validated on this port, but slower than the
-  v1.4.4 mgemm decode route, which upstream removed. Porting `exl3_moe_coop` is the open decode-throughput item.
-  `EXL3_ROCM_MOE_BSZN=1` restores upstream dispatch and raises in the stub.
+- **MoE decode at bsz ≤ 8 runs the per-token `exl3_mgemm` route** (upstream's own v1.4.4 route, reinstated by
+  `rocm_py`), not upstream v1.5.0's cooperative decode kernel (`exl3_moe_coop`, inline-PTX GEMV based, not ported).
+  On RDNA each call lands on the mgemv fast path; Laguna-S-2.1 4bpw decodes at 21 t/s this way versus 10 through
+  the fused `exl3_moe` kernel (`EXL3_ROCM_MOE_MGEMM_ROUTE=0` selects that steer). `EXL3_ROCM_MOE_BSZN=1` restores
+  upstream dispatch and raises in the stub.
 - **The one-launch sliced Q/K/V bundle is off by default** (`EXL3_ROCM_QKV_SLICE=1` to enable): the sliced mgemm
   mode is ported into the WMMA kernels but unvalidated on RDNA; the pairwise bundles from v1.4.4 are used.
 - **RDNA4 (gfx1200/gfx1201) runs MoE through the per-expert path**: the fused MoE kernel's WMMA uses gfx11

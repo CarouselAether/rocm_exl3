@@ -46,7 +46,12 @@ Environment switches (all default to the safe value for this backend):
   EXL3_ROCM_MOE_BSZN=1     let bsz <= MAX_BSZN MoE decode take upstream's
                            BC_BlockSparseMLP.run_bszN route. On ROCm that route
                            is the unported exl3_moe_coop kernel and raises;
-                           default off reroutes to the fused exl3_moe kernel
+                           default off steers it (see the next switch)
+  EXL3_ROCM_MOE_MGEMM_ROUTE=0  steer bsz <= MAX_BSZN MoE decode to the fused
+                           exl3_moe kernel (a 16-row tile GEMM padding one
+                           useful row: ~half the decode speed). Default on =
+                           the restored v1.4.4 per-token exl3_mgemm route,
+                           which lands on the mgemv fast path
   EXL3_ROCM_QKV_SLICE=1    enable the one-launch sliced Q/K/V bundle
                            (SlicedMultiLinear, exl3_mgemm sliced mode). Ported
                            into the WMMA kernels, unvalidated on RDNA
@@ -439,7 +444,7 @@ def apply() -> list[str]:
             applied.append(f"!! FAILED MoE patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
-    # v1.5.0: MoE decode for bsz <= MAX_BSZN -- keep off the cooperative kernel
+    # v1.5.0: MoE decode for bsz <= MAX_BSZN -- the mgemm/GEMV route, restored
     # ------------------------------------------------------------------
     # Upstream v1.5.0 replaced BC_BlockSparseMLP.run_bszN's three exl3_mgemm
     # graph launches with exl3_moe_coop, a fused decode kernel built on
@@ -447,47 +452,124 @@ def apply() -> list[str]:
     # ROCm build links a stub that raises if reached (rocm/quant/
     # exl3_moe_coop_rdna.hip). block_sparse_mlp.forward takes that route
     # whenever `self.bc is not None and bsz <= MAX_BSZN`, and its else-branch
-    # asserts bszn_eligible, so the dispatch has to be steered from outside:
+    # asserts bszn_eligible, so the dispatch has to be steered from outside.
     #
-    #   - MAX_BSZN is read from the module globals inside forward. It is set to
-    #     0 for the duration of each call (and restored), which makes
-    #     bszn_eligible false without touching the load-time buffer sizing
-    #     that also reads it.
-    #   - f_threshold is set to 1 after load_local, so every batch size takes
-    #     the fused / per-expert branch instead of the bszN else-branch.
+    # Two steers exist. The default restores upstream's own v1.4.4 route,
+    # verbatim: per token, gate and up through exl3_mgemm (indices = that
+    # token's experts), the activation, then down through exl3_mgemm with the
+    # routing weights, which reduces the top-k expert outputs into out_d[0].
+    # That row is the token's routed sum and is copied to out_bszn[i], where
+    # the branch reads it back. Every call is num_tokens == 1, so on RDNA each
+    # lands on the mgemv fast path (exl3_mgemv_rdna.hip: barrier-free dot
+    # core, 120-240 GB/s). Measured 2026-09-22 on Laguna-S-2.1 4bpw
+    # (bench_model.py): the fused steer decodes at 10.4 t/s, v1.4.4 on this
+    # route at 20.8 -- the fused exl3_moe is a 16-row WMMA tile GEMM that pads
+    # one useful row to sixteen and runs at a flat ~53 GB/s (RDNA_NOTES.md,
+    # "Token generation was NOT memory-bound as first shipped").
     #
-    # self.bc is kept: the per-expert graph and dequant paths
-    # (run_single_expert, run_single_expert_dq) still use it, unlike the
-    # retired v1.4.4 patch above which set it to None.
+    # Mechanics: forward is wrapped so that, for the duration of the call,
+    # self.bc is a proxy whose run_bszN is the Python loop below; every other
+    # attribute forwards to the real BC_BlockSparseMLP, so bszn_eligible still
+    # sees a non-None bc and the per-expert graph paths (bsz > MAX_BSZN) still
+    # reach the C++ object. Shared experts: upstream's kernel merges them in-
+    # kernel and the forward tail skips them while self.bc_sh_exp is True, so
+    # bc_sh_exp is forced False after load_local and the tail's Python
+    # shared-expert path runs instead, as it does for every non-bszN tier.
+    # Expert-range shards pass cfg.min_expert / max_expert exactly as
+    # run_bszN does (num_tokens == 1 compacts out-of-range picks).
     #
-    # Net effect: bsz 1..8 MoE decode runs the fused exl3_moe kernel, which
-    # matched an fp32 reference on this port after the 2026-08-08 split-K fixes
-    # (RDNA_NOTES.md). Correct, and slower than the v1.4.4 mgemm decode route
-    # that upstream removed; porting exl3_moe_coop is the item that gets it
-    # back. EXL3_ROCM_MOE_BSZN=1 restores upstream dispatch for that day.
+    # EXL3_ROCM_MOE_MGEMM_ROUTE=0 selects the older steer: MAX_BSZN is zeroed
+    # for the call and f_threshold set to 1, so bsz 1..8 runs the fused
+    # exl3_moe kernel (correct per the 2026-08-08 fp32 comparison, half the
+    # decode speed). EXL3_ROCM_MOE_BSZN=1 leaves upstream dispatch alone
+    # (raises on ROCm) for the day exl3_moe_coop is ported.
     if not _env_on("EXL3_ROCM_MOE_BSZN", False):
         try:
             from ..modules import block_sparse_mlp as _bsn
+            from ..ext import exllamav3_ext as _ext
             _bsn_cls = _bsn.BlockSparseMLP
             _orig_bsn_load = _bsn_cls.load_local
             _orig_bsn_forward = _bsn_cls.forward
 
-            def _load_no_bszn(self, *args, **kwargs):
-                r = _orig_bsn_load(self, *args, **kwargs)
-                self.f_threshold = 1
-                return r
+            if _env_on("EXL3_ROCM_MOE_MGEMM_ROUTE", True):
 
-            def _forward_no_bszn(self, *args, **kwargs):
-                saved = _bsn.MAX_BSZN
-                _bsn.MAX_BSZN = 0
-                try:
-                    return _orig_bsn_forward(self, *args, **kwargs)
-                finally:
-                    _bsn.MAX_BSZN = saved
+                def _mgemm_bszN(mod, y, selected_experts, routing_weights):
+                    cfg = mod.experts_cfg
+                    bsz = y.shape[0]
+                    mine, maxe = cfg.min_expert, cfg.max_expert
+                    A = y.unsqueeze(1).unsqueeze(1)          # (bsz, 1, 1, Hi)
+                    sel = selected_experts.unsqueeze(1)      # (bsz, 1, top_k)
+                    w = routing_weights.unsqueeze(1)         # (bsz, 1, top_k)
+                    width = cfg.out_bszn.shape[-1]
+                    out_row = cfg.out_d[0].view(-1)[:width]  # routed sum lands in row 0
+                    mg, mu, md = mod.multi_gate, mod.multi_up, mod.multi_down
+                    for i in range(bsz):
+                        if mod.gated:
+                            _ext.exl3_mgemm(
+                                A[i], mg.ptrs_trellis, cfg.interm_g, mg.ptrs_suh, cfg.yh, mg.ptrs_svh,
+                                sel[i], None, mg.K, -1, mg.mcg, mg.mul1, mine, maxe, 0, 1, None, None)
+                        _ext.exl3_mgemm(
+                            A[i], mu.ptrs_trellis, cfg.interm_u, mu.ptrs_suh, cfg.yh, mu.ptrs_svh,
+                            sel[i], None, mu.K, -1, mu.mcg, mu.mul1, mine, maxe, 0, 1, None, None)
+                        act_g = cfg.interm_g if mod.gated else cfg.interm_u
+                        mod.activation_fn_call(act_g, cfg.interm_u, cfg.interm_a, mod.act_limit)
+                        # A_had must not alias A (the autotuner relaunches on the first call);
+                        # the gate buffer is free after the activation
+                        _ext.exl3_mgemm(
+                            cfg.interm_a, md.ptrs_trellis, cfg.out_d, md.ptrs_suh, cfg.interm_g, md.ptrs_svh,
+                            sel[i], w[i], md.K, -1, md.mcg, md.mul1, mine, maxe, 0, 1, None, None)
+                        cfg.out_bszn[i].copy_(out_row)
 
-            _bsn_cls.load_local = _load_no_bszn
-            _bsn_cls.forward = _forward_no_bszn
-            applied.append("MoE bsz<=MAX_BSZN decode -> fused exl3_moe (exl3_moe_coop not ported to RDNA)")
+                class _BCProxy:
+                    __slots__ = ("_bc", "_mod")
+
+                    def __init__(self, bc, mod):
+                        self._bc = bc
+                        self._mod = mod
+
+                    def __getattr__(self, name):
+                        return getattr(self._bc, name)
+
+                    def run_bszN(self, y, selected_experts, routing_weights):
+                        _mgemm_bszN(self._mod, y, selected_experts, routing_weights)
+
+                def _load_mgemm_route(self, *args, **kwargs):
+                    r = _orig_bsn_load(self, *args, **kwargs)
+                    self.bc_sh_exp = False
+                    return r
+
+                def _forward_mgemm_route(self, *args, **kwargs):
+                    bc = self.bc
+                    if bc is None:
+                        return _orig_bsn_forward(self, *args, **kwargs)
+                    self.bc = _BCProxy(bc, self)
+                    try:
+                        return _orig_bsn_forward(self, *args, **kwargs)
+                    finally:
+                        self.bc = bc
+
+                _bsn_cls.load_local = _load_mgemm_route
+                _bsn_cls.forward = _forward_mgemm_route
+                applied.append("MoE bsz<=MAX_BSZN decode -> per-token exl3_mgemm route (v1.4.4's; mgemv fast path; exl3_moe_coop not ported)")
+
+            else:
+
+                def _load_no_bszn(self, *args, **kwargs):
+                    r = _orig_bsn_load(self, *args, **kwargs)
+                    self.f_threshold = 1
+                    return r
+
+                def _forward_no_bszn(self, *args, **kwargs):
+                    saved = _bsn.MAX_BSZN
+                    _bsn.MAX_BSZN = 0
+                    try:
+                        return _orig_bsn_forward(self, *args, **kwargs)
+                    finally:
+                        _bsn.MAX_BSZN = saved
+
+                _bsn_cls.load_local = _load_no_bszn
+                _bsn_cls.forward = _forward_no_bszn
+                applied.append("MoE bsz<=MAX_BSZN decode -> fused exl3_moe (EXL3_ROCM_MOE_MGEMM_ROUTE=0)")
         except Exception as e:
             applied.append(f"!! FAILED MoE bszN patch: {type(e).__name__}: {e}")
 

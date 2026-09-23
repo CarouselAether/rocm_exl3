@@ -132,9 +132,10 @@ the other nine entries are one-for-one `_rdna` siblings, each justified in its
   backs `BC_BlockSparseMLP::run_bszN` upstream. Built on `exl3_gemv_kernel.cuh`
   (PTX GEMV), so it needs a re-derivation, not an include swap. **Not ported.**
   `rocm/quant/exl3_moe_coop_rdna.hip` stubs the entry points; `rocm_py` keeps
-  `block_sparse_mlp.forward` off that route (`EXL3_ROCM_MOE_BSZN`), so bsz ≤ 8 MoE
-  decode runs the fused `exl3_moe` kernel. This is the largest open item of the
-  v1.5.0 sync: upstream removed the mgemm decode route this port used at v1.4.4.
+  `block_sparse_mlp.forward` off that route (`EXL3_ROCM_MOE_BSZN`) and runs bsz ≤ 8
+  MoE decode through the per-token `exl3_mgemm` route upstream had at v1.4.4
+  (three calls per token, each on the mgemv fast path). Same fp32 accuracy as the
+  fused kernel and twice its decode speed (RDNA_NOTES, "MoE decode route restored").
 
 ## LDS budget on non-Strix RDNA parts
 
