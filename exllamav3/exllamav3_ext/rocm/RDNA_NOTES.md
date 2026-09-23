@@ -1024,7 +1024,7 @@ toolchain. **Superseded:** it has since been built and validated on gfx1151; see
 |---|---|---|
 | `exl3_mgemm` sliced mode | New `n_stride_list` / `had_src_list` / `num_had_src` args; per-source input Hadamard, strided B/C rows (`SlicedMultiLinear`, used for one-launch Q/K/V decode) | Mirrored into `exl3_gemm_kernel_rdna.hip.h` and `exl3_gemm_inner_rdna.hip.h` (`size_n_stride`, `blocks_n_full`). The m == 1 mgemv shortcut is bypassed in sliced mode. **Python keeps it off** (`EXL3_ROCM_QKV_SLICE=1` to test): the v1.4.4 pairwise bundles are the validated path. |
 | Fused MoE (`exl3_moe`) | `count_lo`/`count_hi` expert tiers, `output_scratch`/`fused_base` deterministic slots + `exl3_moe_gather` (on by default: `EXL3_MOE_FUSED_DET`), 32/64-row tile instances (mul1) | Tiers and scratch path applied verbatim (they are addressing, not tensor-core work). 32/64-row tiles **fall back to the 16-row instance** over the same expert range -- identical numerics. `rocm_py` sets `MTILE=False` so Python issues one launch, not three. |
-| MoE decode (bsz <= 8) | `BC_BlockSparseMLP::run_bszN` now calls `exl3_moe_coop` (PTX GEMV based); the three-mgemm graph route is gone | Stub + `rocm_py` reroute to the fused `exl3_moe` kernel (`EXL3_ROCM_MOE_BSZN`). Correct per the 2026-08-08 fp32 comparison, slower than the removed mgemm route. **Porting `exl3_moe_coop` is the decode-throughput item.** |
+| MoE decode (bsz <= 8) | `BC_BlockSparseMLP::run_bszN` now calls `exl3_moe_coop` (PTX GEMV based); the three-mgemm graph route is gone | Stub; `rocm_py` reinstates the v1.4.4 per-token `exl3_mgemm` route (2026-09-23, see "MoE decode route restored" below). The fused-`exl3_moe` steer remains behind `EXL3_ROCM_MOE_MGEMM_ROUTE=0`. |
 | Batched expert reconstruct | `reconstruct_had_batch` / `reconstruct_batch` (blockIdx.z over a pointer table), `hgemm_batched` (`cublasGemmStridedBatchedEx`), `had_r_128_batch` | Batch kernels applied to `reconstruct_rdna.hip` (same tile body); shim maps the strided-batched hipBLAS call. **Python keeps the tier off** (`EXL3_ROCM_BATCH_RECON=1` to test). |
 | `hgemm_f16acc` | fp16-accumulate MMA GEMM for GeForce | Stub; `hgemm_recon` = `hgemm`. RDNA has no fp32-accumulate rate penalty, so nothing is lost. |
 | Quantizer | Tile length 160 (n-gram rows), block geometry per K, `quantize_tiles_scratch`, sm_120 "optimized" specialisations with a codebook LUT | `quantize_tiles_kernel_rdna.hip.h` regenerated (include swap only); instance files gain the `bool optimized` parameter and `_l160` getters; `quantize_tiles_use_optimized()` is hard `false` and the LUT code is dropped. Note `__CUDA_ARCH__` is 1 under the shim, so `qt_num_threads` takes the `arch < 1000` branch in both passes. |
@@ -1139,3 +1139,59 @@ reproduced here on ALL THREE stacks with no stop ids: Laguna ends turns with
 only on the tokenizer's EOS runs past the finished answer and repeats it
 verbatim (rep4 0.51-0.55 by turn 6). It was a client stop-token gap, not
 graphs. exl3_server already unions `eos_token_id_list` with `eos_token_id`.
+
+## MoE decode route restored (2026-09-23): 10.4 -> 21.1 t/s on Laguna
+
+`bench_model.py` on Laguna-S-2.1 4.03bpw (MoE, 256 experts top-10, shared
+expert), `-p 512 2048 -n 128 -r 4`, system 7.2.4: decode **10.4 t/s** with the
+v1.5.0-sync steer (bsz <= 8 through the fused `exl3_moe` kernel) against the
+**20.8** recorded at v1.4.4 on the same model and tool. "Benchmarks
+deliberately not taken" at the sync hid a 2x regression on every MoE model's
+decode; dense models were unaffected. ROCm 10.0 measured the same 10.6 with
+graphs on or off, so the runtime was never the variable.
+
+Why: `exl3_moe` is a 16-row WMMA tile GEMM. At bsz 1 each expert has one
+useful row, so fifteen sixteenths of every tile is padding and the kernel
+runs at the flat ~53 GB/s the tile path always shows, plus the argsort/bincount
+host syncs the fused path pays per layer. Upstream's v1.4.4 route ran three
+`exl3_mgemm` calls per token (gate, up, down-with-weights), each num_tokens
+== 1, and on RDNA every one of those lands on the mgemv fast path
+(`exl3_mgemv_try_launch`: barrier-free dot core, weights streamed once,
+120-240 GB/s). v1.5.0 deleted that route for `exl3_moe_coop`, which is not
+ported.
+
+Fix (`rocm_py`, no upstream edit, no kernel change): for the duration of
+`BlockSparseMLP.forward`, `self.bc` is a proxy whose `run_bszN` is the v1.4.4
+loop written into `experts_cfg.out_bszn[i]` (what the bszN branch reads
+back); every other attribute forwards to the real `BC_BlockSparseMLP`.
+`bc_sh_exp` is forced False after `load_local` so the forward tail runs the
+Python shared-expert path (the fused kernel merged it in-kernel). Expert-range
+shards pass `cfg.min_expert / max_expert` as `run_bszN` does.
+
+Validated: route vs fp32 reference at bsz 1 / 3 / 8 over two layers
+(`route_ref32` on top of `moe_ref32.py`): relmean 0.02-0.10%, identical to
+the fused kernel's error at every point. Six-turn `chat_probe.py` coherent.
+Decode **21.1 t/s**, prefill unchanged (192 / 314 t/s). Switches:
+`EXL3_ROCM_MOE_MGEMM_ROUTE=0` restores the fused steer; `EXL3_ROCM_MOE_BSZN=1`
+leaves upstream dispatch alone (raises in the stub). Porting `exl3_moe_coop`
+is no longer the decode item; it would have to beat the mgemv path to matter.
+
+`profile_decode.py` (24 tokens, Kineto) confirms the dispatch: with the route
+the top kernel is `exl3_mgemv_dot_kernel_splitk<4,false,2,8>` (3408 calls =
+3 per MoE layer per token, 231 ms) and no `exl3_moe_kernel` runs at all; with
+`EXL3_ROCM_MOE_MGEMM_ROUTE=0` `exl3_moe_kernel<4,256,2,16>` is 1382 ms =
+66.6% of GPU time (1.22 ms per layer vs ~0.34 ms for the route's three calls)
+plus a per-layer `hipMemcpyWithStream` readback sync (274 ms host). Two leads
+the same profile exposes, both independent of the MoE route:
+- Host launch cost is now the limiter: ~1720 launches/token, GPU idle 36% of
+  wall under the profiler (~20% unprofiled, from 21.1 t/s vs 38 ms/token of
+  kernel time). The route issues ~9 launches per MoE layer; on a runtime with
+  working graphs (ROCm 10, branch `rocm-10`) capturing the per-layer loop into
+  a torch CUDA graph (static buffers already exist: yh / interm_* / out_d /
+  bcast_sel_bsz1) would collapse them to one replay. First concrete ROCm 10
+  item.
+- `Cijk_Ailk_Bljk_HHS_BH_MT128x128x32...` (rocBLAS/hipBLASLt HGEMM, 128x128
+  tile) costs 134 ms = 15% of decode GPU time, once per layer per token, in
+  BOTH profiles: an unquantized linear is going through hgemm at m == 1 on a
+  tile kernel. Identify the caller; a GEMV-shaped path would recover most of
+  it.
