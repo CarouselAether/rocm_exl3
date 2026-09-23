@@ -108,6 +108,7 @@ def apply() -> list[str]:
 
     applied: list[str] = []
 
+
     # ------------------------------------------------------------------
     # arch_list: hipcc takes PYTORCH_ROCM_ARCH, not TORCH_CUDA_ARCH_LIST
     # ------------------------------------------------------------------

@@ -1,34 +1,34 @@
 // =============================================================================
-// hgemm_rdna.hip -- hgemm sibling for ROCm: narrow-output GEMV fast path
+// hgemm_rdna.hip -- hgemm sibling for ROCm: narrow-output GEMV kernel at m <= 8
 // =============================================================================
 //
 // Generated from hgemm.cu (which stays byte-identical to upstream; setup.py
 // excludes it from the ROCm build in favor of this file). The diff against
-// upstream is confined to hgemm_narrow_try() and its one call site at the top
-// of hgemm_gemmex_impl(); everything else is a verbatim copy so the file can be
-// regenerated mechanically on rebase and audited by diff.
+// upstream is confined to the two kernels and hgemm_narrow_try() below plus its
+// one call site at the top of hgemm_gemmex_impl(); everything else is a verbatim
+// copy so the file can be regenerated mechanically on rebase and audited by diff.
 //
-// WHY (measured 2026-09-23, gfx1151, ROCm 7.2.4, Laguna-S-2.1 4bpw decode):
-// BC_Attention runs the headwise attention gate through hgemm_gr once per
-// layer per token: a (1 x 3072) @ (3072 x 48) fp16 product. hipBLASLt answers
-// that with a 128x128 WMMA tile kernel (Cijk_..._MT128x128x32_MI16x16x16) at
-// ~56 us unprofiled / 116 us profiled per call -- ~50x the bandwidth bound of
-// a 295 KB matrix -- and 48 layers made it ~15% of profiled decode GPU time.
-// Measured at that shape: torch.mv on an fp32 copy 8 us (m == 1); broadcast
-// multiply + fp32 sum 15-30 us (m == 2..8); the fp16 GEMM is flat ~56 us from
-// m == 1 to 8. Wide outputs are NOT affected (a 3072 x 6144 fp16 product at
-// m == 1 runs at 159 GB/s on the same GEMM path), so only narrow N is steered.
+// WHY (measured 2026-09-23, gfx1151, rocm_tools/hgemm_narrow_probe.py):
+// BC_Attention runs the headwise attention gate through hgemm_gr once per layer
+// per token: a (1 x 3072) @ (3072 x 48) fp16 product. Through hipblasGemmEx,
+// rocBLAS's legacy kernels answer it with ONE 128x128 tile workgroup walking K
+// serially: ~63-74 us for a 295 KB matrix, ~50x its bandwidth bound, and 48
+// layers made it 15% of Laguna's decode GPU time. Wide products are fine on the
+// same path (N = 12288 at m == 1 streams at ~200 GB/s), so the pathology is
+// narrow N, and it is rocBLAS's kernel selection: ROCBLAS_USE_HIPBLASLT=1 fixes
+// the narrow shapes (10-22 us) but costs prefill 13-17% (hipBLASLt loses to
+// rocBLAS at m >= 128 and at wide N on this part), and there is no per-call
+// backend switch. A plain HIP GEMV for the one bad regime is the fix that
+// leaves everything else on rocBLAS: two kernel launches, split-K partials
+// into the DevCtx workspace then a reduce into C, no allocations -- so it is
+// also safe inside HIP graph capture, where the ATen-based attempt could not
+// go and where the captured gate node otherwise stays on the slow kernel.
 //
-// The fast path is taken only when no stream capture is active on the target
-// stream: under HIP graph capture (ROCm 10 with graphs on) the ATen ops here
-// would allocate through the caching allocator mid-capture, which is the
-// allocator-state-in-graph interaction graph_rdna.hip's header describes, so a
-// captured BC step keeps the cuBLAS node. EXL3_RDNA_HGEMM_NARROW_N sets the N
-// cutoff (default 512; 0 disables).
+// Regime: m <= HGEMM_NARROW_MAX_M (8) and N <= HGEMM_NARROW_MAX_N (256), any K,
+// fp16 or fp32 C. EXL3_RDNA_HGEMM_NARROW_N overrides the N cutoff (0 disables).
 // =============================================================================
 
 #include <cuda_fp16.h>
-#include <ATen/ATen.h>          // ROCm sibling: at::mv and tensor arithmetic for the narrow path
 #include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -47,47 +47,139 @@ Row-major matmul using cuBLAS, a @ b -> c
 using bfloat16 = __nv_bfloat16;
 
 
-// ROCm sibling: narrow-output GEMV path (see file header). Returns true when it
-// handled the product.
+// ---------------------------------------------------------------------------
+// ROCm sibling: narrow-output GEMV (see file header)
+// ---------------------------------------------------------------------------
+#define HGEMM_NARROW_MAX_M 8
+#define HGEMM_NARROW_MAX_N 256
+#define HGEMM_NARROW_THREADS 256
+#define HGEMM_NARROW_MAX_SPLITS 64
+#define HGEMM_NARROW_MIN_K_PER_SPLIT 64
+
+// Stage 1, one block per K-split: thread t owns column (t % n) and row-lane (t / n);
+// the lanes stride over the split's rows and are reduced through LDS. A is tiny (m x K)
+// and every thread of a lane group reads the same element, a broadcast load.
+__global__ void hgemm_narrow_partial_kernel
+(
+    const half* __restrict__ a,
+    const half* __restrict__ b,
+    float* __restrict__ ws,
+    int size_m,
+    int size_k,
+    int size_n,
+    int k_per_split
+)
+{
+    __shared__ float red[HGEMM_NARROW_MAX_M][HGEMM_NARROW_THREADS];
+    const int split = blockIdx.x;
+    const int k0 = split * k_per_split;
+    const int k1 = min(size_k, k0 + k_per_split);
+    const int lanes = HGEMM_NARROW_THREADS / size_n;
+    const int t = threadIdx.x;
+    const int col = t % size_n;
+    const int lane = t / size_n;
+
+    float acc[HGEMM_NARROW_MAX_M];
+    #pragma unroll
+    for (int r = 0; r < HGEMM_NARROW_MAX_M; ++r) acc[r] = 0.0f;
+
+    if (lane < lanes)
+    {
+        for (int k = k0 + lane; k < k1; k += lanes)
+        {
+            float bv = __half2float(b[(int64_t) k * size_n + col]);
+            #pragma unroll
+            for (int r = 0; r < HGEMM_NARROW_MAX_M; ++r)
+                if (r < size_m) acc[r] += __half2float(a[(int64_t) r * size_k + k]) * bv;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < HGEMM_NARROW_MAX_M; ++r) red[r][t] = acc[r];
+    __syncthreads();
+
+    if (t < size_n)
+    {
+        for (int r = 0; r < size_m; ++r)
+        {
+            float s = 0.0f;
+            for (int l = 0; l < lanes; ++l) s += red[r][l * size_n + t];
+            ws[((int64_t) split * size_m + r) * size_n + t] = s;
+        }
+    }
+}
+
+__device__ __forceinline__ void hgemm_narrow_store(half* c, float v) { *c = __float2half(v); }
+__device__ __forceinline__ void hgemm_narrow_store(float* c, float v) { *c = v; }
+
+// Stage 2: sum the split partials and write C with its row stride, in its dtype
+template <typename T>
+__global__ void hgemm_narrow_reduce_kernel
+(
+    const float* __restrict__ ws,
+    T* __restrict__ c,
+    int size_m,
+    int size_n,
+    int splits,
+    int64_t c_stride_m
+)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= size_m * size_n) return;
+    const int r = i / size_n;
+    const int col = i % size_n;
+    float s = 0.0f;
+    for (int sp = 0; sp < splits; ++sp) s += ws[((int64_t) sp * size_m + r) * size_n + col];
+    hgemm_narrow_store(c + (int64_t) r * c_stride_m + col, s);
+}
+
 static int hgemm_narrow_n_cutoff()
 {
     static int v = -1;
     if (v < 0)
     {
         const char* e = getenv("EXL3_RDNA_HGEMM_NARROW_N");
-        v = e && *e ? atoi(e) : 512;
+        v = (e && *e) ? atoi(e) : HGEMM_NARROW_MAX_N;
         if (v < 0) v = 0;
+        if (v > HGEMM_NARROW_MAX_N) v = HGEMM_NARROW_MAX_N;
     }
     return v;
 }
 
 static bool hgemm_narrow_try
 (
-    const at::Tensor& a,
-    const at::Tensor& b,
-    at::Tensor& c,
+    const half* a_ptr,
+    const half* b_ptr,
+    void* c_ptr,
+    bool output_fp32,
     int size_m,
     int size_k,
     int size_n,
+    int64_t c_stride_m,
+    int device,
     cudaStream_t stream
 )
 {
     int cutoff = hgemm_narrow_n_cutoff();
-    if (cutoff <= 0 || size_m < 1 || size_m > 8 || size_n > cutoff) return false;
-    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
-    if (hipStreamIsCapturing(stream, &cs) != hipSuccess || cs != hipStreamCaptureStatusNone) return false;
+    if (cutoff <= 0 || size_m < 1 || size_m > HGEMM_NARROW_MAX_M || size_n < 1 || size_n > cutoff) return false;
+    if (size_k < 1) return false;
 
-    // Run the ATen ops on the caller's stream (hgemm_gr passes the graph's capture stream,
-    // which in passthrough mode is the current torch stream anyway)
-    at::cuda::CUDAStreamGuard sg(at::cuda::getStreamFromExternal(stream, a.device().index()));
-    at::Tensor a2 = a.reshape({size_m, size_k}).to(at::kFloat);          // (m, k)
-    at::Tensor bt = b.t().contiguous().to(at::kFloat);                    // (n, k)
-    at::Tensor y;
-    if (size_m == 1)
-        y = at::mv(bt, a2[0]).unsqueeze(0);                               // (1, n)
+    int k_per_split = MAX(HGEMM_NARROW_MIN_K_PER_SPLIT, CEIL_DIVIDE(size_k, HGEMM_NARROW_MAX_SPLITS));
+    int splits = CEIL_DIVIDE(size_k, k_per_split);
+    float* ws = (float*) DevCtx::instance().get_ws(device);
+    if (!ws || (size_t) splits * size_m * size_n * sizeof(float) > (size_t) WORKSPACE_SIZE) return false;
+
+    hgemm_narrow_partial_kernel<<<splits, HGEMM_NARROW_THREADS, 0, stream>>>
+        (a_ptr, b_ptr, ws, size_m, size_k, size_n, k_per_split);
+
+    int outputs = size_m * size_n;
+    int blocks = CEIL_DIVIDE(outputs, HGEMM_NARROW_THREADS);
+    if (output_fp32)
+        hgemm_narrow_reduce_kernel<float><<<blocks, HGEMM_NARROW_THREADS, 0, stream>>>
+            (ws, (float*) c_ptr, size_m, size_n, splits, c_stride_m);
     else
-        y = (a2.unsqueeze(1) * bt).sum(-1);                               // (m, n)
-    c.copy_(y.to(c.scalar_type()).view(c.sizes()));
+        hgemm_narrow_reduce_kernel<half><<<blocks, HGEMM_NARROW_THREADS, 0, stream>>>
+            (ws, (half*) c_ptr, size_m, size_n, splits, c_stride_m);
+    cuda_check(cudaPeekAtLastError());
     return true;
 }
 
@@ -125,8 +217,10 @@ static void hgemm_gemmex_impl
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
 
-    // ROCm sibling: narrow outputs at small m go to an fp32 GEMV (see file header)
-    if (hgemm_narrow_try(a, b, c, size_m, size_k, size_n, stream)) return;
+    // ROCm sibling: narrow outputs at small m run the GEMV kernels above (see file header)
+    if (hgemm_narrow_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m,
+                         a.device().index(), stream))
+        return;
 
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
