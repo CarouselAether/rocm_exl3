@@ -448,8 +448,13 @@ class HIPBuildExtension(build_ext):
             sysconfig.get_path("include"),
         )]
 
+        # torch >= 2.14 headers use C++20 `requires` clauses and torch's own
+        # cpp_extension passes -std=c++20; older torch headers compile fine
+        # under c++20 too (ROCm clang is 17+), so track torch's requirement.
+        torch_mm = tuple(int(x) for x in _torch_mod.__version__.split("+")[0].split(".")[:2])
+        cxx_std = "-std=c++20" if torch_mm >= (2, 14) else "-std=c++17"
         common = [
-            "-fPIC", "-std=c++17",
+            "-fPIC", cxx_std,
             "-O0" if ext_debug else "-O3",
             # attention.cu uses C++17-deprecated `register`; hipcc errors by default
             "-Wno-register",

@@ -656,6 +656,53 @@ The traps, for the next attempt:
    (bounded leak — kernels are cached per shape). Needed only if the stack
    ever moves to triton >= 3.6; the 7.2-era triton does not unload.
 
+### 7.14 retest (2026-08-27): stack works, graphs work, still no benefit
+
+The 2026-08-17 NO-GO (self-consistent 7.14.0a SDK segfaulting in rocr
+GpuAgent::InitDma at hsa_init on this kernel) is obsolete. PyTorch nightly
+now ships `torch 2.15.0.dev+rocm7.14` manylinux wheels that DEPEND on
+AMD's TheRock wheels directly — `rocm-sdk-core 7.14.0` **final** plus
+per-arch device packages including gfx1151 — and that release runtime
+initializes fine on the same kernel the June alpha crashed. Stack under
+test: `.venv714` (torch nightly, runtime) + `venv714sdk`
+(`rocm-sdk-devel 7.14.0a20260624`, hipcc only; no final devel wheel is
+published) + the `rocm_exl3_714` worktree.
+
+Findings, in test order: hsa_init gate PASS (matmul, gfx1151 in the
+wheel's arch list); all four graphpatch checks PASS (graph_order 0/300
+violations, kernel-node / module-node / multi-node patching effective);
+EXL3_ROCM_HIP_GRAPHS=1 coherent on Laguna and GLM-4.6V through single-
+and multi-job generation — the 7.2.x capture hang, "Graph update failed"
+and cross-job BC corruption are all absent; mgemv_check full PASS
+(masked-2tok bitwise); decode A/B **flat everywhere** (Laguna 20.9/20.8,
+Gemma 7.8/7.8, DS4 15.6/15.7 — and statistically identical to system
+7.2.4). Same verdict as 7.13: **stay on system 7.2.4 for production.**
+Graphs stay passthrough-off: correct now, but the mgemv-fast-path decode
+no longer contains the route they accelerated.
+
+Trap status on 7.14, numbered as above: (2) FIXED — the cooperative-groups
+header now carries `__forceinline__`, no patch needed. (3) mutated and is
+FIXED IN CODE: torch 2.15 loads its bundled runtime RTLD_LOCAL, so
+CudaDrv's `dlopen(nullptr)` probe misses it and the named fallback loaded
+the SYSTEM 7.2.4 runtime as a mismatched second instance ("CUDA driver
+error" at every TritonKernel module load). `cuda_drv_rdna.cpp` now tries
+`dlopen("libamdhip64.so.7", RTLD_NOLOAD)` — the already-mapped instance by
+soname — before any filesystem search. (4) did not fire: BC kernels
+compile eagerly before any capture, so the triton-3.6 destructor runs
+outside capture; keep the workaround note if lazy compilation ever moves
+inside. New traps: (5) torch >= 2.14 headers need `-std=c++20`
+(`requires` clauses in TensorBase.h); setup.py now picks the standard from
+the torch version — with a real version parse, since `"2.9" >= "2.14"` is
+lexicographically true. (6) `requirements_rocm.txt`'s `triton-rocm` pin
+CLOBBERS pytorch-triton-rocm on a pytorch-index stack — both own the
+`triton/` import path and the mix imports as a chimera; on such stacks
+install requirements minus triton, then reinstall the exact
+`pytorch-triton-rocm` the nightly pins. (7) the devel SDK's lib/
+dev-symlinks resolve into `../../_rocm_sdk_libraries/`, which torch's venv
+owns, not the SDK venv — symlink `_rocm_sdk_libraries` into the SDK venv's
+site-packages (also means the ext links exactly the libs that run) or the
+link fails with "unable to find -lrocblas/-lhipblas/-lhiprand".
+
 ## Syncing to a new upstream release
 
 Every sibling is derived from exactly one upstream file. Before deciding how to
@@ -893,11 +940,75 @@ What is PROVEN vs SUSPECTED, so nobody re-litigates the wrong part:
 - ROCm 7.14 reworked graph replay ("allocation nodes no longer block during
   replay; physical memory reused across nodes instead of mapped/unmapped per
   launch") — the right neighborhood for the suspected allocator interaction.
-  Untestable here as of 2026-08-15: Linux gfx1151 torch pairings stop at
-  rocm7.13 nightlies, and preloading the 7.14.0a runtime libs over the 7.2.4
-  driver stack segfaults in rocr GpuAgent::InitDma at hsa_init. When a Linux
-  7.14 pairing ships: run stream_wedge_check + the graph checks first, then
-  A/B EXL3_ROCM_HIP_GRAPHS=1 on real multi-turn chat.
+  **TESTED 2026-08-27 — graphs WORK on 7.14, but buy nothing.** See "ROCm
+  wheel stack" above for the stack and findings. On torch nightly
+  2.15+rocm7.14 (final 7.14.0 runtime, hsa_init fine on this kernel): all
+  four graphpatch checks pass, EXL3_ROCM_HIP_GRAPHS=1 runs Laguna and
+  GLM-4.6V through single and multi-job generation coherently — no capture
+  hang, no "Graph update failed", no cross-job corruption. Decode A/B is
+  flat on all three models (20.9/20.8, 7.8/7.8, 15.6/15.7): the Aug-13
+  decode work (mgemv fast path, width lists) removed the graph-dependent
+  cooperative route from decode, so the −15% passthrough penalty this flag
+  once recovered no longer exists. Graphs stay off by default; the flag is
+  now known-safe on 7.14-class runtimes should a path that benefits return.
+  WHY flat, PROVEN by Kineto trace (2026-08-27, Laguna, 31 decode tokens
+  on the 7.14 stack; scratch tool `gap_profile.py`, built on
+  profile_decode's 1-token-prompt method): decode launches ~1953 kernels
+  per token (the gemv/mgemv had_in + dot + had_out triplets are ~800 of
+  them). Graphs-ON collapses the HOST side exactly as designed — 53,351
+  hipLaunchKernel calls fall to 7,595 plus 2,976 hipGraphLaunch replays
+  (~96/token, param patching visible as hipGraphExecKernelNodeSetParams)
+  — yet the DEVICE timeline is identical in both traces: same 2.1us
+  median inter-kernel gap, same ~10%-of-span idle under the profiler,
+  same busy time. Conclusion: that 2.1us gap is the command processor's
+  per-dispatch latency between dependent kernels, which graph replay on
+  ROCm does not remove; the host was never the bottleneck (async
+  submission, GPU 100% busy via rocm-smi). The recoverable overhead is
+  reachable only by launching FEWER kernels (fusing the had/dot/had
+  triplet, batching expert slots), not by replaying the same kernels
+  from a graph — that dispatch-gap budget (~4ms/token profiled, less
+  unprofiled; A/B bounds it under 0.5% real) belongs to the mgemv
+  split-K/fusion arc. Cross-model (same tool, 31 tokens, profiled):
+  launches/token 1953 Laguna / 1622 Gemma / 2172 DS4; dispatch-gap
+  3.5-5.2 ms/token everywhere, but as % of span it is 10.0 / 2.9 / 7.8 —
+  fusion pays most on fast MoE tokens, least on big dense.
+  RESOLVED (2026-08-28), DS4 per-layer stall: 1271 big gaps (~41/token,
+  once per layer, ~100-500us each, ~5 ms/token ≈ 8%) sat between
+  dsv4_compress_store and _dsa_attn_split — SAME stream (tid 1), next
+  kernel already enqueued (host parked in one ~60 ms hipDeviceSynchronize
+  per token), so a DEVICE-side dispatch stall, unaffected by
+  EXL3_ROCM_HIP_GRAPHS (1369 vs 1374 gaps A/B). Root cause confirmed by
+  compile inspection: _dsa_attn_split_kernel at upstream's CUDA tuning
+  (BLOCK_H=16, num_warps=4) sits at the 256-VGPR ceiling with 2050 VGPR
+  spills and 5332 B/item scratch — the only scratch user in the decode
+  stream, so every layer's dispatch after scratch-free kernels pays the
+  queue's scratch reconfiguration. 16-variant compile sweep
+  (scratch tracks spills; none reach zero — residual ~130 at w16/H4/N16):
+  BLOCK_H=8 + num_warps=8 (BLOCK_N untouched) is the bench winner —
+  spills 438, scratch 1756 B, big gaps 1369 -> 45, decode 15.6 -> 17.8
+  t/s on the 7.14 stack and 15.9 -> 17.9 on system 7.2.4 (+13-14%).
+  Deeper-spill variants bench WORSE (H4/w16 14.9, H4/w8 17.0): past the
+  stall threshold, tile shape matters more than residual spills. Shipped
+  as the EXL3_ROCM_DSA_TUNE rocm_py patch (default on; =0 restores
+  upstream tuning): bc_dsa.BLOCK_H=8 via module attr + num_warps=8 via a
+  _compile_kernel wrapper keyed on the kernel name, rebound in bc_attn,
+  bc_dsa AND bc_mla (each holds its own from-import reference). bc_mla's
+  DSA-on-MLA (GLM 5.2) hardcodes a local BLOCK_H=16, so it gets only the
+  warps half (~1428 spills) — no model small enough to test here anyway.
+  Watch item: tests/test_mla_dsa.py::test_dsa_selection[300] failed ONCE
+  ("row 2..." assertion) on the first tuned full-suite run, then passed 5
+  consecutive full-suite runs and in isolation; baseline also clean.
+  Unreproduced — if it recurs, bisect with EXL3_ROCM_DSA_TUNE=0 first.
+  Tools: spill sweep = scratchpad dsa_sweep.py pattern (triton.compile
+  interception, parse .vgpr_spill_count / .private_segment_fixed_size
+  from ck.asm["amdgcn"]); gap evidence = rocm_tools/gap_profile.py. The "-15% decode without graphs" recorded
+  2026-08-15 does NOT reproduce today on either stack (system 7.2.4
+  graphs-off matches historical graphs-on numbers exactly); treat it as
+  stale — most plausibly it amortized the cooperative kernel's
+  per-launch setup in a configuration the mgemv fast path had already
+  made obsolete, or it was first-run-high measurement noise. stream_wedge_check itself was deliberately NOT run
+  (machine-wedge risk; user's call) — the graphpatch ladder was accepted
+  as the gating evidence.
 
 ## v1.5.0 sync (2026-09-20) -- what changed under the siblings, and what is unverified
 
