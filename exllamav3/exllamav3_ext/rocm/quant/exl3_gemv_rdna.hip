@@ -73,6 +73,16 @@ bool exl3_gemv_splitk_enabled()
 // EXL3_GEMV_LDS = 1 pins the LDS dot-tile core in every GEMV form -- the A/B
 // and kill switch for the barrier-free core (exl3_gemv_dot_tile_direct).
 // Re-read per call; graph captures bake the value read at capture time.
+// EXL3_GEMV_FUSE_OUT=0 keeps the fused dot kernels' epilogue to the plain
+// store and launches the separate output-rotation (and, multi-matrix,
+// reduction) kernels. Re-read per call; shared with exl3_mgemv_rdna.hip.
+bool exl3_gemv_fuse_out_enabled()
+{
+    const char* env = std::getenv("EXL3_GEMV_FUSE_OUT");
+    if (!env) return true;
+    return atoi(env) != 0;
+}
+
 bool exl3_gemv_lds_core()
 {
     const char* env = std::getenv("EXL3_GEMV_LDS");
@@ -461,11 +471,19 @@ void exl3_gemv
 // original plan for this work item) would leave the later copies stale; the
 // republish is what makes a multi-kernel node sequence patchable at all.
 //
-// This path requires all three transform tensors (suh, A_had, svh): with them
-// present the kernel count is fixed at three, so the site group always lands
-// on the prologue. EXL3 quant linears always carry su/sv, so nothing real is
-// excluded. Kill switch: EXL3_GEMV_GRAPH=0 (the routing site also honours
-// EXL3_GEMV=0/1/2 exactly like the non-graph path).
+// This path requires all three transform tensors (suh, A_had, svh). EXL3
+// quant linears always carry su/sv, so nothing real is excluded. Kill switch:
+// EXL3_GEMV_GRAPH=0 (the routing site also honours EXL3_GEMV=0/1/2 exactly
+// like the non-graph path).
+//
+// Since the launch-count fusion (2026-09-23, see the kernels below) the
+// prologue kernel is gone: the dot kernel itself hosts the six patch sites,
+// rotates the input in its prologue and the output in its epilogue, so this
+// path is ONE launch per call. The parameter block survives for the fallback
+// output kernel (EXL3_GEMV_FUSE_OUT=0) and for the epilogue's arrival
+// counters. The paragraph above describes the three-kernel form the fusion
+// replaced; the patch-site reasoning in it still holds, with "the dot kernel"
+// for "the prologue".
 
 static bool exl3_gemv_graph_enabled()
 {
@@ -494,6 +512,13 @@ static Exl3GemvGraphParams* exl3_gemv_graph_param_block(int device, bool allow_a
             (void) cudaGetLastError();
             return nullptr;
         }
+        // The fused epilogue's arrival counters must start at zero
+        if (cudaMemset(p, 0, sizeof(Exl3GemvGraphParams)) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            cudaFree(p);
+            return nullptr;
+        }
         blocks[device] = (Exl3GemvGraphParams*) p;
     }
     return blocks[device];
@@ -504,22 +529,39 @@ static void exl3_gemv_graph_prewarm(int device)
     (void) exl3_gemv_graph_param_block(device, true);
 }
 
-// Prologue: argument order 0-5 is load-bearing -- these indices are the graph
-// patch sites, recorded in the cooperative kernel's order so the upstream
-// callers' params subsequences match. B, C and svh take no part in this
-// kernel's own math.
+// Launch-count fusion (2026-09-23; the design is written up in
+// exl3_mgemv_rdna.hip under the same heading, and the helpers live in
+// exl3_gemv_kernel_rdna.hip.h). The input rotation used to be its own kernel
+// (exl3_gemv_graph_had_in_kernel, which also hosted the six graph patch
+// sites) and the output rotation another; both are now the dot kernel's
+// prologue and epilogue, so a dense linear at m == 1 is one launch instead
+// of three. The dot kernel therefore takes the six patchable pointers as its
+// first six arguments -- order 0-5 is load-bearing, recorded in the
+// cooperative kernel's order so the upstream callers' params subsequences
+// match -- and republishes C and svh to the parameter block for the fallback
+// output kernel (EXL3_GEMV_FUSE_OUT=0). B, C and svh take no part in the
+// prologue's own math; A_had is neither read nor written any more.
+//
+// Every early exit before the __syncthreads that publishes the rotated input
+// is block-uniform; the single-warp form's per-warp tile exit comes after it.
+
+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
 static __global__
-__launch_bounds__(256)
-void exl3_gemv_graph_had_in_kernel
+__launch_bounds__(WARPS_PER_BLOCK * 32)
+__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+void exl3_gemv_graph_dot_kernel
 (
     const half* __restrict__ A,        // 0: GP_gemm_A
-    const uint16_t* __restrict__ B,    // 1: GP_gemm_B_trellis (patch host only)
-    void* __restrict__ C,              // 2: GP_gemm_C (patch host only)
+    const uint16_t* __restrict__ B,    // 1: GP_gemm_B_trellis
+    void* __restrict__ C,              // 2: GP_gemm_C
     const half* __restrict__ suh,      // 3: GP_gemm_B_suh
-    half* __restrict__ A_had,          // 4: GP_gemm_A_had
-    const half* __restrict__ svh,      // 5: GP_gemm_B_svh (patch host only)
+    half* __restrict__ A_had,          // 4: GP_gemm_A_had (patch host only)
+    const half* __restrict__ svh,      // 5: GP_gemm_B_svh
     Exl3GemvGraphParams* __restrict__ pb,
-    const int size_k
+    const int size_k,
+    const int size_n,
+    const bool lds_core,
+    const bool fuse_out
 )
 {
     if (blockIdx.x == 0 && threadIdx.x == 0)
@@ -530,61 +572,48 @@ void exl3_gemv_graph_had_in_kernel
         pb->svh = svh;
     }
 
-    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    if (warp_id >= size_k / 128) return;
-    int offset = warp_id * 128;
-    had_hf_r_128_inner<true, false>
-    (
-        A + offset,
-        A_had + offset,
-        suh + offset,
-        0.088388347648f  // 1/sqrt(128)
-    );
-}
-
-template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
-static __global__
-__launch_bounds__(WARPS_PER_BLOCK * 32)
-__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
-void exl3_gemv_graph_dot_kernel
-(
-    const Exl3GemvGraphParams* __restrict__ pb,
-    const int size_k,
-    const int size_n,
-    const bool lds_core
-)
-{
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     const int n_tiles = size_n / 16;
-    if (tile_n >= n_tiles) return;
 
     extern __shared__ char shared_mem[];
     constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
     half* sh_b_dq = (half*) shared_mem;
     uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
+    half* sh_a = (half*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
+
+    exl3_gemv_rotate_in<WARPS_PER_BLOCK>(A, suh, sh_a, size_k, warp_id, lane);
+    __syncthreads();
+
+    const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    if (tile_n >= n_tiles) return;
 
     float accum = lds_core
         ? exl3_gemv_dot_tile<bits, cb>
           (
-              pb->A_had, pb->B, size_k, n_tiles, tile_n, lane, my_sh_b,
+              sh_a, B, size_k, n_tiles, tile_n, lane, my_sh_b,
               my_sh_b_quant, 0, size_k / 16
           )
         : exl3_gemv_dot_tile_direct<bits, cb>
           (
-              pb->A_had, pb->B, n_tiles, tile_n, lane, 0, size_k / 16
+              sh_a, B, n_tiles, tile_n, lane, 0, size_k / 16
           );
 
-    if (lane < 16)
+    if (fuse_out)
+        exl3_gemv_fused_epilogue<c_fp32>
+        (
+            accum, C, 0, size_n, tile_n, lane, svh, 0.088388347648f,  // 1/sqrt(128)
+            pb->seg_counters + tile_n / 8, nullptr, 0, 1
+        );
+    else if (lane < 16)
     {
         const int out_idx = tile_n * 16 + lane;
         if constexpr (c_fp32)
-            ((float*) pb->C)[out_idx] = accum;
+            ((float*) C)[out_idx] = accum;
         else
-            ((half*) pb->C)[out_idx] = __float2half(accum);
+            ((half*) C)[out_idx] = __float2half(accum);
     }
 }
 
@@ -594,12 +623,27 @@ __launch_bounds__(WARPS_PER_BLOCK * 32)
 __attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
 void exl3_gemv_graph_dot_kernel_splitk
 (
-    const Exl3GemvGraphParams* __restrict__ pb,
+    const half* __restrict__ A,        // 0: GP_gemm_A
+    const uint16_t* __restrict__ B,    // 1: GP_gemm_B_trellis
+    void* __restrict__ C,              // 2: GP_gemm_C
+    const half* __restrict__ suh,      // 3: GP_gemm_B_suh
+    half* __restrict__ A_had,          // 4: GP_gemm_A_had (patch host only)
+    const half* __restrict__ svh,      // 5: GP_gemm_B_svh
+    Exl3GemvGraphParams* __restrict__ pb,
     const int size_k,
     const int size_n,
-    const bool lds_core
+    const bool lds_core,
+    const bool fuse_out
 )
 {
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        pb->B = B;
+        pb->C = C;
+        pb->A_had = A_had;
+        pb->svh = svh;
+    }
+
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int tile_n = blockIdx.x;
@@ -610,25 +654,38 @@ void exl3_gemv_graph_dot_kernel_splitk
     half* sh_b_dq = (half*) shared_mem;
     uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
     float* sh_red = (float*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
+    half* sh_a = (half*) (sh_red + WARPS_PER_BLOCK * 16);
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
+    exl3_gemv_rotate_in<WARPS_PER_BLOCK>(A, suh, sh_a, size_k, warp_id, lane);
+    __syncthreads();
+
     float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
     (
-        pb->A_had, pb->B, size_k, n_tiles, tile_n, warp_id, lane,
+        sh_a, B, size_k, n_tiles, tile_n, warp_id, lane,
         my_sh_b, my_sh_b_quant, sh_red, lds_core
     );
 
-    if (warp_id == 0 && lane < 16)
+    if (warp_id != 0) return;
+    if (fuse_out)
+        exl3_gemv_fused_epilogue<c_fp32>
+        (
+            accum, C, 0, size_n, tile_n, lane, svh, 0.088388347648f,  // 1/sqrt(128)
+            pb->seg_counters + tile_n / 8, nullptr, 0, 1
+        );
+    else if (lane < 16)
     {
         const int out_idx = tile_n * 16 + lane;
         if constexpr (c_fp32)
-            ((float*) pb->C)[out_idx] = accum;
+            ((float*) C)[out_idx] = accum;
         else
-            ((half*) pb->C)[out_idx] = __float2half(accum);
+            ((half*) C)[out_idx] = __float2half(accum);
     }
 }
 
+// Fallback output rotation (EXL3_GEMV_FUSE_OUT=0, or more segments than the
+// counters hold); the fused epilogue reproduces it bit for bit.
 template <bool c_fp32>
 static __global__
 __launch_bounds__(256)
@@ -657,6 +714,19 @@ void exl3_gemv_graph_had_out_kernel
             pb->svh + offset,
             0.088388347648f  // 1/sqrt(128)
         );
+}
+
+// Graph patch sites, recorded against the dot-kernel instantiation that was
+// launched, in the cooperative kernel's order.
+static void exl3_gemv_graph_record_sites(Graph* graph, void* k)
+{
+    graph->record_param(k, GP_gemm_A, 0);
+    graph->record_param(k, GP_gemm_B_trellis, 1);
+    graph->record_param(k, GP_gemm_C, 2);
+    graph->record_param(k, GP_gemm_B_suh, 3);
+    graph->record_param(k, GP_gemm_A_had, 4);
+    graph->record_param(k, GP_gemm_B_svh, 5);
+    graph->record_param(k, GP_end, 0);
 }
 
 bool exl3_gemv_graph_try_launch
@@ -693,31 +763,17 @@ bool exl3_gemv_graph_try_launch
     Exl3GemvGraphParams* pb = exl3_gemv_graph_param_block(device, false);
     if (!pb) return false;
 
-    // 1. Prologue + input rotation
-    {
-        int blocks = CEIL_DIVIDE((size_k / 128) * 32, 256);
-        hipLaunchKernelGGL
-        (
-            exl3_gemv_graph_had_in_kernel,
-            dim3(blocks), dim3(256), 0, stream,
-            A_ptr, B_ptr, C_ptr, suh_ptr, A_had_ptr, svh_ptr, pb, size_k
-        );
-        if (graph)
-        {
-            void* k = (void*) exl3_gemv_graph_had_in_kernel;
-            graph->record_param(k, GP_gemm_A, 0);
-            graph->record_param(k, GP_gemm_B_trellis, 1);
-            graph->record_param(k, GP_gemm_C, 2);
-            graph->record_param(k, GP_gemm_B_suh, 3);
-            graph->record_param(k, GP_gemm_A_had, 4);
-            graph->record_param(k, GP_gemm_B_svh, 5);
-            graph->record_param(k, GP_end, 0);
-        }
-    }
+    // Fused output epilogue unless switched off or the segment counters would
+    // not fit this width (lm_head-scale outputs fit: 100352 / 128 = 784)
+    const bool fuse_out = exl3_gemv_fuse_out_enabled()
+        && size_n / 128 <= EXL3_GEMV_SEG_COUNTERS;
 
-    // 2. GEMV -- same wave selection and split-K rule as the non-graph path.
-    //    The captured kernel choice is baked at capture; shapes are static per
-    //    call site, so the heuristic is graph-stable by construction.
+    // 1. GEMV, with the input rotation as its prologue and the output rotation
+    //    as its epilogue -- same wave selection and split-K rule as the
+    //    non-graph path. The captured kernel choice is baked at capture; shapes
+    //    are static per call site, so the heuristic is graph-stable by
+    //    construction. The six graph patch sites are recorded against the
+    //    instantiation that was launched.
     {
         int n_tiles = size_n / 16;
         int k_blocks = size_k / 16;
@@ -725,13 +781,12 @@ bool exl3_gemv_graph_try_launch
 
         int warps_per_block = exl3_gemv_rdna_warps(n_tiles, k_blocks);
         int num_blocks = (n_tiles + warps_per_block - 1) / warps_per_block;
-        size_t smem = exl3_gemv_smem_bytes(warps_per_block);
         if (splitk)
         {
             warps_per_block = exl3_gemv_splitk_warps(k_blocks, n_tiles, 1);
             num_blocks = n_tiles;
-            smem = exl3_gemv_smem_bytes_splitk(warps_per_block);
         }
+        size_t smem = exl3_gemv_smem_bytes_fused(warps_per_block, splitk, size_k);
 
         const bool lds_core = exl3_gemv_lds_core();
 
@@ -740,12 +795,18 @@ bool exl3_gemv_graph_try_launch
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, true, codebook, warps>), \
                     dim3(num_blocks), dim3(warps * 32), smem, stream, \
-                    pb, size_k, size_n, lds_core); \
+                    A_ptr, B_ptr, C_ptr, suh_ptr, A_had_ptr, svh_ptr, pb, \
+                    size_k, size_n, lds_core, fuse_out); \
+                if (graph) exl3_gemv_graph_record_sites(graph, \
+                    (void*) &kernel_name<bits_val, true, codebook, warps>); \
             } else { \
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, false, codebook, warps>), \
                     dim3(num_blocks), dim3(warps * 32), smem, stream, \
-                    pb, size_k, size_n, lds_core); \
+                    A_ptr, B_ptr, C_ptr, suh_ptr, A_had_ptr, svh_ptr, pb, \
+                    size_k, size_n, lds_core, fuse_out); \
+                if (graph) exl3_gemv_graph_record_sites(graph, \
+                    (void*) &kernel_name<bits_val, false, codebook, warps>); \
             }
 
         #define LAUNCH_GGEMV_WAVES(bits_val, codebook, warps) \
@@ -786,7 +847,9 @@ bool exl3_gemv_graph_try_launch
         #undef LAUNCH_GGEMV_WAVES_K
     }
 
-    // 3. Output rotation
+    if (fuse_out) return true;
+
+    // 2. Output rotation -- fallback form
     {
         int blocks = CEIL_DIVIDE((size_n / 128) * 32, 256);
         if (c_fp32)

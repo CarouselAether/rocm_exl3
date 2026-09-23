@@ -1221,3 +1221,125 @@ fp32 at bsz 1/3/8; `chat_probe.py` clean; `bench_model.py` decode up with
 prefill flat; `profile_decode.py` showing the launch count per token drop.
 Noise floor ~5%: repeat runs. Do it on `main` (7.2.4), merge to `rocm-10`,
 rebuild `.venv10`.
+
+## Launch-count fusion: landed, and what it showed (2026-09-23)
+
+Steps 1, 2 and 4 of the brief above are done on `main`; step 3 (gate+up in one
+call) is deliberately not, see below. Every fused kernel is bit-identical to
+the form it replaced, by two new gates: `rocm_tools/mgemv_bitwise.py` (the
+multi-matrix path, every routing configuration of mgemv_check, saved on the
+old build and compared on the new) and `rocm_tools/decode_bitwise.py` (a
+48-step greedy decode on Laguna, every step's logits, which is the only way to
+reach the single-matrix graph path inside the BC modules). Both PASS, the
+decode one also with `EXL3_GEMV_FUSE_OUT=0`; mgemv_check and exl3_stack_check
+PASS.
+
+What changed (`rocm/quant/exl3_gemv_kernel_rdna.hip.h` holds the shared
+helpers under "Launch-count fusion"):
+
+- **Multi-matrix (`exl3_mgemv_rdna.hip`)**: the had_in kernel is gone -- each
+  dot block rotates its expert's input into LDS (block-cooperative, one
+  `__syncthreads`) and the dot core reads A from LDS; the had_out and reduce
+  kernels are gone -- the last-arriving warp of each 128-wide output segment
+  (an atomic counter per (slot, segment), self-resetting, in the parameter
+  block) rotates the segment in place, and with routing weights the last
+  rotated slot of a segment runs the grouped reduce for its 128 columns. One
+  launch per mgemm call instead of three or four; the dot kernel hosts the four
+  graph patch sites, recorded against the launched instantiation.
+- **Single-matrix graph path (`exl3_gemv_rdna.hip`)**: same two folds; one
+  launch instead of three; six patch sites on the dot kernel. The plain
+  (non-graph) path is untouched: it also serves calls without su/sv and runs
+  once per token (lm_head).
+- Kill switch `EXL3_GEMV_FUSE_OUT=0` restores the separate output kernels on
+  both paths (the input fold has no switch; its arithmetic is the same
+  function). A `(void) A_had` marks the scratch the fused paths no longer touch.
+
+Measured (Laguna-S-2.1 4bpw, gfx1151, 7.2.4; bench_model -p 512 2048 -n 128
+-r 4; profile_decode -n 32; every figure repeated):
+
+| | decode t/s | launches/token | profiler wall (32 tok) | GPU busy (Kineto) | kernel time |
+|---|---|---|---|---|---|
+| baseline 47df37d | 23.3 | 1961 | 1.768 s | 60.0% | 1.061 s |
+| + step 1 (had_in) | 23.2 | -- | 1.684 s | 64.2% | 1.080 s |
+| + step 2 (had_out+reduce) | 23.2 | -- | 1.639 s | 66.0% | 1.082 s |
+| + step 4 (dense graph path) | **23.5** (x2) | **1152** | 1.581 s | 68.6% | 1.085 s |
+
+Prefill flat throughout (191-192 / 312-316 t/s). Launches per token fell 41%;
+the profiler's wall fell 10.6%; unprofiled decode moved +0.9%, inside the noise
+floor but the same direction on every run. `gap_profile.py` on the fused
+build: per token 33.58 ms busy, 3.41 ms of launch-shaped gaps (1239 gaps,
+median 2.7 us -- the CP gap the census measured, now on 41% fewer kernels),
+0.32 ms of big gaps.
+
+**The diagnosis in the brief was wrong, and this is the useful result.**
+Decode was called host-bound from Kineto profiles (GPU busy 60% of wall, 880
+ms of `hipLaunchKernel` CPU time for 58k launches = 15 us each). Measured
+without the profiler:
+
+- `exl3_mgemm` costs the host **3.3 us** per call; a whole MoE layer (gate,
+  up, act, down, copy: 5 calls) costs **15 us** of host time against **305
+  us** of GPU time. Fusion took the layer from 21 to 15 us host.
+- Instrumenting `Model.forward` in the generator loop (1-token prompt, 64
+  tokens): the host enqueues a full forward in **4.15 ms**, then waits **31.4
+  ms** for the GPU; with a sync at forward exit the forward is **35.5 ms** and
+  the pure host segment between tokens (sampler, generator, next forward's
+  Python up to its first kernel) is **0.13 ms**.
+
+So unprofiled decode is **GPU-bound**, with ~31 ms of host slack per token.
+Kineto inflates per-launch host cost roughly tenfold, which is what made the
+GPU look idle. What fusion actually buys is device-side: fewer CP gaps (~2
+ms/token less, by the profiler's count) against +0.7 ms/token of kernel time
+(the rotation prologue is redundant across the N-tile blocks of one expert,
++9% on the biggest kernel; the fused reduce tail is +8% on the down kernel
+after its row loop was reordered for load overlap). Net ~+1 ms/token, which
+is the +0.9% seen. On rocm-10 with graphs on, the launch count is the thing
+graph replay does not fix (census), so the 41% cut carries over there intact.
+
+**Next, in order of return:**
+
+1. Remove the rotation redundancy: TILES_PER_BLOCK=2 (or 4) N-tiles per
+   split-K block sharing one rotation, keeping split depth so the wave count
+   is unchanged (block = tiles x splits warps). Claws back most of the +0.7
+   ms/token; then fusion is a clear GPU-side win. Contained in the two dot
+   kernels + the smem carve; measure with bench_mgemm / gemv_check sweep.
+2. Step 3 (gate+up in one call) is deprioritized: it saves 47 launches/token
+   (~0.1 ms of CP gap) and needs a doubled index list no existing argument
+   carries -- a new ROCm-only binding (bindings.cpp deviation) or a mode flag
+   smuggled through an int argument. Not worth it at this return. Same for
+   folding the activation into the down prologue (47 tiny kernels/token).
+3. The GPU-side levers are now the kernels themselves: the expert GEMVs run
+   at ~141 GB/s effective (2.2 GB of expert weight per token in 15.6 ms)
+   against the ~226 GB/s the single-matrix sweep reaches -- occupancy/tail
+   effects of 64-tile grids at top-10, not launch overhead.
+
+Measurement discipline learned: **never diagnose host-vs-GPU from a Kineto
+profile alone**. Time the host segment directly (forward entry/exit with and
+without a sync, as above) before attributing idle GPU to the host.
+
+### Fused build on DS4 and Qwen 3.8, plain and with MTP (2026-09-23)
+
+`rocm_tools/bench_mtp.py` (new: one load, plain + `-ndt 3 2 1` with the
+model's MTP head, tok/s + acceptance + text) and bench_model, fused build vs
+`EXL3_GEMV_FUSE_OUT=0`. Coherent text on every path of both models.
+
+| model | decode128 fused | FUSE_OUT=0 | prefill512 | MTP ndt=1 | ndt=2 | ndt=3 |
+|---|---|---|---|---|---|---|
+| DS4-Flash 2.04bpw (draft route: dflash) | **16.2** | 15.8 | 104 | 9.9 (acc 81%) | 12.1 (80%) | 10.7 (75%) |
+| Qwen3.8-Flash-Next 4bpw (route: mtp_draft) | **23.9** | 23.3 | 226 | 15.7 (83%) | 20.0 (78%) | 18.4 (64%) |
+
+(MTP columns: greedy 256 tokens on natural prompts, median of 3, tok/s.)
+The output fusion is worth +2.5% on both; prefill flat. DS4's 16.2 is below
+the 17.9 recorded 2026-08-28 (pre-1.5.0 sync) -- not this change (fused >
+unfused); the 1.5.0 sync / route changes are the suspect, untracked.
+
+**MTP is a net loss on both models, and the reason is the m > 1 verify
+path.** Tokens per verify step = 1 + ndt x acceptance: Qwen ndt=2 gets 2.56
+tokens per step at 20.0 t/s = 128 ms/step against 42 ms for an m=1 step, so
+an m=3 forward costs **3.05x** an m=1 forward; DS4 ndt=2: 215 vs 62 ms,
+**3.5x**. Memory-bound it would be ~1.1-1.3x (the weights are read once
+either way), which would put ndt=2 near 2x plain. At m > 1 the dense linears
+leave the GEMV for the cooperative GEMM and the MoE takes the bszN route,
+neither tuned for 2-4 rows. This is the case for the multi-row GEMV
+(m = 2..8, row tile {1,2,4,8}) plan: it is what makes the MTP head pay.
+ndt=2 is the best draft length on both models today; 3 loses acceptance, 1
+loses too much per step.
