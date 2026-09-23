@@ -119,7 +119,7 @@ unexercised (the opt-in gates below).
 
 The fork ships its own server: `rocm_tools/exl3_server/server.py`, a single-file, llama.cpp-server-style,
 OpenAI-compatible HTTP server. Its dependencies are in `requirements_rocm.txt`. It takes the same model/sampler
-flags as `examples/chat.py`, plus a handful of server flags:
+flags as `examples/chat.py` (they come from `exllamav3.model_init.add_args`), plus the server flags below.
 
 ```sh
 python rocm_tools/exl3_server/server.py -m ~/models/<model>-exl3 -cs 32768 -ngram 2 -dds
@@ -127,8 +127,99 @@ python rocm_tools/exl3_server/server.py -m ~/models/<model>-exl3 -cs 32768 -ngra
 ```
 
 `-ngram 2 -dds` (n-gram drafting, skipped while acceptance is low) is the recommended speculative-decoding setting on
-this GPU. See [`rocm_tools/exl3_server/README.md`](rocm_tools/exl3_server/README.md) for flags, endpoints and
+this GPU. Endpoints: `GET /health`, `GET /props`, `GET /v1/models`, `POST /v1/chat/completions` (prompt built with the
+model's own chat template), `POST /v1/completions` (prompt used verbatim, for clients that apply their own instruct
+template), `POST /tokenize`, `POST /detokenize`. Streaming uses standard OpenAI SSE chunks ending in `data: [DONE]`.
+Sampling flags set the *defaults*; each request can override them. See
+[`rocm_tools/exl3_server/README.md`](rocm_tools/exl3_server/README.md) for endpoint details, SillyTavern setup and
 measurements.
+
+#### All flags
+
+Every flag has a short and a long form; the short form is shown. Run `server.py -h` for the live list.
+
+**Model loading**
+
+| flag | what it does |
+|---|---|
+| `-m DIR` | model directory (required) |
+| `-gs GB[,GB...]` | max VRAM to use per device, in GB; on a single-GPU Strix Halo box this is one number |
+| `-lm` | print loader metrics |
+| `-or FILE` | tensor override spec (YAML) |
+| `-tp` | load in tensor-parallel mode (multi-GPU); respects `-gs` where it can |
+| `-tpb native\|nccl` | tensor-parallel backend, default `native` |
+| `-tp_attn N`, `-tp_mlp N`, `-tp_moe N`, `-tp_linear N`, `-tp_linear_attn N` | (TP) cap the parallelism of that layer class |
+| `-tp_moe_ts` | (TP) tensor-split MoE layers instead of expert parallelism |
+| `-swa_full` | use a full cache for sliding-window layers instead of recurrent mode with snapshots |
+| `-ambs N` | max batch size to account for when autosplitting, default 4 |
+| `-chunk_size N` | max prefill chunk size |
+| `-lv` | verbose loading |
+| `-asnf` | skip the forward pass during autosplit (debug) |
+| `-layer_map SPEC` | RYS layer map, e.g. `0..15,11..31` repeats layers 11-15 once |
+
+**MoE on the CPU** (experimental; layer-split mode only; needs mul1-codebook experts)
+
+| flag | what it does |
+|---|---|
+| `-mcl N` | run the routed experts of the first N block-sparse MoE layers on the CPU, weights in system RAM |
+| `-mcs N` | per-layer split: run the tail N routed experts of every eligible MoE layer on the CPU, overlapped with the GPU experts; dynamic hot/cold placement is on (`EXL3_MOE_CPU_SWAP=0` for static). Mutually exclusive with `-mcl` |
+| `-mct N` | worker threads for the two above (default `EXL3_MOE_CPU_THREADS`, else half the cores) |
+| `-ngr` | load a PLE model's n-gram embedding table fully into RAM (tens of GB) instead of streaming rows from disk per forward, e.g. Qwen3.8-Flash-Next |
+
+**KV cache**
+
+| flag | what it does |
+|---|---|
+| `-cs N` | total cache size in tokens. **Default = the model's max context**; long-context models advertise 256K-1M, so pass `-cs` (e.g. `-cs 32768`) or `-cq` to keep the cache sane |
+| `-cq BITS` or `-cq K,V` | quantized cache, one bit width for both or separate K and V widths |
+| `-cca A` | compand `a` value for the simulated cache, default 0 |
+| `-ccs GB` | CPU second-tier cache size, GB |
+| `-rcs GB` | recurrent-state second-tier cache size, GB |
+
+**Speculative decoding**
+
+| flag | what it does |
+|---|---|
+| `-dm DIR` | separate draft model, like llama.cpp's `--model-draft`; DFlash / EAGLE-3-style drafters load directly (e.g. `-dm ~/models/Laguna-S-2.1-DFlash`) |
+| `-mtp` | draft with the model's own MTP head (DeepSeek V4, Qwen3.8-Flash-Next, ...); not with `-dm` |
+| `-ndt N` | draft tokens per step (default: the draft model's own default, else 4) |
+| `-ngram N` | n-gram drafting from repeats already in the context, minimum match length N; no extra model. `-ngram 2` is the cheap default |
+| `-dds` | dynamic draft length: skip or shorten drafting while acceptance is low; `-ndt` becomes the ceiling |
+| `-dc X` | confidence target for dynamic draft truncation, default 0.4 |
+| `-dmcl N` | like `-mcl` for the draft model or MTP head (experimental) |
+
+Draft acceptance is printed per request in the server log and returned in the native `timings` as
+`draft_n` / `draft_n_accepted`.
+
+**Sampling defaults** (per-request values override these)
+
+| flag | what it does |
+|---|---|
+| `-temp X` | temperature, default 0.8 |
+| `-temp_first` | apply temperature before truncation |
+| `-repp X` | HF-style repetition penalty, 1 disables |
+| `-presp X`, `-freqp X` | presence / frequency penalty, 0 disables |
+| `-penr N` | range in tokens the penalties look back over, default 1024 (see the note below) |
+| `-minp X` | min-P truncation, default 0.08, 0 disables |
+| `-topk N` | top-K truncation, 0 disables |
+| `-topp X` | top-P truncation, 1 disables |
+| `-adaptive_target X`, `-adaptive_decay X` | Adaptive-P target (1 disables) and decay |
+| `-xtcp X`, `-xtct X` | XTC probability (0 disables) and threshold (default 0.1) |
+| `-drym X`, `-dryb X`, `-dryal N`, `-dryln N` | DRY multiplier (0 disables), base (1.75), allowed repeat length (2), scan range in tokens (-1 = whole context, 0 disables) |
+
+Keep the penalty range bounded: unbounded frequency/presence penalties over a long context were the cause of the
+"coherency cliff" around 8K tokens that was once blamed on the kernels.
+
+**Server**
+
+| flag | what it does |
+|---|---|
+| `-host ADDR`, `-port N` | bind address and port, default `127.0.0.1:3953` |
+| `-key KEY` | require this API key (`Authorization: Bearer` or `x-api-key` header) |
+| `-smn NAME` | model name reported by the API, default: the model directory name |
+| `-maxr N` | server-side cap on tokens per response, default: fill the remaining context |
+| `-ctk JSON` | default chat-template kwargs, e.g. `'{"enable_thinking": false}'` |
+| `-lw N`, `-lmr N` | loop detection: stop after a window of N tokens repeats `-lmr` times (default 3); `-lw 0` disables |
 
 ---
 <p align="center">
