@@ -4,7 +4,7 @@ The C++ side keeps upstream sources byte-identical and puts every ROCm-specific
 change in ``exllamav3_ext/rocm/`` as a sibling file (see that directory's
 README). This package is the same idea for Python: instead of editing upstream
 modules in place, the divergences live here and are applied as monkeypatches at
-import time, from a single hook in ``exllamav3/ext.py``.
+import time, from a single hook at the end of ``exllamav3/__init__.py``.
 
 Why not edit the modules directly? The original ROCm fork did, across five
 files, and every upstream rebase then had to re-derive which edits were ROCm
@@ -22,11 +22,22 @@ this module and does nothing.
 Environment switches (all default to the safe value for this backend):
 
   EXL3_ROCM_PATCH=0        disable every patch below
-  EXL3_ROCM_MGEMM=1        trust exl3_mgemm on RDNA (re-enables MultiLinear
-                           fusion *and* the bsz-1 MoE mgemm routes)
+  EXL3_ROCM_MGEMM=0        distrust exl3_mgemm on RDNA: disables MultiLinear
+                           fusion *and* the bsz-1 MoE mgemm routes. Default on
+                           since 2026-08-07 (see the note at the patch)
   EXL3_ROCM_MOE_DISABLE=1  route block-sparse MoE through the dense per-expert
                            path instead of the fused kernel (NOT advised -- see
                            the note at the patch itself)
+  EXL3_ROCM_RDNA4_FUSED_MOE=1  on gfx120x, do not steer MoE off the fused
+                           kernel (whose WMMA traps on gfx12); for a future
+                           gfx12 WMMA port
+
+  Bisect handles -- slow, for localising a numerics fault, never to leave on:
+
+  EXL3_ROCM_MOE_TORCH=1    MoE expert compute in pure torch
+  EXL3_ROCM_ROUTING_TORCH=1  expert routing in pure torch (routing_ds3)
+  EXL3_ROCM_FORCE_TORCH=1  every EXL3 Linear via reconstruct + at::mm, taking
+                           exl3_gemm and exl3_gemv out of the model
 
   Added at the v1.5.0 sync (2026-09-20). Each keeps a v1.4.4-validated path as
   the default and makes the new upstream path opt-in until it has been run on

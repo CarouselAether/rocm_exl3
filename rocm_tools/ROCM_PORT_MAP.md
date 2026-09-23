@@ -1,5 +1,9 @@
 # ROCm port map: `rocm_exl3` (v0.0.29 base) → upstream v1.3.0
 
+> **Historical.** This is the planning log from the v1.3.0 port. Pass counts and
+> "not yet ported" items below reflect that time, not the current tree (now v1.5.0;
+> see `exllamav3/exllamav3_ext/rocm/README.md` for current status).
+
 What the existing ROCm fork changed, what upstream has done since, and what each
 item costs to bring forward. Written to answer "how much of my work survives?"
 

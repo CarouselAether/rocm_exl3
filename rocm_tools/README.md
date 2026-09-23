@@ -1,8 +1,6 @@
 # rocm_tools
 
-Verification and measurement tools for the ROCm backend. Every claim in
-[ROCM_PORT_MAP.md](ROCM_PORT_MAP.md) is reproducible with one of these — they
-exist so the port's conclusions can be re-checked after a ROCm bump or on a
+Verification and measurement tools for the ROCm backend. They exist so the port's conclusions can be re-checked after a ROCm bump or on a
 different RDNA card, rather than trusted.
 
 All scripts resolve paths relative to the repo, use the active virtualenv's
@@ -20,9 +18,10 @@ rocm_tools/hipcc_probe.sh --all          # all ROCm-built sources
 GPU_ARCH=gfx1100 rocm_tools/hipcc_probe.sh --all   # another card
 ```
 
-Current baseline on gfx1151 / ROCm 7.2.4: **44 of 50 pass**. The 6 failures are
-exactly the inline-PTX files -- see ROCM_PORT_MAP.md. A number below 44 after a
-toolchain change means the shim needs attention.
+Current baseline on gfx1151 / ROCm 7.2.4: **all 117 ROCm-built sources pass**
+(`GPU_ARCH=gfx1201` also compiles clean). The inline-PTX files are excluded, in
+step with `ROCM_EXCLUDE` in `setup.py`. Any failure after a toolchain change
+means the shim needs attention.
 
 ## `attn_check.py`
 
@@ -48,11 +47,12 @@ non-Blackwell one.
 python rocm_tools/bench_prefill_tiles.py
 ```
 
-Exists because `triton_paged.py` selects tiles from
-`get_device_capability()[0] >= 10`, which gfx1151 trips (it reports `(11, 5)`).
-The measured result is counter-intuitive and worth re-checking on new hardware:
-the misdetected narrow-kv config is *faster* on RDNA, because upstream sizes
-tiles for ~100 KB of smem and RDNA 3.5 has 64 KB of LDS.
+Kept to re-verify the RDNA tile choice. Upstream's `triton_paged.py` selects
+tiles from `get_device_capability()[0] >= 10`, which gfx1151 trips by accident
+(it reports `(11, 5)`); this fork now selects the narrow-kv tile explicitly on
+ROCm. The measured result is counter-intuitive and worth re-checking on new
+hardware: the narrow-kv config is *faster* on RDNA, because upstream sizes tiles
+for ~100 KB of smem and RDNA 3.5 has 64 KB of LDS.
 
 ## Re-verifying after a ROCm upgrade
 
@@ -100,3 +100,7 @@ The measured facts these tools exist to protect — WMMA operand order and fragm
 layout, `sudot4` vs `sdot4`, the 64 KB LDS budget, the noise floor, and why each
 RDNA sibling differs from the upstream file it replaces — are in
 [`exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md`](../exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md).
+Its "Verification tools" table covers every script here, not just the four above.
+
+[ROCM_PORT_MAP.md](ROCM_PORT_MAP.md) is the original porting log. Its pass counts
+(31 / 43 of 50) are historical; the current baseline is above.

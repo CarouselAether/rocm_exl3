@@ -159,8 +159,8 @@ class CompletionRequest(SamplingFields):
     parse_special: bool = True
 
 class NativeCompletionRequest(BaseModel):
-    """llama.cpp-native /completion request (subset). Unsupported native samplers
-    (DRY, XTC, mirostat, dynatemp, typical_p, grammar) are ignored."""
+    """llama.cpp-native /completion request (subset). DRY and XTC are honored;
+    other native samplers (mirostat, dynatemp, typical_p, grammar) are ignored."""
     model_config = ConfigDict(extra = "ignore")
     prompt: str | list = ""
     n_predict: int = -1

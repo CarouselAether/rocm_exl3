@@ -5,7 +5,8 @@ This is a **ROCm fork of [ExLlamaV3](https://github.com/turboderp-org/exllamav3)
 upstream v1.5.0. If you are on NVIDIA, you want [the upstream repo](https://github.com/turboderp-org/exllamav3) —
 this one builds for CUDA too, but adds nothing there.
 
-The Python package is still named `exllamav3`, so it is a drop-in replacement (including for TabbyAPI).
+The Python package is still named `exllamav3`, so it is a drop-in replacement for code that imports it. For a
+server, use the bundled one (see [Server](#server)).
 Only the repository is renamed.
 
 ### What this fork changes
@@ -21,7 +22,8 @@ git diff --stat v1.5.0 -- '*.cu' '*.cuh' '*.cpp' '*.h' ':(exclude)exllamav3/exll
 # (empty)
 ```
 
-Outside `rocm/` and `rocm_py/`, exactly four upstream files differ from v1.5.0 (plus one ignore line in `.gitignore`):
+Outside `rocm/`, `rocm_py/` and `rocm_tools/`, exactly four upstream files differ from v1.5.0, plus one added file
+(`requirements_rocm.txt`) and one ignore line in `.gitignore`:
 
 | file | change |
 |---|---|
@@ -66,7 +68,7 @@ pip install --no-build-isolation .
 torch in it, and a torch C++ extension has to be compiled against the same torch it will run against.
 Building without it fails with an explanation rather than silently installing an empty package.
 
-The build compiles ~100 sources with `hipcc` in parallel (`MAX_JOBS` to limit it, e.g. on a low-memory
+The build compiles ~117 sources with `hipcc` in parallel (`MAX_JOBS` to limit it, e.g. on a low-memory
 machine).
 
 ### Tested
@@ -105,19 +107,27 @@ unexercised (the opt-in gates below).
   mechanically, untested.
 - **fp16-accumulate `hgemm` and the sm_120 quantizer specialisations are CUDA-only.** hipBLAS and the original
   quantizer kernels are used; nothing is lost on RDNA, which has no fp32-accumulate rate penalty.
+- **The int8-activation GEMV is not ported** (a disabled stub); every call uses the fp16 GEMV/GEMM kernels.
+- **HIP graph capture is off by default**: capture/replay corrupts BC decode across generator jobs and can hang at
+  capture on ROCm 7.2.x. `EXL3_ROCM_HIP_GRAPHS=1` re-enables it for A/B against newer ROCm stacks.
+- **Quantization (`convert.py`) is built but not yet exercised on RDNA.** Convert on CUDA if you can; reports welcome.
 - Kernel behaviour can be bisected at runtime with the `EXL3_ROCM_*` environment switches — see
-  `exllamav3/rocm_py/__init__.py`, which documents each one and why it exists.
+  `exllamav3/rocm_py/__init__.py`, whose module docstring lists each one and why it exists.
 
-### Using with TabbyAPI
+### Server
 
-TabbyAPI's `start.py` offers only `cu12` / `cu13` GPU options and will install a **CUDA** `exllamav3` wheel
-straight over this one. Use `--nowheel`, which skips the extras entirely:
+The fork ships its own server: `rocm_tools/exl3_server/server.py`, a single-file, llama.cpp-server-style,
+OpenAI-compatible HTTP server. Its dependencies are in `requirements_rocm.txt`. It takes the same model/sampler
+flags as `examples/chat.py`, plus a handful of server flags:
 
 ```sh
-python start.py --nowheel
+python rocm_tools/exl3_server/server.py -m ~/models/<model>-exl3 -cs 32768 -ngram 2 -dds
+# serves on http://127.0.0.1:3953
 ```
 
-Install this fork *after* TabbyAPI, or re-install it if `start.py` has already clobbered it.
+`-ngram 2 -dds` (n-gram drafting, skipped while acceptance is low) is the recommended speculative-decoding setting on
+this GPU. See [`rocm_tools/exl3_server/README.md`](rocm_tools/exl3_server/README.md) for flags, endpoints and
+measurements.
 
 ---
 <p align="center">
@@ -132,10 +142,7 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
 - **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
 - **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
-- **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](examples/transformers_integration.py), and an OpenAI-compatible API via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/).
-
-> [!TIP]
-> **Looking for a server?** [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is the official and recommended backend server. It provides an OpenAI-compatible API for local or remote inference, HF model downloading, embedding model support, and HF Jinja2 chat templates. Its startup script manages and installs prerequisites to help you get started.
+- **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](examples/transformers_integration.py), and an OpenAI-compatible API via the [bundled server](#server).
 
 <p align="center">
   <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
@@ -235,9 +242,13 @@ pip install .
 ROCm-specific build variables:
 - `EXL3_BACKEND`: `cuda` or `rocm`, forcing the backend. Otherwise it follows the installed torch.
 - `MAX_JOBS`: also honoured by the ROCm builder, which drives `hipcc` directly. It defaults to a value
-  bounded by both core count and RAM (~2.5 GB budgeted per job), so lower it if you still run out of memory.
-- `PYTORCH_ROCM_ARCH` / `GPU_ARCHS`: semicolon-separated `gfx` list to build for. Defaults to what `rocminfo` reports, filtered against the supported list. `PYTORCH_ROCM_ARCH` takes precedence.
-- `EXL3_RDNA_SMEM_MAX`: LDS budget in bytes. Defaults to the device's `sharedMemPerBlock` (64 KB on RDNA).
+  bounded by core count, RAM (~2.5 GB budgeted per job) and a cap of 32, so lower it if you still run out of memory.
+- `PYTORCH_ROCM_ARCH` / `GPU_ARCHS`: comma- or space-separated `gfx` list to build for (e.g. `gfx1100,gfx1151`;
+  semicolons are *not* separators). An explicit value is used as-is. If unset, the build uses what `rocminfo`
+  reports, filtered against the supported list. `PYTORCH_ROCM_ARCH` takes precedence.
+- LDS budget: not an environment variable. `setup.py` passes `-DEXL3_RDNA_SMEM_MAX` from the target archs
+  (64 KB for Strix / Strix Halo and unknown targets, 90 KB for discrete RDNA3/4, the smallest across a multi-arch
+  build), and at runtime it is further clamped to the device's `sharedMemPerBlock`.
 - `EXL3_RDNA_MOE_TILESIZE_K`: `32` (default) or `16`. 16 forces the MoE GEMMs onto the single-K path — the
   tile geometry every RDNA shape is validated on — at a cost of roughly 1.4–1.6× MoE throughput. It is the
   first thing to try if fused MoE output ever looks wrong.
@@ -428,7 +439,6 @@ This project owes its existence to a wonderful community of FOSS developers and 
 supporters (🐈❤️!) The following projects in particular deserve a special mention:
 
 - [ExLlamaV3](https://github.com/turboderp-org/exllamav3)
-- [TabbyAPI](https://github.com/theroyallab/tabbyAPI/)
 - [PyTorch](https://github.com/pytorch/pytorch)
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention)
 - [QTIP](https://github.com/Cornell-RelaxML/qtip)

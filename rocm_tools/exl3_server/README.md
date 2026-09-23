@@ -8,11 +8,15 @@ handful of server flags.
 ```sh
 python rocm_tools/exl3_server/server.py -m ~/models/Laguna-S-2.1-exl3-4.00bpw -cs 32768
 # serves on http://127.0.0.1:3953
-# python server.py --help lists every flag with its default
+# python server.py --help lists every flag with its default (except -cs: its help
+# shows 32768, but the real default is the model's max context)
 ```
 
+Dependencies (fastapi, uvicorn, sse-starlette, transformers, jinja2) come with
+`pip install -r requirements_rocm.txt`.
+
 All chat.py loader/sampler flags work: `-gs`, `-cs`, `-cq`, `-tp`,
-`-mcl/-mclt`, draft model flags (`-dm`, `-ndt`, `-dds`, `-ngram`, `-mtp`),
+`-mcl/-mcs/-mct`, draft model flags (`-dm`, `-ndt`, `-dds`, `-ngram`, `-mtp`),
 `-temp/-minp/-topk/-topp/-repp/-presp/-freqp/-penr`, etc. CLI sampling values
 are the *defaults*; each request can override them.
 
@@ -56,7 +60,7 @@ Server flags:
 
 - `POST /v1/chat/completions` — prompt is built with the **model's own chat
   template** (`tokenizer_config.json`, rendered by HF `apply_chat_template`).
-  Streaming and non-streaming, `n > 1`, `stop`, `logit_bias`, `seed`, `tools`
+  Streaming and non-streaming, `n > 1` (non-streaming only), `stop`, `logit_bias`, `seed`, `tools`
   (passed to the template), `chat_template_kwargs`, `continue_final_message`.
 - `POST /v1/completions` — raw prompt used **verbatim** (special tokens are
   encoded), so the client's own instruct template applies. Extensions:

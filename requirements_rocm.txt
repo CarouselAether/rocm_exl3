@@ -1,7 +1,7 @@
 # ROCm requirements. Bring ROCm 7.2.x; this brings everything else.
 #
 #   pip install -r requirements_rocm.txt
-#   pip install .
+#   pip install --no-build-isolation .
 #
 # Do NOT use requirements.txt on ROCm: it resolves torch from PyPI, and PyPI's
 # torch is the CUDA build. pyproject.toml declares torch>=2.6.0 (upstream, since
@@ -58,5 +58,14 @@ pyyaml
 marisa_trie
 pydantic
 llguidance>=1.7.0
+
+# rocm_tools/exl3_server (the bundled OpenAI-compatible server). transformers +
+# jinja2 render the model's own chat template (Tokenizer.hf_chat_template).
+fastapi
+uvicorn
+sse-starlette
+transformers
+jinja2
+
 # flash-linear-attention is no longer needed: upstream v1.5.0 vendors the FLA
 # chunk kernels it uses (exllamav3/vendor/fla), with its own AMD/HIP detection.

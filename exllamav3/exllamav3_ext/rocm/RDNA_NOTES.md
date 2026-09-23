@@ -904,9 +904,10 @@ What is PROVEN vs SUSPECTED, so nobody re-litigates the wrong part:
 Brought forward by `git merge v1.5.0` plus, for each sibling whose upstream twin
 changed, applying upstream's own v1.4.4 -> v1.5.0 diff to the sibling (it applied
 cleanly to nine of ten; `quantize_rdna.hip` and `rope_rdna.hip` were regenerated
-from the v1.5.0 twins instead). **None of this has been compiled or executed on
-RDNA yet** -- the machine that did the sync has no ROCm toolchain. Treat every
-item below as a build candidate.
+from the v1.5.0 twins instead). *At the time of the merge*, none of this had been
+compiled or executed on RDNA -- the machine that did the sync had no ROCm
+toolchain. **Superseded:** it has since been built and validated on gfx1151; see
+"v1.5.0 validated on gfx1151" below for what ran and what remains opt-in.
 
 | Area | What upstream did | What the RDNA layer does now |
 |---|---|---|

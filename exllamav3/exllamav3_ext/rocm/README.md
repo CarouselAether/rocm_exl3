@@ -84,13 +84,18 @@ lanes at a shuffle would need the real masked forms.
 
 ## Excluded upstream sources
 
-`ROCM_EXCLUDE` in `setup.py`, with reasons:
+`ROCM_EXCLUDE` in `setup.py`, with reasons. The groups below need explaining;
+the other nine entries are one-for-one `_rdna` siblings, each justified in its
+`setup.py` comment: `rope.cu`, `quant/exl3_gemm.cu`, `quant/exl3_kernel_map.cu`,
+`quant/reconstruct.cu`, `quant/quantize.cu`, `quant/exl3_moe.cu`,
+`cpu/moe_handoff.cu`, `cuda_drv.cpp` and `graph.cu`.
 
 - `parallel/` (8 files) — CUDA IPC + inline PTX. Tensor-parallel is unavailable
   on ROCm.
-- `quant/comp_units/` (66 files) — EXL3 GEMM instantiations that reach the inline
-  PTX in `ptx.cuh`. Replaced by `rocm/quant/comp_units_rdna/` (24 GEMM slots,
-  8 bitwidths x 3 codebooks; MoE slots pending).
+- `quant/comp_units/` (92 files) — EXL3 GEMM / MoE / quantize instantiations that
+  reach the inline PTX in `ptx.cuh`. Replaced by `rocm/quant/comp_units_rdna/`:
+  24 GEMM units (8 bitwidths x 3 codebooks), 20 fused-MoE units (16-row only;
+  upstream's 32/64-row variants fall back to 16-row) and 8 quantize-tile units.
 
   An earlier version of this note said these "stall `grid.sync()` on RDNA WGP
   pairing". That is wrong, and it has now been tested rather than argued about:
@@ -133,13 +138,15 @@ lanes at a shuffle would need the real masked forms.
 
 ## LDS budget on non-Strix RDNA parts
 
-Strix Halo (gfx1151) has **64 KB** of LDS per workgroup, measured. Other RDNA
-parts tolerate upstream's 90 KB figure, so this is a build-time knob rather than
-a constant:
+Strix Halo (gfx1151) has **64 KB** of LDS per workgroup, measured. Discrete
+RDNA parts are assumed to take upstream's 90 KB figure (not measured here), so
+this is a build-time define rather than a constant. `setup.py` sets it from its
+`GPU_ARCH_SMEM` table — 65536 for gfx1150/gfx1151 and unknown targets, 92160 for
+gfx110x/gfx120x, the smallest across a multi-arch build. The header default of
+64 KB only applies to a hand-run `hipcc` without the define:
 
 ```bash
-hipcc -DEXL3_RDNA_SMEM_MAX=92160 ...    # 90 KB parts
-# default is 64 * 1024
+hipcc -DEXL3_RDNA_SMEM_MAX=92160 ...    # what setup.py passes for a 90 KB part
 ```
 
 It is deliberately **not** selected with an arch macro. `__gfx1151__` exists only
@@ -163,20 +170,24 @@ shapes, never a failed launch. Verified with
 - [x] Cooperative launch — **verified on gfx1151** (`rocm_tools/gemm_coop_check.hip`),
       13 differential cases exact, and an oversubscribed grid is refused by the
       runtime rather than deadlocking
-- [x] MoE kernel + 20 instantiations — builds and links, **not yet executed**
+- [x] MoE kernel + 20 instantiations — validated on gfx1151 (`rocm_tools/moe_ref32.py`
+      fp32 comparison; GLM-4.6V and Qwen 3.8-Flash-Next generation)
 - [x] `quantize` + 8 tile instantiations — builds and links, **not yet executed**
-- [x] `ROCM_EXCLUDE` covers every replaced source (verified: setup.py keeps 102
-      sources, the probe compiles 102, no upstream twins remain)
+      (no conversion has been run on RDNA)
+- [x] `ROCM_EXCLUDE` covers every replaced source (setup.py keeps 117 sources,
+      the probe compiles the same 117, no upstream twins remain)
+- [x] v1.5.0 sync — built and validated on gfx1151 (2026-09-20): full build,
+      numeric ladder, pytest, coherent generation on the verified models. MoE
+      `count_lo`/`count_hi` tiers and the deterministic `output_scratch` +
+      `exl3_moe_gather` path run by default.
+- [ ] v1.5.0 opt-ins that are built but unexercised: sliced mgemm
+      (`EXL3_ROCM_QKV_SLICE=1`); batched `reconstruct[_had]_batch` + `hgemm_batched`
+      (`EXL3_ROCM_BATCH_RECON=1`); quantize tile length 160 and the
+      `quantize_tiles_scratch` query (conversion only)
 - [ ] int8 GEMV — currently a disabled stub
-- [ ] **v1.5.0 sync (source-level, not yet compiled or run on RDNA):** sliced
-      mgemm (`had_src_list` / `n_stride_list`) ported into the WMMA inner and the
-      mgemm kernel, default-off in Python; MoE `count_lo`/`count_hi` tiers and the
-      deterministic `output_scratch` path plus `exl3_moe_gather`; batched
-      `reconstruct[_had]_batch`; quantize tile length 160 and the
-      `quantize_tiles_scratch` query. Re-run `rocm_tools/hipcc_probe.sh --all` and
-      the smoke checks before trusting any of it.
 - [ ] `exl3_moe_coop` (fused bsz ≤ 8 MoE decode) — stub; see above
-- [ ] End-to-end validation (perplexity, TabbyAPI)
+- [x] End-to-end generation on gfx1151
+- [ ] Perplexity comparison against CUDA
 
 `ROCM_EXCLUDE` and `rocm_tools/hipcc_probe.sh`'s exclusion regex are the same
 statement written twice — keep them in step. Every `_rdna` sibling is only

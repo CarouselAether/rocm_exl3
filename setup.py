@@ -108,19 +108,17 @@ rocm_dir = os.path.join(sources_dir, "rocm")
 # rocm/hip_compat.hip.h (force-included) and rocm/cuda_shim/ (include-path
 # redirection), never by editing upstream sources. See rocm/README.md.
 #
-# ROCM_EXCLUDE lists upstream paths the ROCm build skips because they are
-# CUDA-cooperative-kernel or PTX-inline-asm paths with no HIP equivalent.
-# Each entry needs a reason; an unexplained exclusion is a silently missing
+# ROCM_EXCLUDE lists upstream paths the ROCm build skips because they cannot
+# build or run correctly on RDNA as-is (inline PTX, CUDA IPC, a runtime bug, a
+# library name, an LDS assumption). Each entry needs a reason; an unexplained exclusion is a silently missing
 # feature.
 ROCM_EXCLUDE = (
     # 8 files. Multi-GPU peer kernels built on CUDA IPC + inline PTX. No HIP port
     # yet, so tensor-parallel is unavailable on ROCm.
     "parallel/",
-    # 66 files. Per-bitwidth EXL3 GEMM instantiations using cooperative launches
-    # and ~64 KB LDS, which stall grid.sync() on RDNA WGP pairing. ROCm replaces
-    # them with rocm/quant/comp_units_rdna/.
-    # NOTE: until that port lands, a ROCm build links but has no EXL3 quant
-    # kernels -- exllamav3 will import and run unquantized paths only.
+    # 92 files. Per-bitwidth EXL3 GEMM / MoE / quantize instantiations that
+    # reach the inline PTX in ptx.cuh. ROCm replaces them with
+    # rocm/quant/comp_units_rdna/ (24 GEMM, 20 MoE, 8 quantize-tile units).
     "quant/comp_units/",
     # Replaced by rocm/rope_rdna.hip, which differs by one line: `half2 x = {}`
     # is ambiguous against HIP's assignment overloads. Same exported symbols.
@@ -195,21 +193,6 @@ if verbose:
 # ROCm build
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Minimum ROCm
-# ---------------------------------------------------------------------------
-# 7.2.4 is a hard floor, not a recommendation. ROCm changed materially between
-# 7.1 and 7.2 in ways this port now depends on -- notably __shfl_*_sync exists
-# and is default-on (rocm/hip_compat.hip.h overrides them rather than defining
-# them, and sets HIP_DISABLE_WARP_SYNC_BUILTINS to win the race), and hipBLAS
-# hgemm is usable. On an older ROCm those overrides land differently and the
-# result compiles but computes the wrong thing, which is the worst failure mode
-# available. Fail the build instead.
-#
-# Parsed from ROCM_PATH/.info/version, which is a bare "7.2.4". hipcc --version
-# reports the HIP runtime version ("7.2.53211") on a different numbering, and
-# torch.version.hip reports that same runtime number, so neither is comparable
-# against a ROCm release version without a mapping table.
 def _build_jobs():
     """Parallel hipcc jobs. MAX_JOBS overrides, matching torch/flash-attn convention.
 
@@ -233,6 +216,21 @@ def _build_jobs():
     return max(1, min(cpu, by_mem, 32))
 
 
+# ---------------------------------------------------------------------------
+# Minimum ROCm
+# ---------------------------------------------------------------------------
+# 7.2.4 is a hard floor, not a recommendation. ROCm changed materially between
+# 7.1 and 7.2 in ways this port now depends on -- notably __shfl_*_sync exists
+# and is default-on (rocm/hip_compat.hip.h overrides them rather than defining
+# them, and sets HIP_DISABLE_WARP_SYNC_BUILTINS to win the race), and hipBLAS
+# hgemm is usable. On an older ROCm those overrides land differently and the
+# result compiles but computes the wrong thing, which is the worst failure mode
+# available. Fail the build instead.
+#
+# Parsed from ROCM_PATH/.info/version, which is a bare "7.2.4". hipcc --version
+# reports the HIP runtime version ("7.2.53211") on a different numbering, and
+# torch.version.hip reports that same runtime number, so neither is comparable
+# against a ROCm release version without a mapping table.
 MIN_ROCM = (7, 2, 4)
 
 def _rocm_version(rocm_path):
@@ -477,7 +475,7 @@ class HIPBuildExtension(build_ext):
         #
         # Compiled in parallel. The CUDA path gets this free from ninja via
         # torch's BuildExtension; this builder drives hipcc directly and so has to
-        # do it itself. Serially this is ~25 min for ~100 sources on a 32-thread
+        # do it itself. Serially this is ~25 min for ~117 sources on a 32-thread
         # box with 31 threads idle -- the single largest cost of a source install.
         #
         # Threads, not processes: each task is a subprocess.run that blocks on an
