@@ -12,32 +12,75 @@
 //
 // The multi-matrix form dissolves that trade-off: bszm experts x (size_n / 16)
 // tiles gives 640-1920 warps for the shapes that matter (Laguna gate/up/down at
-// top-10), oversubscribing all 80 SIMDs without any cooperative launch. Four
+// top-10), oversubscribing all 80 SIMDs without any cooperative launch. Three
 // plain kernels replace the one cooperative one:
 //
-//   1. exl3_mgemv_had_in_kernel   per-expert input rotation (SUH), and the
-//                                 graph-patch prologue -- see below
-//   2. exl3_mgemv_dot_kernel      the GEMV proper, one warp per (expert, tile);
-//                                 per-warp core shared verbatim with the
-//                                 single-matrix kernel (exl3_gemv_dot_tile)
-//   3. exl3_mgemv_had_out_kernel  per-expert output rotation (SVH), folding in
+//   1. exl3_mgemv_dot_kernel      the GEMV proper, one warp per (expert, tile);
+//      (and _splitk)              per-warp core shared verbatim with the
+//                                 single-matrix kernel (exl3_gemv_dot_tile).
+//                                 Its prologue rotates the expert's input
+//                                 (SUH + 128-point Hadamard) into LDS, block-
+//                                 cooperatively, and hosts the graph-patch
+//                                 sites -- see below
+//                                 Its epilogue, run by the last-arriving warp
+//                                 of each 128-wide output segment, is the
+//                                 output rotation and the weighted-sum
+//                                 reduction -- see "Launch-count fusion"
+//   2. exl3_mgemv_had_out_kernel  per-expert output rotation (SVH), folding in
 //                                 the routing weight exactly as the cooperative
-//                                 kernel does (scale * weights[j])
-//   4. exl3_mgemv_reduce_kernel   the weighted-sum epilogue, mirroring the
-//                                 cooperative kernel's num_tokens grouping
+//                                 kernel does (scale * weights[j]) -- fallback
+//                                 form, EXL3_GEMV_FUSE_OUT=0
+//   3. exl3_mgemv_reduce_kernel   the weighted-sum epilogue, mirroring the
+//                                 cooperative kernel's num_tokens grouping --
+//                                 fallback form, as above
+//
+// Launch-count fusion (2026-09-23). The input rotation used to be its own
+// kernel (exl3_mgemv_had_in_kernel, writing A_had in global memory for the dot
+// kernel to read). Decode is host-bound at ~1720 launches/token on Laguna, and
+// the CP's ~2.1 us gap between dependent kernels is paid per launch on every
+// runtime (graph replay does not remove it -- see RDNA_NOTES, dispatch-gap
+// census), so the rotation moved into the dot kernel's prologue. Each block
+// rotates the full K of its expert into LDS (redundantly across the N-tiles of
+// that expert; A is m x K halfs, L2-resident, and the 128-point Hadamard is a
+// few shuffle stages, so the redundancy costs nothing measurable) and the dot
+// core reads A from LDS instead of global. The arithmetic is the same
+// function, in the same order, so the output is bit-identical to the
+// three-kernel form. A_had is no longer written by this path.
+//
+// The output side fused the same day. Each 128-wide rotation segment of an
+// expert's output is produced by 8 N-tiles -- 8 warps of one block in the
+// single-warp form, 8 blocks in the split-K form. After storing its 16 outputs
+// a warp fences and increments the segment's arrival counter (per segment,
+// not per block, so no tile-to-block alignment is assumed); the warp that
+// observes 7 earlier arrivals is the last, and it acquires, resets the counter
+// and applies svh + Hadamard + scale to the segment in place, on the same
+// stored (fp16-rounded, for half C) values and with the same arithmetic as
+// exl3_mgemv_had_out_kernel. When the call carries routing weights, a second
+// counter per segment counts rotated slots, and the last of the packed slots
+// runs the grouped reduction for its 128 columns in exl3_mgemv_reduce_kernel's
+// exact order. Counters live in the per-device parameter block: zeroed at
+// allocation, reset by their own last arriver, so no per-launch memset and no
+// graph patch site. This is the classic last-block pattern (release fence
+// before the increment, acquire fence after observing the final count); it is
+// wait-free, so it cannot hang. EXL3_GEMV_FUSE_OUT=0 restores the separate
+// rotation and reduction kernels, as does a shape whose counters would not
+// fit (none in practice). A MoE expert call is now one launch instead of
+// three (four with weights).
 //
 // Graph capture. Upstream records four patchable parameters per mgemm launch
 // (A, C, indices, weights -- add_graph_args in exl3_gemm_rdna.hip), and
 // Graph::launch() patches ONE site per caller-supplied parameter, walking sites
 // and params in lockstep. A multi-kernel path therefore cannot record the same
 // parameter on several kernels and expect all copies patched. Instead all four
-// sites are recorded on kernel 1, which takes all four as ordinary arguments
-// (C and weights exist there only to host the patch site) and republishes the
-// ones the downstream kernels need through a per-device Exl3MgemvParams block.
-// Downstream kernels read C/indices/weights from that block, so a patched
-// prologue re-propagates automatically on every replay. Site order (A, C,
-// indices, weights, GP_end) matches the cooperative path, which is what the
-// upstream callers' params subsequences are written against.
+// sites are recorded on the dot kernel, which takes all four as its first four
+// arguments (weights exists there only to host the patch site) and republishes
+// the ones the downstream kernels need through a per-device Exl3MgemvParams
+// block. Downstream kernels read C/indices/weights from that block, so a
+// patched prologue re-propagates automatically on every replay. Site order
+// (A, C, indices, weights, GP_end) matches the cooperative path, which is what
+// the upstream callers' params subsequences are written against. The dot
+// kernel is a template, so the sites are recorded against the instantiation
+// that was launched (exl3_mgemv_record_sites at the launch macro).
 //
 // Index packing (min_index >= 0). The cooperative kernel packs indices within
 // [min_index, max_index) into a device global and processes only the packed
@@ -73,6 +116,7 @@
 #include "../../graph.cuh"
 #include "exl3_mgemv_rdna.hip.h"
 #include "exl3_gemv_kernel_rdna.hip.h"
+#include "exl3_gemv_multirow_rdna.hip.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -115,137 +159,92 @@ static Exl3MgemvParams* exl3_mgemv_param_block(int device, bool allow_alloc)
             (void) cudaGetLastError();
             return nullptr;
         }
+        // The arrival counters must start at zero; they self-reset after that
+        if (cudaMemset(p, 0, sizeof(Exl3MgemvParams)) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            cudaFree(p);
+            return nullptr;
+        }
         blocks[device] = (Exl3MgemvParams*) p;
     }
     return blocks[device];
 }
 
-// -----------------------------------------------------------------------------
-// Slot resolution, shared by all four kernels
-// -----------------------------------------------------------------------------
-// Returns the matrix index for slot j and, through orig_pos, the position in
-// the ORIGINAL indices/weights arrays that slot j came from (equal to j when no
-// packing is active; the cooperative kernel packs weights alongside indices, so
-// weights are always addressed by packed slot once packing has happened --
-// which for this path means "the j-th valid original position").
-// Returns -1 when slot j has no matrix (fewer than j+1 indices in range).
-__device__ __forceinline__ int exl3_mgemv_mat_index
-(
-    const int64_t* __restrict__ indices,
-    int j,
-    int bszm,
-    int min_index,
-    int max_index,
-    int* orig_pos
-)
-{
-    if (!indices)
-    {
-        *orig_pos = j;
-        return j;
-    }
-    if (min_index < 0)
-    {
-        *orig_pos = j;
-        return (int) indices[j];
-    }
-    int seen = 0;
-    for (int i = 0; i < bszm; ++i)
-    {
-        int idx = (int) indices[i];
-        if (idx >= min_index && idx < max_index)
-        {
-            if (seen == j)
-            {
-                *orig_pos = i;
-                return idx - min_index;
-            }
-            seen++;
-        }
-    }
-    return -1;
-}
-
-// Packed slot count: bszm when no packing, else the number of in-range indices
-__device__ __forceinline__ int exl3_mgemv_packed_count
-(
-    const int64_t* __restrict__ indices,
-    int bszm,
-    int min_index,
-    int max_index
-)
-{
-    if (!indices || min_index < 0) return bszm;
-    int seen = 0;
-    for (int i = 0; i < bszm; ++i)
-    {
-        int idx = (int) indices[i];
-        if (idx >= min_index && idx < max_index) seen++;
-    }
-    return seen;
-}
+// Slot resolution (exl3_mgemv_mat_index / exl3_mgemv_packed_count) lives in
+// exl3_gemv_kernel_rdna.hip.h since the multi-row path shares it.
 
 // =============================================================================
-// Kernel 1: prologue + per-expert input rotation
+// Kernel-side glue for the fused epilogue (helpers: exl3_gemv_kernel_rdna.hip.h)
 // =============================================================================
-// Argument order 0-3 is load-bearing: these are the graph patch sites, recorded
-// as (A, C, indices, weights) to match the cooperative path's site order. C and
-// weights are not used by this kernel's own math.
-
-__global__
-__launch_bounds__(256)
-void exl3_mgemv_had_in_kernel
+// Resolves the per-matrix inputs from the launch arguments. Shared by both dot
+// kernels; entered by the tile's warp.
+template <bool c_fp32>
+__device__ __forceinline__ void exl3_mgemv_store_or_fuse
 (
-    const half* __restrict__ A,          // 0: GP_mgemm_A
-    void* __restrict__ C,                // 1: GP_mgemm_C (patch host only)
-    const int64_t* __restrict__ indices, // 2: GP_mgemm_indices
-    const half* __restrict__ weights,    // 3: GP_mgemm_weights (patch host only)
+    const float accum,
+    const bool fuse_out,
+    void* __restrict__ C,
+    void* const* __restrict__ c_list,
+    const uintptr_t* __restrict__ svh_list,
+    const half* __restrict__ weights,
+    const int64_t* __restrict__ indices,
     Exl3MgemvParams* __restrict__ pb,
-    const uintptr_t* __restrict__ suh_list,
-    half* __restrict__ A_had,
-    const int size_k,
-    const int bszm_in,
+    const int size_n,
     const int bszm,
     const int min_index,
-    const int max_index
+    const int max_index,
+    const int num_tokens,
+    const int j,
+    const int mat_index,
+    const int orig_pos,
+    const int tile_n,
+    const int lane
 )
 {
-    if (blockIdx.x == 0 && threadIdx.x == 0)
+    void* Cb = c_list ? c_list[mat_index] : C;
+    const int64_t row_off = c_list ? 0 : (int64_t) j * size_n;
+
+    if (!fuse_out)
     {
-        pb->C = C;
-        pb->indices = indices;
-        pb->weights = weights;
+        if (lane < 16)
+        {
+            const int64_t out_idx = row_off + tile_n * 16 + lane;
+            if constexpr (c_fp32)
+                ((float*) Cb)[out_idx] = accum;
+            else
+                ((half*) Cb)[out_idx] = __float2half(accum);
+        }
+        return;
     }
 
-    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int k_warps = size_k / 128;
-    if (warp_id >= bszm * k_warps) return;
+    float scale = 0.088388347648f;  // 1/sqrt(128)
+    if (weights) scale *= __half2float(weights[orig_pos]);
+    const int n_segs = size_n / 128;
+    int* seg_counter = pb->seg_counters + j * n_segs + tile_n / 8;
+    int* red_counter = weights ? pb->red_counters + tile_n / 8 : nullptr;
+    const int red_target = weights
+        ? exl3_mgemv_packed_count(indices, bszm, min_index, max_index) : 0;
 
-    int j   = warp_id / k_warps;
-    int seg = warp_id % k_warps;
-
-    int orig_pos;
-    int mat_index = exl3_mgemv_mat_index(indices, j, bszm, min_index, max_index, &orig_pos);
-    if (mat_index < 0) return;
-
-    const half* suh = (const half*) suh_list[mat_index];
-    const half* A_j = (bszm_in == 1 ? A : A + (int64_t) j * size_k) + seg * 128;
-    half* A_had_j   = A_had + (int64_t) j * size_k + seg * 128;
-
-    had_hf_r_128_inner<true, false>
+    exl3_gemv_fused_epilogue<c_fp32>
     (
-        A_j,
-        A_had_j,
-        suh + seg * 128,
-        0.088388347648f  // 1/sqrt(128)
+        accum, Cb, row_off, size_n, tile_n, lane,
+        (const half*) svh_list[mat_index], scale,
+        seg_counter, red_counter, red_target, num_tokens
     );
 }
 
 // =============================================================================
-// Kernel 2: the GEMV proper
+// Kernel 1: the GEMV proper, with the input rotation as its prologue
 // =============================================================================
 // Grid (ceil(n_tiles / WARPS_PER_BLOCK), bszm); one warp per (expert, N-tile).
 // The per-warp body is exl3_gemv_dot_tile, shared with the single-matrix GEMV.
+//
+// Argument order 0-3 is load-bearing: these are the graph patch sites, recorded
+// as (A, C, indices, weights) to match the cooperative path's site order.
+//
+// Every early exit that precedes the __syncthreads after the rotation is
+// block-uniform (j is the block's y); the per-warp tile exits come after it.
 
 template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
 __global__
@@ -253,31 +252,62 @@ __launch_bounds__(WARPS_PER_BLOCK * 32)
 __attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
 void exl3_mgemv_dot_kernel
 (
-    const Exl3MgemvParams* __restrict__ pb,
+    const half* __restrict__ A,           // 0: GP_mgemm_A
+    void* __restrict__ C,                 // 1: GP_mgemm_C
+    const int64_t* __restrict__ indices,  // 2: GP_mgemm_indices
+    const half* __restrict__ weights,     // 3: GP_mgemm_weights (patch host only)
+    Exl3MgemvParams* __restrict__ pb,
     const uintptr_t* __restrict__ B_list,
-    const half* __restrict__ A_had,
+    const uintptr_t* __restrict__ suh_list,
     const int size_k,
     const int size_n,
+    const int bszm_in,
     const int bszm,
     const int min_index,
     const int max_index,
     const int* __restrict__ size_n_list,  // per-matrix widths; size_n is the max
     void* const* __restrict__ c_list,     // per-matrix output bases (row 0; m == 1)
-    const bool lds_core
+    const uintptr_t* __restrict__ svh_list,
+    const int num_tokens,
+    const bool lds_core,
+    const bool fuse_out
 )
 {
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+    {
+        pb->C = C;
+        pb->indices = indices;
+        pb->weights = weights;
+    }
+
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int j = blockIdx.y;
-
-    const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     const int n_tiles = size_n / 16;
-    if (tile_n >= n_tiles) return;
 
-    const int64_t* indices = pb->indices;
     int orig_pos;
     int mat_index = exl3_mgemv_mat_index(indices, j, bszm, min_index, max_index, &orig_pos);
-    if (mat_index < 0) return;
+    if (mat_index < 0) return;   // block-uniform
+
+    // Dynamic shared memory -- the single-matrix carve, then the rotated input
+    extern __shared__ char shared_mem[];
+    constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
+    half* sh_b_dq = (half*) shared_mem;
+    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
+    half* sh_a = (half*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
+    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
+    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
+
+    // Prologue: rotate this expert's input into LDS
+    {
+        const half* suh = (const half*) suh_list[mat_index];
+        const half* A_src = bszm_in == 1 ? A : A + (int64_t) j * size_k;
+        exl3_gemv_rotate_in<WARPS_PER_BLOCK>(A_src, suh, sh_a, size_k, warp_id, lane);
+    }
+    __syncthreads();
+
+    const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    if (tile_n >= n_tiles) return;
 
     // Per-matrix width (the cooperative kernel's n_j): the grid covers the
     // widest matrix, warps beyond a narrower one exit here. B is packed at the
@@ -286,130 +316,121 @@ void exl3_mgemv_dot_kernel
     if (tile_n >= n_tiles_j) return;
 
     const uint16_t* B = (const uint16_t*) B_list[mat_index];
-    const half* A_j = A_had + (int64_t) j * size_k;
-
-    // Dynamic shared memory -- same carve as the single-matrix kernel
-    extern __shared__ char shared_mem[];
-    constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
-    half* sh_b_dq = (half*) shared_mem;
-    uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
-    half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
-    uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
     float accum = lds_core
         ? exl3_gemv_dot_tile<bits, cb>
           (
-              A_j, B, size_k, n_tiles_j, tile_n, lane, my_sh_b, my_sh_b_quant,
+              sh_a, B, size_k, n_tiles_j, tile_n, lane, my_sh_b, my_sh_b_quant,
               0, size_k / 16
           )
         : exl3_gemv_dot_tile_direct<bits, cb>
           (
-              A_j, B, n_tiles_j, tile_n, lane, 0, size_k / 16
+              sh_a, B, n_tiles_j, tile_n, lane, 0, size_k / 16
           );
 
-    if (lane < 16)
-    {
-        if (c_list)
-        {
-            // Each matrix owns its output tensor; no j stride (m == 1)
-            const int out_idx = tile_n * 16 + lane;
-            if constexpr (c_fp32)
-                ((float*) c_list[mat_index])[out_idx] = accum;
-            else
-                ((half*) c_list[mat_index])[out_idx] = __float2half(accum);
-        }
-        else
-        {
-            const int64_t out_idx = (int64_t) j * size_n + tile_n * 16 + lane;
-            if constexpr (c_fp32)
-                ((float*) pb->C)[out_idx] = accum;
-            else
-                ((half*) pb->C)[out_idx] = __float2half(accum);
-        }
-    }
+    // Store, or the fused rotation / reduction epilogue (each matrix owns its
+    // own output tensor under c_list, with no j stride -- m == 1)
+    exl3_mgemv_store_or_fuse<c_fp32>
+    (
+        accum, fuse_out, C, c_list, svh_list, weights, indices, pb,
+        size_n, bszm, min_index, max_index, num_tokens,
+        j, mat_index, orig_pos, tile_n, lane
+    );
 }
 
-// Split-K form of kernel 2: one block per (expert, N-tile), warps share K.
+// Split-K form of kernel 1: one block per (expert, N-tile), warps share K.
 // The expert shapes this path exists for are exactly the narrow-output ones
 // the single-warp form starves on (64 tiles at 1024 wide), so in practice
 // this is the form MoE decode takes; the threshold keeps parity with the
-// single-matrix sites.
+// single-matrix sites. Same argument contract as the single-warp form.
 template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
 __global__
 __launch_bounds__(WARPS_PER_BLOCK * 32)
 __attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
 void exl3_mgemv_dot_kernel_splitk
 (
-    const Exl3MgemvParams* __restrict__ pb,
+    const half* __restrict__ A,           // 0: GP_mgemm_A
+    void* __restrict__ C,                 // 1: GP_mgemm_C
+    const int64_t* __restrict__ indices,  // 2: GP_mgemm_indices
+    const half* __restrict__ weights,     // 3: GP_mgemm_weights (patch host only)
+    Exl3MgemvParams* __restrict__ pb,
     const uintptr_t* __restrict__ B_list,
-    const half* __restrict__ A_had,
+    const uintptr_t* __restrict__ suh_list,
     const int size_k,
     const int size_n,
+    const int bszm_in,
     const int bszm,
     const int min_index,
     const int max_index,
     const int* __restrict__ size_n_list,  // per-matrix widths; size_n is the max
     void* const* __restrict__ c_list,     // per-matrix output bases (row 0; m == 1)
-    const bool lds_core
+    const uintptr_t* __restrict__ svh_list,
+    const int num_tokens,
+    const bool lds_core,
+    const bool fuse_out
 )
 {
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+    {
+        pb->C = C;
+        pb->indices = indices;
+        pb->weights = weights;
+    }
+
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int j = blockIdx.y;
     const int tile_n = blockIdx.x;
     const int n_tiles = size_n / 16;
 
-    const int64_t* indices = pb->indices;
     int orig_pos;
     int mat_index = exl3_mgemv_mat_index(indices, j, bszm, min_index, max_index, &orig_pos);
     if (mat_index < 0) return;   // whole block exits together; no sync hazard
 
     // Per-matrix width: tile_n and mat_index are block-uniform, so the whole
-    // block exits together here too and the split-K __syncthreads is safe
+    // block exits together here too and the __syncthreads below are safe
     const int n_tiles_j = size_n_list ? size_n_list[mat_index] / 16 : n_tiles;
     if (tile_n >= n_tiles_j) return;
 
     const uint16_t* B = (const uint16_t*) B_list[mat_index];
-    const half* A_j = A_had + (int64_t) j * size_k;
 
     extern __shared__ char shared_mem[];
     constexpr int SH_STRIDE = EXL3_GEMV_SH_STRIDE;
     half* sh_b_dq = (half*) shared_mem;
     uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
     float* sh_red = (float*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
+    half* sh_a = (half*) (sh_red + WARPS_PER_BLOCK * 16);
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
+    // Prologue: rotate this expert's input into LDS
+    {
+        const half* suh = (const half*) suh_list[mat_index];
+        const half* A_src = bszm_in == 1 ? A : A + (int64_t) j * size_k;
+        exl3_gemv_rotate_in<WARPS_PER_BLOCK>(A_src, suh, sh_a, size_k, warp_id, lane);
+    }
+    __syncthreads();
+
     float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
     (
-        A_j, B, size_k, n_tiles_j, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant,
+        sh_a, B, size_k, n_tiles_j, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant,
         sh_red, lds_core
     );
 
-    if (warp_id == 0 && lane < 16)
-    {
-        if (c_list)
-        {
-            const int out_idx = tile_n * 16 + lane;
-            if constexpr (c_fp32)
-                ((float*) c_list[mat_index])[out_idx] = accum;
-            else
-                ((half*) c_list[mat_index])[out_idx] = __float2half(accum);
-        }
-        else
-        {
-            const int64_t out_idx = (int64_t) j * size_n + tile_n * 16 + lane;
-            if constexpr (c_fp32)
-                ((float*) pb->C)[out_idx] = accum;
-            else
-                ((half*) pb->C)[out_idx] = __float2half(accum);
-        }
-    }
+    if (warp_id == 0)
+        exl3_mgemv_store_or_fuse<c_fp32>
+        (
+            accum, fuse_out, C, c_list, svh_list, weights, indices, pb,
+            size_n, bszm, min_index, max_index, num_tokens,
+            j, mat_index, orig_pos, tile_n, lane
+        );
 }
 
 // =============================================================================
-// Kernel 3: per-expert output rotation, weight folded into the scale
+// Kernel 2: per-expert output rotation, weight folded into the scale
 // =============================================================================
+// Fallback form (EXL3_GEMV_FUSE_OUT=0, or counters that would not fit); the
+// dot kernels' fused epilogue reproduces this bit for bit.
 
 template <bool c_fp32>
 __global__
@@ -471,8 +492,9 @@ void exl3_mgemv_had_out_kernel
 }
 
 // =============================================================================
-// Kernel 4: weighted-sum epilogue
+// Kernel 3: weighted-sum epilogue
 // =============================================================================
+// Fallback form, as kernel 2.
 // Mirrors the cooperative kernel's reduction (m == 1 form): each of the
 // num_tokens groups of (packed / num_tokens) contiguous slots sums into its own
 // output row. Accumulation dtype matches the cooperative kernel (half chain for
@@ -529,6 +551,17 @@ void exl3_mgemv_reduce_kernel
 // =============================================================================
 // Host dispatch
 // =============================================================================
+
+// Graph patch sites, recorded against the dot-kernel instantiation that was
+// launched. Site order matches the cooperative path: A, C, indices, weights.
+static void exl3_mgemv_record_sites(Graph* graph, void* k)
+{
+    graph->record_param(k, GP_mgemm_A, 0);
+    graph->record_param(k, GP_mgemm_C, 1);
+    graph->record_param(k, GP_mgemm_indices, 2);
+    graph->record_param(k, GP_mgemm_weights, 3);
+    graph->record_param(k, GP_end, 0);
+}
 
 // One warp per (expert, 16-wide tile); 8 warps per block. The per-expert tile
 // counts this path exists for (64 at 1024-wide, 192 at 3072-wide) are multiples
@@ -592,34 +625,23 @@ bool exl3_mgemv_try_launch
 
     Exl3MgemvParams* pb = exl3_mgemv_param_block(device, graph == nullptr);
     if (!pb) return false;
+    if (!graph) exl3_gemv_multirow_prewarm(device);   // the m = 2..8 path's block
+
+    // The rotated input lives in the dot kernel's LDS; the caller's A_had
+    // scratch is neither read nor written by this path.
+    (void) A_had_ptr;
+
+    // Fused output epilogue unless switched off or the arrival counters would
+    // not fit this shape (bszm x segments, and segments; see the header)
+    const int n_segs = size_n / 128;
+    const bool fuse_out = exl3_gemv_fuse_out_enabled()
+        && bszm * n_segs <= EXL3_MGEMV_SEG_COUNTERS
+        && n_segs <= EXL3_MGEMV_RED_COUNTERS;
 
     // -------------------------------------------------------------------------
-    // 1. Prologue + input rotation
-    // -------------------------------------------------------------------------
-    {
-        int k_warps = size_k / 128;
-        int blocks = CEIL_DIVIDE(bszm * k_warps * 32, 256);
-        hipLaunchKernelGGL
-        (
-            exl3_mgemv_had_in_kernel,
-            dim3(blocks), dim3(256), 0, stream,
-            A_ptr, C_ptr, indices_ptr, weights_ptr, pb,
-            suh_ptr_ptr, A_had_ptr, size_k, bszm_in, bszm, min_index, max_index
-        );
-        if (graph)
-        {
-            void* k = (void*) exl3_mgemv_had_in_kernel;
-            graph->record_param(k, GP_mgemm_A, 0);
-            graph->record_param(k, GP_mgemm_C, 1);
-            graph->record_param(k, GP_mgemm_indices, 2);
-            graph->record_param(k, GP_mgemm_weights, 3);
-            graph->record_param(k, GP_end, 0);
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // 2. GEMV -- split-K when the per-expert output is narrow (same rule as
-    //    the single-matrix sites), which for MoE decode it always is
+    // 1. GEMV, with the input rotation as its prologue -- split-K when the
+    //    per-expert output is narrow (same rule as the single-matrix sites),
+    //    which for MoE decode it always is
     // -------------------------------------------------------------------------
     {
         int n_tiles = size_n / 16;
@@ -634,22 +656,27 @@ bool exl3_mgemv_try_launch
 
         dim3 grid(splitk ? n_tiles : CEIL_DIVIDE(n_tiles, warps), bszm);
         dim3 block(warps * 32);
-        size_t smem = splitk ? exl3_gemv_smem_bytes_splitk(warps)
-                             : exl3_gemv_smem_bytes(warps);
+        size_t smem = exl3_gemv_smem_bytes_fused(warps, splitk, size_k);
 
         #define LAUNCH_MGEMV_FP(bits_val, codebook, warps_val, kernel_name) \
             if (c_fp32) { \
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, true, codebook, warps_val>), \
                     grid, block, smem, stream, \
-                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, \
-                    size_n_list, c_list, lds_core); \
+                    A_ptr, C_ptr, indices_ptr, weights_ptr, pb, B_ptr_ptr, suh_ptr_ptr, \
+                    size_k, size_n, bszm_in, bszm, min_index, max_index, \
+                    size_n_list, c_list, svh_ptr_ptr, num_tokens, lds_core, fuse_out); \
+                if (graph) exl3_mgemv_record_sites(graph, \
+                    (void*) &kernel_name<bits_val, true, codebook, warps_val>); \
             } else { \
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, false, codebook, warps_val>), \
                     grid, block, smem, stream, \
-                    pb, B_ptr_ptr, A_had_ptr, size_k, size_n, bszm, min_index, max_index, \
-                    size_n_list, c_list, lds_core); \
+                    A_ptr, C_ptr, indices_ptr, weights_ptr, pb, B_ptr_ptr, suh_ptr_ptr, \
+                    size_k, size_n, bszm_in, bszm, min_index, max_index, \
+                    size_n_list, c_list, svh_ptr_ptr, num_tokens, lds_core, fuse_out); \
+                if (graph) exl3_mgemv_record_sites(graph, \
+                    (void*) &kernel_name<bits_val, false, codebook, warps_val>); \
             }
 
         #define LAUNCH_MGEMV_CB(bits_val, codebook) \
@@ -686,8 +713,10 @@ bool exl3_mgemv_try_launch
         #undef LAUNCH_MGEMV_FP
     }
 
+    if (fuse_out) return true;
+
     // -------------------------------------------------------------------------
-    // 3. Output rotation (+ routing weight)
+    // 2. Output rotation (+ routing weight) -- fallback form
     // -------------------------------------------------------------------------
     {
         int n_warps = size_n / 128;
@@ -711,7 +740,7 @@ bool exl3_mgemv_try_launch
     }
 
     // -------------------------------------------------------------------------
-    // 4. Weighted-sum epilogue (only when the call has routing weights, exactly
+    // 3. Weighted-sum epilogue -- fallback form (only when the call has routing weights, exactly
     //    like the cooperative kernel's `if (B_weights)` epilogue; whether the
     //    argument is present is fixed per call site, so this is graph-stable)
     // -------------------------------------------------------------------------

@@ -13,32 +13,50 @@
 
 class Graph;
 
-// Device-side parameter block, one per device. The prologue kernel receives the
-// graph-patchable pointers (C, indices, weights) as ordinary kernel arguments
-// -- making it the single node whose parameters Graph::launch() patches -- and
-// republishes them here for the downstream kernels, whose own argument copies
-// would otherwise go stale after a patch. In-stream ordering makes the handoff
-// safe: the prologue finishes before any consumer launches, and sequential
+// Device-side parameter block, one per device. The dot kernel (whose prologue
+// is the input rotation) receives the graph-patchable pointers (C, indices,
+// weights) as ordinary kernel arguments -- making it the single node whose
+// parameters Graph::launch() patches -- and republishes them here for the
+// downstream kernels, whose own argument copies would otherwise go stale after
+// a patch. In-stream ordering makes the handoff safe: the dot kernel finishes
+// before any consumer launches, and sequential
 // calls sharing the block cannot interleave on one stream. Two streams mutating
 // one device concurrently would race on this block, but they already race on
 // DevCtx's shared `locks` buffer in the cooperative path, so this adds no new
 // constraint.
+//
+// The arrival counters of the fused output epilogue live here too (see the
+// "Launch-count fusion" section of exl3_mgemv_rdna.hip): seg_counters is
+// indexed [slot][segment] with segment = 128-wide output block, red_counters
+// by segment. Zeroed when the block is allocated; each counter is reset by
+// the warp that observes its final arrival, so a completed launch leaves them
+// all zero again. A shape needing more than this many falls back to the
+// separate rotation / reduction kernels.
+#define EXL3_MGEMV_SEG_COUNTERS (128 * 256)
+#define EXL3_MGEMV_RED_COUNTERS 1024
 struct Exl3MgemvParams
 {
     void* C;
     const int64_t* indices;
     const half* weights;
+    int seg_counters[EXL3_MGEMV_SEG_COUNTERS];
+    int red_counters[EXL3_MGEMV_RED_COUNTERS];
 };
 
 // Single-matrix analogue for the graph-captured exl3_gemm path, implemented in
 // exl3_gemv_rdna.hip beside the non-graph dispatch. Same prologue-republish
 // trick with the six GP_gemm_* sites; see the comment there.
+// The fused output epilogue's per-segment arrival counters live here as in
+// Exl3MgemvParams (one matrix, so segments only); same zero-at-allocation,
+// self-resetting contract.
+#define EXL3_GEMV_SEG_COUNTERS 1024
 struct Exl3GemvGraphParams
 {
     const uint16_t* B;
     void* C;
     half* A_had;
     const half* svh;
+    int seg_counters[EXL3_GEMV_SEG_COUNTERS];
 };
 
 bool exl3_gemv_graph_try_launch
@@ -63,6 +81,11 @@ bool exl3_gemv_graph_try_launch
 // Defined in exl3_gemv_rdna.hip; the EXL3_GEMV_SPLITK kill switch, re-read per
 // call, shared by every split-K launch site.
 bool exl3_gemv_splitk_enabled();
+
+// Defined in exl3_gemv_rdna.hip; the EXL3_GEMV_FUSE_OUT kill switch for the
+// fused output epilogue of both the single- and multi-matrix paths, re-read
+// per call.
+bool exl3_gemv_fuse_out_enabled();
 
 // Defined in exl3_gemv_rdna.hip; shape-aware split-K wave count (4, 8 or 16),
 // shared by the plain, graph and mgemv split-K sites. bszm is the grid's
@@ -90,7 +113,7 @@ static inline bool exl3_gemv_rdna_pays(int size_k, int size_n)
     return true;
 }
 
-// Launches the multi-matrix GEMV pipeline (rotate + dot + rotate + reduce) if
+// Launches the multi-matrix GEMV pipeline (rotate+dot, rotate, reduce) if
 // the call is eligible, returning true. Returns false -- having launched
 // nothing -- when the call must fall through to the cooperative exl3_mgemm.
 bool exl3_mgemv_try_launch

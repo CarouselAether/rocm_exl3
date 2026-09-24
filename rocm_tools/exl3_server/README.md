@@ -15,7 +15,8 @@ python rocm_tools/exl3_server/server.py -m ~/models/Laguna-S-2.1-exl3-4.00bpw -c
 Dependencies (fastapi, uvicorn, sse-starlette, transformers, jinja2) come with
 `pip install -r requirements_rocm.txt`.
 
-All chat.py loader/sampler flags work: `-gs`, `-cs`, `-cq`, `-tp`,
+The complete flag reference, every flag with what it does, is in the main
+[README's Server section](../../README.md#server). In short, all chat.py loader/sampler flags work: `-gs`, `-cs`, `-cq`, `-tp`,
 `-mcl/-mcs/-mct`, draft model flags (`-dm`, `-ndt`, `-dds`, `-ngram`, `-mtp`),
 `-temp/-minp/-topk/-topp/-repp/-presp/-freqp/-penr`, etc. CLI sampling values
 are the *defaults*; each request can override them.

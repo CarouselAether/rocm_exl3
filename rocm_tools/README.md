@@ -54,6 +54,27 @@ ROCm. The measured result is counter-intuitive and worth re-checking on new
 hardware: the narrow-kv config is *faster* on RDNA, because upstream sizes tiles
 for ~100 KB of smem and RDNA 3.5 has 64 KB of LDS.
 
+## `mgemv_bitwise.py` and `decode_bitwise.py`
+
+Bitwise A/B across a code change, for changes whose arithmetic is claimed to
+be identical (the 2026-09 launch-count fusions). Each runs twice: `--save
+ref.pt` on the build before the change, `--compare ref.pt` on the build after
+it, and fails on any differing bit.
+
+```bash
+python rocm_tools/mgemv_bitwise.py  -m /path/to/moe-model --save ref.pt    # old build
+python rocm_tools/mgemv_bitwise.py  -m /path/to/moe-model --compare ref.pt # new build
+python rocm_tools/decode_bitwise.py -m /path/to/model --save ref.pt
+python rocm_tools/decode_bitwise.py -m /path/to/model --compare ref.pt
+```
+
+`mgemv_bitwise.py` drives the multi-matrix GEMV (`exl3_mgemv_rdna.hip`)
+directly, over the same routing configurations `mgemv_check.py` covers.
+`decode_bitwise.py` greedy-decodes a fixed prompt and records every step's
+logits, which is the only way to reach the single-matrix graph GEMV path (it
+runs inside the BC modules, which no binding exposes). A tolerance check
+cannot tell a pure refactor from a few-ulp change; these can.
+
 ## Re-verifying after a ROCm upgrade
 
 ROCm changed substantially between 7.1 and 7.2 — several workarounds in the
