@@ -58,13 +58,17 @@ def main():
     ap.add_argument("-n", "--new_tokens", type=int, default=32)
     ap.add_argument("-k", "--top", type=int, default=20)
     ap.add_argument("-ndt", "--num_draft_tokens", type=int, default=0,
-                    help="profile MTP decode with this many draft tokens from the model's "
-                         "own MTP head (verify steps run num_draft_tokens + 1 rows)")
+                    help="profile speculative decode with this many draft tokens from the "
+                         "model's own MTP head, or from -dm (verify steps run ndt + 1 rows)")
+    ap.add_argument("-dm", "--draft_model_dir", default=None,
+                    help="separate draft model (DFlash / EAGLE-style) instead of the MTP head")
     args = ap.parse_args()
 
     ndt = args.num_draft_tokens
+    dm = args.draft_model_dir
     print(f" -- loading {os.path.basename(args.model_dir.rstrip('/'))}"
-          f"{' (+ MTP head)' if ndt else ''}", flush=True)
+          f"{(' (+ draft ' + os.path.basename(dm.rstrip('/')) + ')') if (ndt and dm) else (' (+ MTP head)' if ndt else '')}",
+          flush=True)
     config = Config.from_directory(args.model_dir)
     model = Model.from_config(config)
     tokenizer = Tokenizer.from_config(config)
@@ -72,7 +76,10 @@ def main():
     cache = Cache(model, max_num_tokens=4096, max_history=max(ndt, 4))
     draft_model = draft_cache = None
     if ndt:
-        draft_model = Model.from_config(config, component="mtp")
+        if dm:
+            draft_model = Model.from_config(Config.from_directory(dm), component="text")
+        else:
+            draft_model = Model.from_config(config, component="mtp")
         draft_cache = Cache(draft_model, max_num_tokens=4096)
     model.load(progressbar=False)
     if ndt:

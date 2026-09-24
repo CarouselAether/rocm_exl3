@@ -65,6 +65,31 @@ int exl3_gemv_max_m()
     return v < 1 ? 1 : (v > 8 ? 8 : v);
 }
 
+// m == 1 goes through this structure too, with a row tile of 1 -- rows read
+// from L2, no rotated row in LDS -- ahead of the fused m == 1 kernels
+// (EXL3_GEMV_MR_M1=0 restores those). Measured 2026-09-23: at m = 3 this
+// kernel ran below the fused m == 1 kernel per call on the same shapes (71
+// vs 78 us), which pointed at the LDS prologue's occupancy cost, and the A/B
+// confirmed it -- Laguna's gate/up kernel 343 -> 319 ms per 32 tokens, total
+// kernel time back to the pre-fusion figure, decode Laguna 23.5 -> 23.6,
+// Qwen3.8 23.8 -> 24.4, DS4 16.2 -> 17.0 t/s, bit-identical logits
+// (decode_bitwise). Two launches instead of one, but the launch was never
+// the cost (RDNA_NOTES, "Launch-count fusion: landed"). The fused kernels
+// keep the weighted-reduce MoE down projection (this path declines weights)
+// and lm_head-scale widths (the m == 1 single-warp form; leaving them there
+// keeps the two routes bit-identical where both split K).
+static bool exl3_gemv_mr_m1_enabled()
+{
+    const char* env = std::getenv("EXL3_GEMV_MR_M1");
+    if (!env) return true;
+    return atoi(env) != 0;
+}
+
+static inline int exl3_gemv_mr_min_m(int n_tiles)
+{
+    return (exl3_gemv_mr_m1_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES) ? 1 : 2;
+}
+
 // -----------------------------------------------------------------------------
 // Per-device parameter block: the patchable pointers the dot kernels read
 // (republished by the rotation kernels, which host the graph sites) and the
@@ -487,7 +512,7 @@ void exl3_gemv_mr_dot_multi
 
 static inline int exl3_gemv_mr_row_tile(int size_m)
 {
-    return size_m <= 2 ? 2 : (size_m <= 4 ? 4 : 8);
+    return size_m <= 1 ? 1 : (size_m <= 2 ? 2 : (size_m <= 4 ? 4 : 8));
 }
 
 // Split-K wave count: the m == 1 rule (shape-aware; EXL3_GEMV_SPLITK_WARPS
@@ -511,6 +536,7 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
     }
 #define LAUNCH_MR_W(bits_val, codebook, warps_val, kernel_name, ...) \
     switch (m_tile) { \
+        case 1: LAUNCH_MR_M(bits_val, codebook, warps_val, 1, kernel_name, __VA_ARGS__) break; \
         case 2: LAUNCH_MR_M(bits_val, codebook, warps_val, 2, kernel_name, __VA_ARGS__) break; \
         case 4: LAUNCH_MR_M(bits_val, codebook, warps_val, 4, kernel_name, __VA_ARGS__) break; \
         case 8: LAUNCH_MR_M(bits_val, codebook, warps_val, 8, kernel_name, __VA_ARGS__) break; \
@@ -558,7 +584,7 @@ bool exl3_gemv_multirow_try_launch
     Graph* graph
 )
 {
-    if (size_m < 2 || size_m > exl3_gemv_max_m()) return false;
+    if (size_m < exl3_gemv_mr_min_m(size_n / 16) || size_m > exl3_gemv_max_m()) return false;
     if (K < 1 || K > 8) return false;
     if (size_k % 128 || size_n % 128) return false;
     if (!suh_ptr || !A_had_ptr || !svh_ptr) return false;
@@ -629,7 +655,7 @@ bool exl3_mgemv_multirow_try_launch
     Graph* graph
 )
 {
-    if (size_m < 2 || size_m > exl3_gemv_max_m()) return false;
+    if (size_m < exl3_gemv_mr_min_m(size_n / 16) || size_m > exl3_gemv_max_m()) return false;
     if (K < 1 || K > 8) return false;
     if (size_k % 128 || size_n % 128) return false;
     if (weights_ptr || num_tokens != 1) return false;

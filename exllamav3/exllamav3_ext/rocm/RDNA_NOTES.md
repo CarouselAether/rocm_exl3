@@ -1449,3 +1449,51 @@ verify step is now MoE-loop-bound on DS4, and the flat 19.9 says the
 multi-row dense path is no longer what limits it. Coherent at every setting.
 The m = 8 row tile is exercised and correct (multirow_check covers m=8
 directly; the ndt=7 text is clean).
+
+### Row tile 1: m == 1 through the multi-row structure (2026-09-23)
+
+The A/B the 71-vs-78 us observation asked for. `EXL3_GEMV_MR_M1` routes
+m == 1 through exl3_gemv_multirow_rdna.hip with a row tile of 1 (rotation
+kernel to A_had, dot kernel reading its row from L2, 8 KB of smem) instead
+of the fused m == 1 kernels (rotation in LDS: 13-31 KB of smem). Bit-identical
+logits either way (decode_bitwise PASS with the switch on; lm_head-scale
+widths stay on the single-warp m == 1 form so the two routes split K
+identically). Measured, bench_model -p 512 -n 128 -r 4:
+
+| | fused m == 1 (LDS prologue) | row tile 1 (A from L2) |
+|---|---|---|
+| Laguna 4bpw | 23.5 | 23.6 |
+| Qwen3.8 4bpw | 23.8 | **24.4** |
+| DS4 2.04bpw | 16.2 | **17.0** |
+
+Laguna profile: gate/up kernel 343 -> 319 ms per 32 tokens, the dense
+kernels -8%, total kernel time 1.085 -> 1.063 s -- back to the pre-fusion
+figure, with one launch more per call than the fused form. So the LDS
+rotation prologue cost more occupancy than its launch saved; **row tile 1
+is now the default** (`EXL3_GEMV_MR_M1=0` restores the fused form). What
+stays on the fused kernels: the weighted-reduce MoE down projection (the
+multi-row path declines weights) and lm_head. Two follow-ups fall out:
+give the multi-row epilogue the weighted reduce so the down projection can
+move too, and drop the LDS prologue from the m == 1 kernels once nothing
+routes there but those two cases. The launch-count fusion's lasting parts
+are the fused output epilogue (used by both structures) and the counters.
+
+### Laguna with its DFlash drafter (2026-09-23)
+
+`bench_mtp.py -dm ~/models/Laguna-S-2.1-DFlash` (route dflash, drafter's
+default_draft_size 15), multi-row build: net loss. Plain 24.7 t/s greedy;
+ndt 1/2/3/5/7 = 19.4/19.3/17.7/14.4/11.5 at acceptance 72/52/45/34/23% on
+the natural prompts (76% on profile_decode's 1-token prompt, so acceptance
+is prompt-sensitive rather than broken). profile_decode -dm -ndt 2: 99 ms
+of GPU per verify step, of which the per-token MoE loop is 40 ms (three
+tokens' gate/up/down, one token at a time), the multi-row dense verify 13
+ms -- and the **drafter itself 28 ms**: it is an unquantized BF16 model
+whose m == 1 linears run through torch.mm / rocBLAS, and rocBLAS handles
+them as skinny GEMMs (`Cijk_..._HSS_BH_MT128x32x16` at 557 us per call,
+`aten::mm` at 216 us) -- the same one-workgroup-walks-K pathology the
+attention gate had (RDNA_NOTES "Narrow-N hgemm"), which the fp16 split-K
+kernels only cover for N <= 256. Extending those to any N at m <= 8 (a plain
+fp16 GEMV, trivially bandwidth-bound) would take the drafter to a few ms per
+step; with the MoE loop batched as well the step would be ~50 ms at 2.5
+tokens, i.e. the DFlash route would pay. Both items are on the list; neither
+is a kernel-numerics problem.

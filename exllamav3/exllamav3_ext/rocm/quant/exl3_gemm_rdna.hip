@@ -322,7 +322,8 @@ int exl3_gemm_gr
     // (exl3_gemv_rdna_pays) and the EXL3_GEMV env modes.
     // m = 2..8 (speculative-decoding verify steps): the multi-row GEMV, in and
     // out of capture, before the cooperative GEMM (exl3_gemv_multirow_rdna.hip)
-    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 2 && size_m <= 8)
+    // (size_m >= 1: the path itself declines m == 1 unless EXL3_GEMV_MR_M1 is on)
+    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 8)
     {
         if (exl3_gemv_multirow_try_launch
         (
@@ -686,6 +687,27 @@ int exl3_mgemm_gr
     // the runtime kill switch. Falls through when ineligible.
     // Sliced mode (had_src_list) is per-source strided; the plain-launch mgemv does not
     // know about strides, so it takes the cooperative kernel below, as upstream does.
+    // m = 2..8: the multi-row form of the multi-matrix GEMV (declines weights,
+    // sliced mode and multi-token calls itself)
+    // (size_m >= 1: the path declines m == 1 unless EXL3_GEMV_MR_M1 is on, so the
+    // m == 1 route below still owns m == 1 by default)
+    if (size_m >= 1 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list)
+    {
+        if (exl3_mgemv_multirow_try_launch
+        (
+            A_ptr, B_ptr_ptr, C_ptr, suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
+            indices_ptr, weights_ptr,
+            size_m, size_k, size_n, K, cb, c_fp32,
+            bszm_in, bszm_out, min_index, max_index, num_tokens,
+            size_n_list_ptr, c_list_ptr,
+            device, stream, graph
+        ))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 93;
+        }
+    }
+
     if (size_m == 1 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list)
     {
         if (exl3_mgemv_try_launch
@@ -700,25 +722,6 @@ int exl3_mgemm_gr
         {
             cuda_check(cudaPeekAtLastError());
             return 0;
-        }
-    }
-
-    // m = 2..8: the multi-row form of the multi-matrix GEMV (declines weights,
-    // sliced mode and multi-token calls itself)
-    if (size_m >= 2 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list)
-    {
-        if (exl3_mgemv_multirow_try_launch
-        (
-            A_ptr, B_ptr_ptr, C_ptr, suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
-            indices_ptr, weights_ptr,
-            size_m, size_k, size_n, K, cb, c_fp32,
-            bszm_in, bszm_out, min_index, max_index, num_tokens,
-            size_n_list_ptr, c_list_ptr,
-            device, stream, graph
-        ))
-        {
-            cuda_check(cudaPeekAtLastError());
-            return 93;
         }
     }
 

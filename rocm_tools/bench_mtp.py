@@ -9,6 +9,7 @@ cooperative GEMM and the bszN MoE route at m <= 8. Reported per num_draft_tokens
 
     rocm_tools/bench_mtp.py -m /path/to/model                 # plain, then -ndt 2
     rocm_tools/bench_mtp.py -m /path/to/model -ndt 3 2 1 -n 256
+    rocm_tools/bench_mtp.py -m ~/models/Laguna-S-2.1-exl3-4.00bpw -dm ~/models/Laguna-S-2.1-DFlash -ndt 5 3 2
 
 Plain figures follow bench_model.py (random 512-token prompt, 128 new tokens,
 median of repeats) for continuity with recorded numbers, plus a natural-prompt
@@ -65,14 +66,22 @@ def main():
     ap.add_argument("-n", "--new_tokens", type=int, default=256)
     ap.add_argument("-r", "--repeats", type=int, default=3)
     ap.add_argument("--no_plain", action="store_true")
+    ap.add_argument("-dm", "--draft_model_dir", default=None,
+                    help="separate draft model (DFlash / EAGLE-style, e.g. Laguna-S-2.1-DFlash) "
+                         "instead of the model's own MTP head")
     args = ap.parse_args()
 
     label = os.path.basename(args.model_dir.rstrip("/"))
-    print(f" -- loading {label} (+ MTP head)", flush=True)
+    dm = args.draft_model_dir
+    print(f" -- loading {label} (+ {'draft ' + os.path.basename(dm.rstrip('/')) if dm else 'MTP head'})", flush=True)
     t0 = time.perf_counter()
     config = Config.from_directory(args.model_dir)
     model = Model.from_config(config)
-    draft_model = Model.from_config(config, component="mtp")
+    if dm:
+        draft_config = Config.from_directory(dm)
+        draft_model = Model.from_config(draft_config, component="text")
+    else:
+        draft_model = Model.from_config(config, component="mtp")
     tokenizer = Tokenizer.from_config(config)
     # max_history mirrors model_init: recurrent-state models (gated delta net) keep
     # num_draft_tokens + 1 snapshots so a rejected draft can roll back
@@ -82,7 +91,8 @@ def main():
     model.load(progressbar=False)
     draft_model.load(progressbar=False)
     print(f" -- loaded in {time.perf_counter() - t0:.1f}s; draft caps: "
-          f"mtp_draft={draft_model.caps.get('mtp_draft')} default_draft_size={draft_model.caps.get('default_draft_size')}",
+          f"mtp_draft={draft_model.caps.get('mtp_draft')} dflash_draft={draft_model.caps.get('dflash_draft')} "
+          f"default_draft_size={draft_model.caps.get('default_draft_size')}",
           flush=True)
 
     global STOP_IDS
