@@ -57,15 +57,32 @@ def main():
     ap.add_argument("-m", "--model_dir", required=True)
     ap.add_argument("-n", "--new_tokens", type=int, default=32)
     ap.add_argument("-k", "--top", type=int, default=20)
+    ap.add_argument("-ndt", "--num_draft_tokens", type=int, default=0,
+                    help="profile MTP decode with this many draft tokens from the model's "
+                         "own MTP head (verify steps run num_draft_tokens + 1 rows)")
     args = ap.parse_args()
 
-    print(f" -- loading {os.path.basename(args.model_dir.rstrip('/'))}", flush=True)
+    ndt = args.num_draft_tokens
+    print(f" -- loading {os.path.basename(args.model_dir.rstrip('/'))}"
+          f"{' (+ MTP head)' if ndt else ''}", flush=True)
     config = Config.from_directory(args.model_dir)
     model = Model.from_config(config)
     tokenizer = Tokenizer.from_config(config)
-    cache = Cache(model, max_num_tokens=4096)
+    # max_history mirrors model_init: recurrent-state models keep ndt + 1 snapshots
+    cache = Cache(model, max_num_tokens=4096, max_history=max(ndt, 4))
+    draft_model = draft_cache = None
+    if ndt:
+        draft_model = Model.from_config(config, component="mtp")
+        draft_cache = Cache(draft_model, max_num_tokens=4096)
     model.load(progressbar=False)
-    generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
+    if ndt:
+        draft_model.load(progressbar=False)
+    generator = Generator(model=model, cache=cache, tokenizer=tokenizer,
+                          draft_model=draft_model, draft_cache=draft_cache,
+                          num_draft_tokens=ndt or None)
+    if ndt:
+        route = "mtp_draft" if generator.mtp_draft else ("dflash" if generator.dflash_draft else "draft-model")
+        print(f" -- MTP: {ndt} draft tokens, route {route}, verify rows m={ndt + 1}", flush=True)
 
     rng = torch.Generator().manual_seed(7)
     vocab = tokenizer.actual_vocab_size
@@ -85,6 +102,10 @@ def main():
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     n = res["new_tokens"]
+    if ndt:
+        a, rj = res.get("accepted_draft_tokens", 0), res.get("rejected_draft_tokens", 0)
+        print(f"\n  draft acceptance {a}/{a + rj} ({a / max(a + rj, 1):.0%}); "
+              f"~{n / max(1, n - a):.2f} tokens per verify step")
     ka = prof.key_averages()
     gpu_us = sum(getattr(e, "self_device_time_total", 0) or 0 for e in ka)
     gpu_s = gpu_us / 1e6

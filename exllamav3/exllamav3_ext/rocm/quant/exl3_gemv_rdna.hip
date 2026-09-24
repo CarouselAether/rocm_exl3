@@ -40,6 +40,7 @@
 #include "../../graph.cuh"
 #include "exl3_gemv_kernel_rdna.hip.h"
 #include "exl3_mgemv_rdna.hip.h"
+#include "exl3_gemv_multirow_rdna.hip.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -367,6 +368,7 @@ bool exl3_gemv_try_launch
     // outside capture (this function is only routed to when !graph). See
     // exl3_gemv_graph_param_block for why allocation cannot happen mid-capture.
     exl3_gemv_graph_prewarm(device);
+    exl3_gemv_multirow_prewarm(device);   // the m = 2..8 path's block, same reason
 
     int mode = exl3_gemv_env_mode();
     if (!force && mode == 0) return false;

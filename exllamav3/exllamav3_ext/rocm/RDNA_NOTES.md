@@ -1343,3 +1343,109 @@ neither tuned for 2-4 rows. This is the case for the multi-row GEMV
 (m = 2..8, row tile {1,2,4,8}) plan: it is what makes the MTP head pay.
 ndt=2 is the best draft length on both models today; 3 loses acceptance, 1
 loses too much per step.
+
+### Where the m = 3 verify step goes (profile_decode -ndt 2, 2026-09-23)
+
+`profile_decode.py -ndt N` now profiles MTP decode (the model's own MTP head,
+verify rows m = N + 1). GPU ms per plain token vs per m=3 verify step, by
+kernel class (48 tokens, 1-token prompt, Kineto kernel times):
+
+| | Qwen3.8 plain | Qwen3.8 m=3 step | ratio | DS4 plain | DS4 m=3 step | ratio |
+|---|---|---|---|---|---|---|
+| dense linears (graph GEMV at m=1 -> cooperative GEMM/mgemm at m=3) | 12 | 47 | **4x** | 16 | 72 | **4.4x** |
+| MoE experts (per-token mgemv loop) | 9.7 | 29 | 3x | 28 | 45 | 1.6x |
+| attention / GDN | 9.6 | 16 | 1.7x | 11.4 | 20.6 | 1.8x |
+| whole step | 40 | 110 | 2.75x | 61 | 156 | 2.6x |
+
+The dense linears are the lever: at m=3 they leave the GEMV for the
+cooperative tile GEMM (284 us per call on Qwen's 5-bit shapes vs 78 us for
+the m=1 GEMV; DS4's lm_head 9.4 ms per call vs 1.9) and become the largest
+class on both models. A multi-row GEMV that reads the weights once for
+m <= 8 rows would take them to ~1.2x the m=1 cost: the m=3 step falls from
+110 to ~75 ms on Qwen and 156 to ~105 on DS4, which at ndt=2's 2.5-2.6
+tokens per step is ~27 t/s (vs 23.9 plain) and ~25 t/s (vs 16.2). The MoE
+class is 3 tokens' worth of distinct experts (top-10 of 256-512: little
+overlap) -- inherent, though the three per-token launches could be one
+batched mgemm call (num_tokens > 1 without packing) for occupancy. The DSA
+attention and GDN scale sub-linearly already.
+
+Design constraint for the multi-row form: the fused LDS rotation prologue
+does not extend to m rows (8 x 12288 halves is 196 KB, and the redundant
+rotation would be m x the +9%). At m > 1 the input rotation should go back
+to its own kernel writing A_had (launch cost is irrelevant there: the step
+is GPU-bound at 100+ ms), with the dot kernels reading A rows from global
+and the fused output epilogue looping over rows. Row tile {2, 4, 8} as a
+template parameter, m == 1 untouched (bit-identity gate stays).
+
+## Multi-row GEMV, m = 2..8: landed (2026-09-23)
+
+`rocm/quant/exl3_gemv_multirow_rdna.hip` (+ `.hip.h`), routed from
+`exl3_gemm_gr` and `exl3_mgemm_gr` for 2 <= m <= `EXL3_GEMV_MAX_M` (default
+8; 1 switches it off) before the cooperative kernels, in and out of capture.
+Design as decided from the verify-step profile above: the pre-fusion
+three-kernel structure -- a rotation kernel writing the m rows of every slab
+to A_had (and hosting the graph patch sites, republished through a per-device
+block), then a split-K dot kernel with a row tile M in {2, 4, 8} (smallest
+>= m) that dequantizes each B tile once for M pairs of fdot2 accumulators,
+with the fused last-arriving-warp output epilogue rotating the m row segments.
+Row r of an m-row call is bit-identical to a separate m == 1 call on that row
+(same chain, same split-K order since the wave rule is the m == 1 rule):
+`rocm_tools/multirow_check.py`, synthetic trellises, 123 cases over both
+entry points (broadcast / per-slot inputs, indices, expert-range packing,
+per-matrix width/output lists, lm_head-scale widths, both C dtypes), all
+PASS; each case's error against the cooperative kernel equals the m == 1
+path's own. The multi-matrix form declines routing weights (the weighted
+reduce is the per-token MoE route's, always m == 1), sliced mode and
+multi-token calls. exl3_stack_check PASS (m 2..16), decode_bitwise PASS
+(m == 1 untouched), Laguna m == 1 decode unchanged at 23.5.
+
+Measured (bench_mtp.py, greedy 256 tokens, natural prompts, median of 3):
+
+| model | plain | MTP ndt=1 | ndt=2 | ndt=3 | ndt=2 before |
+|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next 4bpw | 23.8 | 30.0 (acc 82%) | **32.1** (73%) | 32.1 (66%) | 20.0 |
+| DS4-Flash 2.04bpw | 16.2 | 17.6 (84%) | **19.5** (79%) | 19.4 (76%) | 12.1 |
+
+MTP is now a win on both: +35% on Qwen, +20% on DS4, coherent text on every
+setting; ndt=2 remains the best draft length. Qwen's m=3 step went from
+110 to 73 ms of GPU (profile_decode -ndt 2): the dense linears from 47 to
+~13 ms/step -- the new kernel runs 71 us per call on the 5-bit shapes
+against the cooperative GEMM's 284 us. What remains of the step is the
+per-token MoE loop (24 ms), the GDN kernels (16 ms) and a rocBLAS hgemm
+at m=3 (4.6 ms/step, 100 us per call -- the fp16 projections that take
+gdn_ba_gemv at m == 1; a narrow-N split-K case like the attention gate's).
+
+**Finding for the m == 1 path:** at m=3 the multi-row kernel's 71 us per call
+is *below* the fused m == 1 kernel's 78 us on the same shapes, with three
+times the rows. The multi-row form reads A from L2 and carries no rotated
+row in LDS (8 KB of smem vs 13-31 KB), so it runs more blocks per CU; the
+fused prologue's LDS footprint and redundant rotation cost more than the
+two launches it saves. Next: instantiate a row tile of 1 and route m == 1
+through the multi-row structure under a switch, bench Laguna/Qwen/DS4; if
+it wins, the LDS rotation prologue becomes the K <= 3072-only form or goes.
+
+DS4's m=3 step went from 156 to 115 ms of GPU: dense linears 72 -> ~20 ms
+(the multi-matrix form covers its bundle/fan sites too), and what is left is
+the per-token MoE loop at 49 ms (43% of the step: three tokens' 2-bit expert
+GEMVs launched one token at a time, 64-tile grids each) and DSA attention at
+23 ms. The MoE loop is the next lever on DS4: one batched mgemm call per
+layer (num_tokens = m, no packing -- the mgemv path handles that form) so
+the three tokens' slots share one grid; the bytes stay 3x but the
+occupancy of narrow 2-bit expert GEMVs does not.
+
+Longer drafts (same tool, ndt 7 / 5 / 3 -> verify rows m = 8 / 6 / 4):
+
+| model | ndt=3 (m=4) | ndt=5 (m=6) | ndt=7 (m=8) |
+|---|---|---|---|
+| Qwen3.8 (mtp_draft) | 32.1 (acc 66%) | 28.5 (50%) | 17.9 (40%) |
+| DS4 (dflash) | 19.4 (76%) | 19.9 (76%) | 19.9 (76%) |
+
+Qwen's one-layer MTP head loses acceptance fast past three drafts, so the
+m = 8 verify does more work per accepted token and throughput falls; 2-3
+drafts is its range. DS4's drafter holds 76% at every length, so tokens per
+step grow linearly (6.3 at ndt=7) -- and so does the step cost (317 ms at
+m=8 vs 170 at m=4), because the per-token MoE loop is linear in rows: the
+verify step is now MoE-loop-bound on DS4, and the flat 19.9 says the
+multi-row dense path is no longer what limits it. Coherent at every setting.
+The m = 8 row tile is exercised and correct (multirow_check covers m=8
+directly; the ndt=7 text is clean).

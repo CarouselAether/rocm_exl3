@@ -36,6 +36,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemm_kernel_rdna.hip.h"
 #include "exl3_kernel_map_rdna.hip.h"
 #include "exl3_mgemv_rdna.hip.h"
+#include "exl3_gemv_multirow_rdna.hip.h"
 #include "../../quant/exl3_devctx.cuh"
 #include "../../quant/exl3_gemv.cuh"
 #include "../../quant/exl3_gemv_int8.cuh"
@@ -319,6 +320,21 @@ int exl3_gemm_gr
     // params entry, so multi-kernel paths must concentrate their sites on one
     // node). Both routes share the measured profitability rule
     // (exl3_gemv_rdna_pays) and the EXL3_GEMV env modes.
+    // m = 2..8 (speculative-decoding verify steps): the multi-row GEMV, in and
+    // out of capture, before the cooperative GEMM (exl3_gemv_multirow_rdna.hip)
+    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 2 && size_m <= 8)
+    {
+        if (exl3_gemv_multirow_try_launch
+        (
+            A_ptr, B_ptr, C_ptr, suh_ptr, (half*) A_had_ptr, svh_ptr,
+            size_m, size_k, size_n, K, cb, c_fp32, device, stream, graph
+        ))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 92;
+        }
+    }
+
     if (force_shape_idx <= 0 && force_num_sms <= 0)
     {
         if (!graph)
@@ -684,6 +700,25 @@ int exl3_mgemm_gr
         {
             cuda_check(cudaPeekAtLastError());
             return 0;
+        }
+    }
+
+    // m = 2..8: the multi-row form of the multi-matrix GEMV (declines weights,
+    // sliced mode and multi-token calls itself)
+    if (size_m >= 2 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list)
+    {
+        if (exl3_mgemv_multirow_try_launch
+        (
+            A_ptr, B_ptr_ptr, C_ptr, suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
+            indices_ptr, weights_ptr,
+            size_m, size_k, size_n, K, cb, c_fp32,
+            bszm_in, bszm_out, min_index, max_index, num_tokens,
+            size_n_list_ptr, c_list_ptr,
+            device, stream, graph
+        ))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 93;
         }
     }
 

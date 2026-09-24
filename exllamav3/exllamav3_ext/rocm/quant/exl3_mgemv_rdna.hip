@@ -116,6 +116,7 @@
 #include "../../graph.cuh"
 #include "exl3_mgemv_rdna.hip.h"
 #include "exl3_gemv_kernel_rdna.hip.h"
+#include "exl3_gemv_multirow_rdna.hip.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -170,70 +171,8 @@ static Exl3MgemvParams* exl3_mgemv_param_block(int device, bool allow_alloc)
     return blocks[device];
 }
 
-// -----------------------------------------------------------------------------
-// Slot resolution, shared by all three kernels
-// -----------------------------------------------------------------------------
-// Returns the matrix index for slot j and, through orig_pos, the position in
-// the ORIGINAL indices/weights arrays that slot j came from (equal to j when no
-// packing is active; the cooperative kernel packs weights alongside indices, so
-// weights are always addressed by packed slot once packing has happened --
-// which for this path means "the j-th valid original position").
-// Returns -1 when slot j has no matrix (fewer than j+1 indices in range).
-__device__ __forceinline__ int exl3_mgemv_mat_index
-(
-    const int64_t* __restrict__ indices,
-    int j,
-    int bszm,
-    int min_index,
-    int max_index,
-    int* orig_pos
-)
-{
-    if (!indices)
-    {
-        *orig_pos = j;
-        return j;
-    }
-    if (min_index < 0)
-    {
-        *orig_pos = j;
-        return (int) indices[j];
-    }
-    int seen = 0;
-    for (int i = 0; i < bszm; ++i)
-    {
-        int idx = (int) indices[i];
-        if (idx >= min_index && idx < max_index)
-        {
-            if (seen == j)
-            {
-                *orig_pos = i;
-                return idx - min_index;
-            }
-            seen++;
-        }
-    }
-    return -1;
-}
-
-// Packed slot count: bszm when no packing, else the number of in-range indices
-__device__ __forceinline__ int exl3_mgemv_packed_count
-(
-    const int64_t* __restrict__ indices,
-    int bszm,
-    int min_index,
-    int max_index
-)
-{
-    if (!indices || min_index < 0) return bszm;
-    int seen = 0;
-    for (int i = 0; i < bszm; ++i)
-    {
-        int idx = (int) indices[i];
-        if (idx >= min_index && idx < max_index) seen++;
-    }
-    return seen;
-}
+// Slot resolution (exl3_mgemv_mat_index / exl3_mgemv_packed_count) lives in
+// exl3_gemv_kernel_rdna.hip.h since the multi-row path shares it.
 
 // =============================================================================
 // Kernel-side glue for the fused epilogue (helpers: exl3_gemv_kernel_rdna.hip.h)
@@ -686,6 +625,7 @@ bool exl3_mgemv_try_launch
 
     Exl3MgemvParams* pb = exl3_mgemv_param_block(device, graph == nullptr);
     if (!pb) return false;
+    if (!graph) exl3_gemv_multirow_prewarm(device);   // the m = 2..8 path's block
 
     // The rotated input lives in the dot kernel's LDS; the caller's A_had
     // scratch is neither read nor written by this path.
