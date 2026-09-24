@@ -1563,3 +1563,25 @@ fp16 GEMV, trivially bandwidth-bound) would take the drafter to a few ms per
 step; with the MoE loop batched as well the step would be ~50 ms at 2.5
 tokens, i.e. the DFlash route would pay. Both items are on the list; neither
 is a kernel-numerics problem.
+
+### ROCm 10 (HIP 7.15) with the fusion + multi-row work, graphs on (2026-09-23)
+
+`rocm-10` = main dd7a670 merged (c77c47d), `.venv10` rebuilt with the SDK
+recipe above. Everything below ran env-scrubbed on the wheel runtime with
+the runtime gate leaving graphs ON (rocm_py reports "HIP graphs ON: HIP
+runtime 7.15.26333"); `EXL3_ROCM_HIP_GRAPHS=0` for the off runs.
+
+- Correctness: exl3_stack_check PASS, multirow_check 123/123 PASS,
+  mgemv_check PASS.
+- **Graph capture of the new kernels**: decode_bitwise saved with graphs
+  OFF and compared with graphs ON -- all 48 steps bit-identical. The dot
+  kernels' patch sites (recorded per template instantiation) and the
+  multi-row rotation kernels' sites are patched correctly on replay; the
+  self-resetting epilogue counters need no per-replay memset, as designed.
+- chat_probe (six turns + concurrent jobs, graphs on): worst rep4 0.03, clean.
+- Speed, bench_model / bench_mtp (7.2.4 figures from the same day in
+  parentheses): Laguna decode 23.7 graphs on / 23.9 off, prefill 195
+  (23.6 / 192); Qwen3.8 plain 24.2, MTP ndt=2 32.3 (24.4 / 32.1); DS4
+  decode **18.1**, prefill 112 (17.0 / 103) -- DS4 gains on ROCm 10 because
+  its fp16 torch matmuls take hipBLASLt there (the narrow-N finding above).
+  Graphs on vs off remains a wash on the device timeline, as before.
