@@ -1,0 +1,15 @@
+ -- thermal_guard: kill at Tctl >= 99.5 C, log /home/carousel/Desktop/exlproject/logs/thermal/20260926-212911.csv
+ -- Loading /home/carousel/models/DeepSeek-V4-Flash-0731-exl3-2.04bpw
+
+ -- Loading tokenizer...
+ -- Model: /home/carousel/models/DeepSeek-V4-Flash-0731-exl3-2.04bpw
+ -- Bitrate: 2.07 bpw / 0.00 bpw (head)
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Generating test split:   0%|          | 0/4358 [00:00<?, ? examples/s]Generating test split: 100%|██████████| 4358/4358 [00:00<00:00, 120481.01 examples/s]
+Generating train split:   0%|          | 0/36718 [00:00<?, ? examples/s]Generating train split: 100%|██████████| 36718/36718 [00:00<00:00, 1180044.70 examples/s]
+Generating validation split:   0%|          | 0/3760 [00:00<?, ? examples/s]Generating validation split: 100%|██████████| 3760/3760 [00:00<00:00, 988751.29 examples/s]
+
+
+ -- Evaluated: 100 rows of 2048 tokens
+ -- Perplexity: 6.461586
+ -- thermal_guard: peak Tctl 85.8 C, rc 0

@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Phase 0 benchmark harness: pp512, pp2048, tg128 as exl3_server reports them.
+
+Consistency with the server is the point (ENGINEER_QUESTIONS Q-3):
+  - the model, cache and draft model load through model_init.init() with the server's
+    own arguments (default -cs 65536, as serve_ds4f.sh), so chunk size, cache capacity
+    and graph-capture geometry match;
+  - speeds use the server's log_request() formulas on the same job fields:
+      prefill = (prompt_tokens - cached_tokens) / time_prefill
+      decode  = new_tokens / time_generate
+
+Workloads, all at bsz 1:
+  pp<N>   random-token prompt of N tokens, 1 new token (fresh ids each run: no prefix-cache hits)
+  tg128   random 512-token prompt, then 128 new tokens (decode at ctx ~512-640); no EOS stop,
+          so exactly 128 tokens are generated
+  mtp     with --mtp: natural prompts, greedy, 128 tokens; reports tok/s and acceptance
+  tglong  with --long N: one N-token prompt, then 64 new tokens (exercises the DSA indexer /
+          top-k regime that tg128 never reaches, see CODE_SCAN "Notes for Phase 0")
+
+Each workload: 1 discarded warmup + --runs timed runs, median reported. A sysfs sampler
+thread records GPU clock / power / busy during every timed run; amd-smi snapshots are
+taken before and after. Results go to bench/results/<commit>_<timestamp>.json.
+
+    bench/run_bench.py -m ~/models/DeepSeek-V4-Flash-0731-exl3-2.04bpw
+    bench/run_bench.py -m ... --mtp -ndt 2          # MTP pass (separate process)
+    bench/run_bench.py -m ... --repo ../rocm_exl3_10 # measure another checkout
+
+Exits via os._exit() (native teardown segfault after model load, see RDNA_NOTES).
+"""
+
+import argparse
+import datetime
+import json
+import os
+import statistics
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-m", "--model_dir", required=True)
+ap.add_argument("--repo", default=os.path.dirname(HERE), help="exllamav3 checkout to import (default: this repo)")
+ap.add_argument("-cs", "--cache_size", type=int, default=65536, help="server default in serve_ds4f.sh")
+ap.add_argument("--pp", type=int, nargs="*", default=[512, 2048])
+ap.add_argument("--tg", type=int, default=128)
+ap.add_argument("--tg_ctx", type=int, default=512)
+ap.add_argument("--runs", type=int, default=3)
+ap.add_argument("--mtp", action="store_true", help="MTP pass instead of plain")
+ap.add_argument("-ndt", "--num_draft_tokens", type=int, default=2)
+ap.add_argument("--long", type=int, default=0, help="also run tg64 after an N-token prompt")
+ap.add_argument("--label", default="")
+ap.add_argument("--out", default=os.path.join(HERE, "results"))
+ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra model_init args, e.g. --extra -cq 8")
+args = ap.parse_args()
+
+sys.path.insert(0, os.path.abspath(args.repo))
+
+import torch  # noqa: E402
+from exllamav3 import model_init, Generator, Job  # noqa: E402
+from exllamav3.generator.sampler import ArgmaxSampler  # noqa: E402
+
+CARD = "/sys/class/drm/card0/device"
+PROMPTS = [
+    "Q: Briefly explain why the sky is blue, then name three primary colors.\nA:",
+    "Write a short story about a lighthouse keeper who finds a message in a bottle.\n\n",
+    "Explain, step by step, how to compute the greatest common divisor of two integers, with an example.\n\n",
+]
+
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception as e:
+        return f"<{e}>"
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def hwmon(name):
+    base = os.path.join(CARD, "hwmon")
+    for h in os.listdir(base):
+        v = read(os.path.join(base, h, name))
+        if v is not None:
+            return v
+    return None
+
+
+class Sampler(threading.Thread):
+    """Samples GPU clock (MHz), power (W) and busy % from sysfs every 0.25 s."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.samples, self.stop_ev = [], threading.Event()
+
+    def run(self):
+        while not self.stop_ev.is_set():
+            f, p, b = hwmon("freq1_input"), hwmon("power1_input"), read(f"{CARD}/gpu_busy_percent")
+            self.samples.append((
+                int(f) / 1e6 if f else None,
+                int(p) / 1e6 if p else None,
+                int(b) if b else None))
+            time.sleep(0.25)
+
+    def stop(self):
+        self.stop_ev.set()
+        self.join()
+        busy = [s for s in self.samples if s[2] is not None and s[2] > 50]
+        def stat(i):
+            v = [s[i] for s in busy if s[i] is not None]
+            return {"min": min(v), "median": statistics.median(v), "max": max(v)} if v else None
+        return {"n": len(self.samples), "n_busy": len(busy), "sclk_mhz": stat(0), "power_w": stat(1)}
+
+
+def env_info(repo):
+    git = lambda c: sh(f"git -C {repo} {c}")
+    return {
+        "time": datetime.datetime.now().isoformat(timespec="seconds"),
+        "repo": os.path.abspath(repo),
+        "commit": git("rev-parse --short HEAD"),
+        "branch": git("rev-parse --abbrev-ref HEAD"),
+        "dirty": bool(git("status --porcelain --untracked-files=no")),
+        "torch": torch.__version__,
+        "hip_runtime": torch.version.hip,
+        "rocm_pip": sh(f"{sys.executable} -m pip show rocm 2>/dev/null | grep ^Version"),
+        "device": torch.cuda.get_device_name(0),
+        "perf_level": read(f"{CARD}/power_dpm_force_performance_level"),
+        "cpu_boost": read("/sys/devices/system/cpu/cpufreq/boost"),
+        "cpu_max_khz": read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"),
+        "env": {k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "HIP_", "ROCM", "HSA_", "LD_"))},
+        "argv": sys.argv,
+    }
+
+
+def run_job(generator, ids, n, sampler=None, seed=None):
+    job = Job(input_ids=ids, max_new_tokens=n, sampler=sampler, seed=seed)
+    generator.enqueue(job)
+    final = None
+    while generator.num_remaining_jobs():
+        for r in generator.iterate():
+            if r["stage"] == "streaming" and r.get("eos", False):
+                final = r
+    return final
+
+
+def rand_ids(tokenizer, n, rng):
+    vocab = tokenizer.actual_vocab_size
+    return torch.randint(int(vocab * 0.05), int(vocab * 0.95), (1, n), dtype=torch.long, generator=rng)
+
+
+# server log_request() formulas
+def pp_rate(f):
+    return (f["prompt_tokens"] - f.get("cached_tokens", 0)) / f["time_prefill"]
+
+
+def tg_rate(f):
+    return f["new_tokens"] / f["time_generate"]
+
+
+def workload(name, make_ids, n_new, rate, runs, generator, sampler=None):
+    out = {"name": name, "runs": [], "cached_seen": 0}
+    for r in range(runs + 1):
+        ids = make_ids(r)
+        smp = Sampler()
+        smp.start()
+        f = run_job(generator, ids, n_new, sampler=sampler, seed=1234 if sampler else None)
+        gpu = smp.stop()
+        out["cached_seen"] = max(out["cached_seen"], f.get("cached_tokens", 0))
+        rec = {"rate": rate(f), "prompt_tokens": f["prompt_tokens"], "new_tokens": f["new_tokens"],
+               "time_prefill": f["time_prefill"], "time_generate": f["time_generate"], "gpu": gpu}
+        if "accepted_draft_tokens" in f:
+            a, rj = f["accepted_draft_tokens"], f["rejected_draft_tokens"]
+            rec["acceptance"] = a / max(a + rj, 1)
+        if r == 0:
+            out["warmup"] = rec
+            continue
+        out["runs"].append(rec)
+    rates = [x["rate"] for x in out["runs"]]
+    out["median"] = statistics.median(rates)
+    out["spread"] = (max(rates) - min(rates)) / out["median"]
+    if out["runs"] and "acceptance" in out["runs"][0]:
+        out["acceptance_median"] = statistics.median(x["acceptance"] for x in out["runs"])
+    flag = "  <- spread > 5%" if out["spread"] > 0.05 else ""
+    flag += "  <- PREFIX CACHE HIT" if out["cached_seen"] else ""
+    acc = f"  acc {out['acceptance_median']:.0%}" if "acceptance_median" in out else ""
+    print(f"  {name:10} {out['median']:9.2f} t/s  spread {out['spread']:5.1%}{acc}  "
+          f"sclk {gpu['sclk_mhz']}{flag}", flush=True)
+    return out
+
+
+@torch.inference_mode()   # as server.py main()
+def main():
+    ia = ["-m", args.model_dir, "-cs", str(args.cache_size)]
+    if args.mtp:
+        ia += ["--mtp", "-ndt", str(args.num_draft_tokens)]
+    ia += args.extra
+    parser = argparse.ArgumentParser()
+    model_init.add_args(parser, cache=True, add_sampling_args=False, add_draft_model_args=True,
+                        default_autosplit_max_batch_size=4)   # server.py's defaults
+    iargs = parser.parse_args(ia)
+
+    info = env_info(args.repo)
+    info["amd_smi_before"] = sh("amd-smi metric -c -p -t -l --json")
+    info["init_args"] = ia
+    print(f" -- {info['commit']}{' (dirty)' if info['dirty'] else ''} on {info['branch']}, "
+          f"torch {info['torch']}, HIP {info['hip_runtime']}, perf {info['perf_level']}", flush=True)
+
+    t0 = time.perf_counter()
+    model, config, cache, tokenizer, draft_model, _dc, draft_cache = model_init.init(iargs)
+    info["load_s"] = time.perf_counter() - t0
+    gen = Generator(model=model, cache=cache, tokenizer=tokenizer, draft_model=draft_model,
+                    draft_cache=draft_cache, num_draft_tokens=iargs.num_draft_tokens)
+    print(f" -- loaded in {info['load_s']:.0f}s; mtp_draft={getattr(gen, 'mtp_draft', None)} "
+          f"dflash={getattr(gen, 'dflash_draft', None)}", flush=True)
+
+    os.makedirs(args.out, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    tag = ("_" + args.label) if args.label else ""
+    path = os.path.join(args.out, f"{info['commit']}_{stamp}{'_mtp' if args.mtp else ''}{tag}.json")
+    info["results"] = res = []
+
+    def save():   # after every workload, so a killed run keeps what it finished
+        with open(path, "w") as f:
+            json.dump(info, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+
+    rng = torch.Generator().manual_seed(1234)
+    if not args.mtp:
+        for n in args.pp:
+            res.append(workload(f"pp{n}", lambda r, n=n: rand_ids(tokenizer, n, rng), 1, pp_rate, args.runs, gen))
+            save()
+        res.append(workload(f"tg{args.tg}", lambda r: rand_ids(tokenizer, args.tg_ctx, rng), args.tg,
+                            tg_rate, args.runs, gen))
+        save()
+        if args.long:
+            res.append(workload(f"tg64@{args.long}", lambda r: rand_ids(tokenizer, args.long, rng), 64,
+                                tg_rate, 1, gen))
+            save()
+    else:
+        enc = lambda r: tokenizer.encode(PROMPTS[r % len(PROMPTS)], add_bos=True)
+        # plain greedy on the same prompts (no draft) for a like-for-like MTP ratio is the
+        # plain pass's job; here: MTP greedy, then MTP with the default (sampling) sampler
+        res.append(workload(f"mtp{args.num_draft_tokens}_greedy", enc, args.tg, tg_rate, args.runs, gen,
+                            sampler=ArgmaxSampler()))
+        save()
+
+    info["amd_smi_after"] = sh("amd-smi metric -c -p -t -l --json")
+    info["complete"] = True
+    save()
+    print(" -- RESULT " + " | ".join(f"{r['name']}={r['median']:.2f}" for r in res) + f"\n -- wrote {path}",
+          flush=True)
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
