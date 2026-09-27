@@ -38,6 +38,11 @@ echo " -- gates for $COMMIT -> $L"
 step mgemv_check        "$PY" "$REPO/rocm_tools/mgemv_check.py" -m "$DS4"
 step reconstruct_had    "$PY" "$T/test_reconstruct_had.py"
 step dsa_kernels        "$PY" "$T/test_dsa_kernels.py"
+# Gate #3: WMMA layout gate. int8 exact vs math, f16/bf16 within the measured WMMA bound, and
+# every case bit-exact against rocm_tools/wmma_gate.golden (docs/RDNA_WMMA.md §8)
+SDK=$ROOT/.venv10/lib/python3.12/site-packages/_rocm_sdk_devel
+(cd "$REPO" && PATH=$SDK/bin:$PATH ROCM_PATH=$SDK GPU_ARCH=gfx1151 OUT_DIR=$TT/wmma rocm_tools/build_wmma_gate.sh) > "$L/wmma_gate_build.log" 2>&1
+step wmma_gate          env LD_LIBRARY_PATH="$ROOT/.venv10/lib/python3.12/site-packages/_rocm_sdk_core/lib" "$TT/wmma/wmma_gate" --golden "$REPO/rocm_tools/wmma_gate.golden"
 # Not runnable on this box (collection errors, not failures): two-GPU test; upstream /mnt/str
 # stub models; the uncommitted compare_deepseek_v4_hf_ reference module. Plus two CUDA-only
 # kernels the port rejects by design with a RuntimeError: hgemm_f16acc (inline PTX; hipBLAS is

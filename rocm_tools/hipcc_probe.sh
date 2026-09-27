@@ -55,8 +55,12 @@ case "$GPU_ARCH" in
   *)               SMEM_MAX_BYTES=65536 ;;   # unknown: conservative
 esac
 
+# Mirror setup.py's standard choice: torch >= 2.14 headers use C++20 `requires` clauses
+# and std::bit_width, so a fixed -std=c++17 fails every torch-including TU there.
+CXX_STD=$("$PY" -c "import torch; v=tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2]); print('-std=c++20' if v >= (2, 14) else '-std=c++17')")
+
 FLAGS=(
-  --offload-arch="$GPU_ARCH" -std=c++17 -fPIC -O3
+  --offload-arch="$GPU_ARCH" "$CXX_STD" -fPIC -O3
   -DEXL3_RDNA_SMEM_MAX=$SMEM_MAX_BYTES
   -Wno-register
   -D__HIP_PLATFORM_AMD__=1 -DUSE_ROCM=1 -DHIPBLAS_V2

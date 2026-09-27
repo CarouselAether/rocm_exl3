@@ -45,12 +45,14 @@ ap.add_argument("-m", "--model_dir", required=True)
 ap.add_argument("--repo", default=os.path.dirname(HERE), help="exllamav3 checkout to import (default: this repo)")
 ap.add_argument("-cs", "--cache_size", type=int, default=65536, help="server default in serve_ds4f.sh")
 ap.add_argument("--pp", type=int, nargs="*", default=[512, 2048])
-ap.add_argument("--tg", type=int, default=128)
+ap.add_argument("--tg", type=int, default=128, help="0 skips the decode workload")
 ap.add_argument("--tg_ctx", type=int, default=512)
 ap.add_argument("--runs", type=int, default=3)
 ap.add_argument("--mtp", action="store_true", help="MTP pass instead of plain")
 ap.add_argument("-ndt", "--num_draft_tokens", type=int, default=2)
 ap.add_argument("--long", type=int, default=0, help="also run tg64 after an N-token prompt")
+ap.add_argument("--gen_chunk", type=int, default=None,
+                help="Generator max_chunk_size (default: Generator's 2048, as the server uses). -chunk_size via --extra only sizes load-time buffers")
 ap.add_argument("--label", default="")
 ap.add_argument("--out", default=os.path.join(HERE, "results"))
 ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra model_init args, e.g. --extra -cq 8")
@@ -217,7 +219,8 @@ def main():
     model, config, cache, tokenizer, draft_model, _dc, draft_cache = model_init.init(iargs)
     info["load_s"] = time.perf_counter() - t0
     gen = Generator(model=model, cache=cache, tokenizer=tokenizer, draft_model=draft_model,
-                    draft_cache=draft_cache, num_draft_tokens=iargs.num_draft_tokens)
+                    draft_cache=draft_cache, num_draft_tokens=iargs.num_draft_tokens,
+                    **({"max_chunk_size": args.gen_chunk} if args.gen_chunk else {}))
     print(f" -- loaded in {info['load_s']:.0f}s; mtp_draft={getattr(gen, 'mtp_draft', None)} "
           f"dflash={getattr(gen, 'dflash_draft', None)}", flush=True)
 
@@ -238,9 +241,10 @@ def main():
         for n in args.pp:
             res.append(workload(f"pp{n}", lambda r, n=n: rand_ids(tokenizer, n, rng), 1, pp_rate, args.runs, gen))
             save()
-        res.append(workload(f"tg{args.tg}", lambda r: rand_ids(tokenizer, args.tg_ctx, rng), args.tg,
-                            tg_rate, args.runs, gen))
-        save()
+        if args.tg:
+            res.append(workload(f"tg{args.tg}", lambda r: rand_ids(tokenizer, args.tg_ctx, rng), args.tg,
+                                tg_rate, args.runs, gen))
+            save()
         if args.long:
             res.append(workload(f"tg64@{args.long}", lambda r: rand_ids(tokenizer, args.long, rng), 64,
                                 tg_rate, 1, gen))

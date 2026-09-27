@@ -164,7 +164,10 @@ def main():
     if a.mode in ("decode", "both"):
         decode_region(gen, tok, a.ctx, a.steps, 3, sampler)
     sys.stdout.flush()
-    os._exit(0)
+    # libc exit(), not os._exit(): rocprofv3 writes its output from a C atexit handler, which
+    # os._exit() skips (the trace came back empty). exit() still skips Python finalization,
+    # where the post-load native teardown segfault lives.
+    ctypes.CDLL(None).exit(0)
 
 
 if __name__ == "__main__":

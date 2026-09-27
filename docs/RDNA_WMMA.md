@@ -440,3 +440,115 @@ coverage are at [code GC:1-17, 102-198].
   does, so that Rule 2.1 is known rather than assumed.
 - **Per-arch runs:** gfx1100/1101 (gfx11) and gfx1200/1201 (gfx12, where
   `mma_sync` is expected to trap) are unverified until run on hardware.
+
+---
+
+## 8. WMMA fp32 accumulation is not IEEE-exact
+
+Measured on gfx1151 on 2026-09-27 with the pip ROCm SDK (.venv10, AMD clang
+23.0.0git), using `rocm_tools/wmma_gate.hip`. The shipped header was not changed.
+
+**Finding.** `v_wmma_f32_16x16x16_f16`, `v_wmma_f32_16x16x16_bf16` and
+`v_wmma_f16_16x16x16_f16` do not accumulate like a sequence of IEEE adds, even
+when every product and the exact sum are representable in fp32.
+
+- Each product of fp16 inputs is exact: 3*3 gives 9, and 16 x (1*1) gives 16.
+- The multi-term sum is not exact.
+- int8 (`v_wmma_i32_16x16x16_iu8`) is bit-exact against integer math.
+
+**First gate run.** The inputs were small integers and dyadics, and the check
+was `==`. Every case with f16 or bf16 inputs failed on a subset of cells, and
+every int8 case passed. For example:
+
+- got -4.25000048, want -4.25
+- got 2.38e-06, want 0
+
+No case matched the transposed expectation. The layouts are correct; the
+arithmetic is not IEEE.
+
+**Accumulator probe.** The gate's INFO probe runs one mma with K = 16. The exact
+sum is representable in fp32 in every row. Emax is the exponent of the largest
+|product|, and one unit below is 2^(Emax-23), which is ulp_f32 of the largest
+product.
+
+| dot product | exact | got | error, in 2^(Emax-23) |
+|---|---|---|---|
+| 9 - 9 | 0 | -2.38e-07 | -0.25 |
+| 1 - 1 | 0 | -5.96e-08 | -0.5 |
+| 1024 - 1024 | 0 | -6.10e-05 | -0.5 |
+| 4 - 1 | 3 | 2.99999976 | -0.5 |
+| 8 - 1 | 7 | 6.99999952 | -0.5 |
+| 9 - 9 + 9 - 9 | 0 | 0 | 0 |
+| -1 - 1 (one sign) | -2 | -2 | 0 |
+| 1024 + 2^-13 (one term) | 1024.000122 | 1024.000122 | 0 |
+| 1024 + 8 x 2^-16 | 1024.000122 | 1024 | -1 |
+| 1024 + 14 x 2^-14 | 1024.000854 | 1024.000732 | -1 |
+| 1024 + 4x2^-12 + 4x2^-13 + 6x2^-14 | 1024.001831 | 1024.001709 | -1 |
+| 1024 + 15 x 2^-12 | 1024.003662 | 1024.003662 | 0 |
+| -1024 + 8 x 2^-16 | -1023.999878 | -1023.999756 | +1 |
+| 1 + 14 x 2^-24 | 1.000000834 | 1.000000715 | -1 |
+
+**Reading of the probe.** This is a hypothesis consistent with the data, not a
+confirmed model.
+
+- **Alignment truncation.** Products far below the largest one are aligned to
+  its exponent, and the bits below a window of roughly 2^(Emax-24..-23) are
+  dropped. They are dropped even when their exact sum would have been
+  representable: 8 x 2^-16 added to 1024 is lost completely. The coordinator's
+  alignment-truncation hypothesis is therefore **confirmed** for small terms.
+  A pure per-term truncation would lose all 14 x 2^-14; only 2^-13 of their
+  sum was lost. So a few guard bits survive, or pairs are summed before
+  truncation.
+- **Mixed-sign bias.** A single subtraction such as 4 - 1 or 1 - 1 is off by
+  -0.25 to -0.5 x 2^(Emax-23). This is not explained by truncating the terms,
+  because the terms are exact integers. The pattern looks like a
+  negation/rounding artefact in a wide fixed-point adder. Balanced pairs
+  (9 - 9 + 9 - 9) cancel it.
+- **Size of the error.** The error per mma is at most about one ulp_f32 of the
+  largest intermediate magnitude. It is not proportional to the result, so a
+  result that is exactly 0 can come back as ±2^-22.
+
+**Consequences.**
+
+- Bit-exact equality against IEEE math is not a valid oracle for any f16 or
+  bf16 WMMA path. This includes the "exact in any order" claim for small
+  integers.
+- `rocm_tools/wmma_gate.hip` therefore checks f16 and bf16 cases in two ways:
+  1. **Math check.** A per-cell bound against a double reference: 16 x
+     ulp_f32(M_s) per 16-deep K step, where M_s is the largest of |C in|, the
+     products, the exact partial sums and |C out|. fp16 accumulation adds
+     ulp_f16(result) per step, and an fp16 store adds ulp_f16(want). The
+     transpose diagnostic is kept.
+  2. **Golden check.** A bit-for-bit comparison against
+     `rocm_tools/wmma_gate.golden`, recorded with `--record` on gfx1151. This is
+     the regression gate.
+- Measured maximum error, in ulp_f32 of the largest intermediate magnitude:
+
+  | case | max error |
+  |---|---|
+  | f32 K=64 cases, including LDS and 8-wave | 4.5 ulp |
+  | K=16 f32 store / accumulate cases | 2.0 ulp |
+  | bf16 K=32 | 2.0 ulp |
+  | f16 accumulate cases | 0.5 ulp |
+  | f16 store | 0.5 ulp |
+  | C identity (A = 0) | 0, bit-exact |
+  | int8 | 0, bit-exact |
+
+  All 27 cases pass. Two default-mode runs were bit-identical to the golden file
+  and to each other.
+- Tolerances elsewhere, such as `wmma_check.hip` and `gemm_check.hip`, are
+  justified by this measurement and not only by fp16 input rounding.
+- Upstream CUDA mma may not share these semantics. Bitwise A/B comparisons
+  between an NVIDIA reference and this port cannot be expected to match on WMMA
+  paths.
+
+**Related INFO result (section 6 item 4).** In this run, lanes 16-31 were given
+A or B data that differed from lanes 0-15. The even C columns matched the
+lanes 0-15 data in 128/128 cells. The odd C columns matched the lanes 16-31 data
+in 126/128 cells for divergent A and 123/128 for divergent B. The probe tests
+the lanes 0-15 product first, so the remaining cells were counted as matching it
+within the bound; they are probably cells where the two products coincide.
+No cell matched neither. The hardware does read both halves: lanes 0-15
+feed the even output columns and lanes 16-31 feed the odd ones. The replication
+in Rule 2.1 is therefore required for correctness, not merely harmless. This
+was measured once, on gfx1151 only.

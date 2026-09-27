@@ -77,3 +77,18 @@ Q-1 to Q-10 were answered by the maintainer in a kickoff interview (2026-09-26),
 - Next: rerun the 90 s ramp with the kill at 98 C. If Tctl plateaus below 98, treat the trip as a one-off and resume Phase 0 with the guard on every GPU job.
 - What I did meanwhile: all GPU work paused. Non-GPU Phase 0 items (WMMA doc, resource tables from code objects, PPL/bench scripting) can continue.
 - Answer:
+
+### Q-12: Should DS4 keep the extra last-page prefill forward (recurrent checkpoint) by default?
+- Status: open
+- Asked by: Phase 0 session, 2026-09-27
+- Context:
+  - `generator/job.py:1305-1313` (upstream) runs a separate forward for the final partial page of every prompt on recurrent-state models, "to get the latest possible checkpoint". DS4 qualifies.
+  - The traces show pp512 = 256 + 255 and pp2048 = 1792 + 255 forwards.
+  - On DS4 each prefill forward streams nearly all routed-expert weights, about 1.61 GB per layer and ~1.55 s per forward at today's ~44 GB/s MoE, however few tokens it covers. So the extra forward costs about 1.5 s per request: roughly a third of pp512 and ~13% of pp2048.
+  - The checkpoint lets the next request resume from the prefix cache at that page. That matters for multi-turn chat, where the next turn shares the prompt.
+- Options considered:
+  - A: keep it as is (best prefix reuse, slower first prefill);
+  - B: skip the split when the remainder is small, or when no follow-up is expected (a per-request or server flag);
+  - C: keep the split but make small-chunk MoE cheap. That comes mostly for free if the MoE mainloop fix (PROFILE.md #1) lands, and it shrinks A's cost proportionally.
+- What I did meanwhile: nothing changed. Measured and documented only. It is a candidate for a Python-side hook if the maintainer picks B.
+- Answer:
