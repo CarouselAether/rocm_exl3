@@ -2121,3 +2121,138 @@ synthetic, short of 120); the next levers are fewer VALU per weight in the K2 de
 and trimming the column-end reduce (half2 stores via a lane exchange, release-only
 fences). Mixed-K models (K instances = 0) get the pipelined loop with the 16-row tile
 only; no mixed-K model was run.
+
+## DSA prefill MQA kernel (2026-09-28): DS4 pp2048 368 -> 518 t/s
+
+Branch `opt/dsa-prefill` (PROFILE.md §6, CODE_SCAN #1). `_dsa_attn_kernel`, the one-shot
+sparse attention kernel every DeepSeek-V4 prefill chunk runs (R > 8 rows), was the top
+prefill kernel after the MoE mainloop fix: 32.8% of pp2048 GPU time, 43 calls x 22 ms.
+
+**Root cause.** Same as the decode split kernel (section "DSA decode MQA kernel"):
+- Each program holds BLOCK_H 32 heads x the whole output width, so a 32 x 576 fp32
+  accumulator over 128 lanes is 144 VGPRs.
+- The loop-invariant 32 x 512 q tile is resident as the WMMA A operand, which RDNA3
+  replicates across half-waves.
+- Result: 256 VGPR, 2878 spills, 5164 B scratch per lane (upstream default tuning).
+
+**Fix.** `rocm_py/dsa_prefill_rdna.py:_dsa_prefill_mqa_kernel` is a drop-in for the
+one-shot kernel: same arguments, same output layout, same features (window ring + chunk,
+sinks, eq. 26 de-rotation, group-major store, dense / gathered pool, online packed pools in
+the H32 domain, NC_CHUNK image chunks, NC_BLOCK DSpark draft).
+- One program = HP heads x one BD-wide output column block x one query row.
+- The score reduction over D = 512 is a runtime loop of KC-wide chunks with q re-read per
+  chunk, so q is never a resident WMMA operand. The virtual key row is [c | r]: ring/chunk
+  rows are contiguous, pool rows are pool_c ++ pool_r.
+- Production tiling: HP 64 (all heads share the one latent KV head), BD 512 (the whole row,
+  so no score recompute), KC 32, BLOCK_N = BLOCK_W 64, 16 warps. The 64 x 512 accumulator
+  is 64 VGPRs over 512 lanes.
+- Wiring: `dsa_attn` looks `_dsa_attn_kernel` up as a module global at call time, so a
+  launch proxy (as for decode) routes eligible calls with their own grid,
+  `(R * H/HP * D/BD,)`. No upstream edits.
+- Declined (upstream kernel): Q_SPLIT / OUT_LATENT (GLM-5.2 DSA-on-MLA), non-power-of-two
+  D (V3.2's 576), H < 16 or not a multiple of HP, D_r == 0. The split path (R <= 8) is the
+  decode kernel's and is unchanged.
+
+**Microbench** (`rocm_tools/bench_dsa_prefill.py`; the whole `dsa_attn` call as dsv4's
+cached prefill makes it: single block-table row, sinks, derot, 8 output groups, packed-pool
+staging when qc; CUDA events, best of 6; err = max abs vs fp64 reference over 40 rows /
+max |ref|, identical for old and new in every row):
+
+| case (R new rows at ctx) | old ms | new ms | speedup | new spill / scratch B |
+|---|---|---|---|---|
+| csa dense R512 ctx0 | 9.36 | **1.40** | 6.7x | 5 / 20 |
+| csa dense R2048 ctx0 (pp2048) | 52.6 | **9.81** | 5.4x | 5 / 20 |
+| hca R2048 ctx0 | 31.5 | **4.64** | 6.8x | 5 / 20 |
+| csa top-k R64 ctx3K | 3.03 | **0.62** | 4.9x | 25 / 104 |
+| csa top-k R255 ctx3K | 10.56 | **2.03** | 5.2x | 25 / 104 |
+| csa top-k R1792 ctx3K | 71.7 | **14.1** | 5.1x | 25 / 104 |
+| hca R255 ctx3K | 4.49 | **0.67** | 6.7x | 5 / 20 |
+| csa top-k R64 ctx16K | 3.33 | **0.63** | 5.3x | 25 / 104 |
+| csa top-k R255 ctx16K | 11.36 | **2.12** | 5.4x | 25 / 104 |
+| csa top-k R2048 ctx16K | 86.9 | **16.0** | 5.4x | 25 / 104 |
+| hca R64 ctx16K | 1.79 | **0.26** | 6.8x | 5 / 20 |
+| hca R2048 ctx16K | 44.2 | **7.90** | 5.6x | 5 / 20 |
+| csa top-k R255 ctx3K qc4 (staged) | 10.51 | **2.11** | 5.0x | 25 / 104 |
+| csa top-k R2048 ctx16K qc4 (staged) | 88.1 | **16.1** | 5.5x | 25 / 104 |
+| hca R255 ctx16K qc4 (staged) | 6.02 | **0.95** | 6.3x | 5 / 20 |
+| csa top-k R40 ctx3K qc4 (online, R < 64) | 2.08 | **0.79** | 2.7x | 307 / 880 |
+
+Old: 256 VGPR, 2851-2878 spills, 5164-5368 B scratch in every case.
+
+**Sweeps** (ms, columns = csa R2048 ctx0 | csa top-k R255 16K | csa top-k R64 16K | hca R2048 16K):
+- Upstream kernel params (BLOCK_H x BLOCK_N x warps x stages, 36 variants, first two
+  columns): the best is H32 N16 w4 s1 at 34.6 | 7.0 (1.55x over the default 53.7 | 10.9),
+  still 1005 spills / 3.1 KB. Every variant spills 661-2878. Retuning alone cannot reach 2x.
+- New kernel, compile-only over HP {16,32,64} x BD {128,256,512} x KC {32,64,128} x BN
+  {16,32,64} x warps {4,8} (162 variants): KC 128 and BN 64 at 4 warps spill hundreds; BD
+  512 at 4 warps spills unless HP is 16.
+- Timed (selection):
+
+  | HP / BD / KC / BN / warps | ms | spills |
+  |---|---|---|
+  | 32 / 256 / 64 / 32 / 4 (decode kernel's tile) | 14.7 / 3.20 / 0.88 / 10.7 | 13 |
+  | 32 / 256 / 32 / 32 / 8 | 18.5 / 3.91 / 1.12 / 13.4 | 0 |
+  | 64 / 256 / 32 / 32 / 8 | 14.2 / 2.96 / 0.89 / 10.8 | 0 |
+  | 64 / 256 / 32 / 64 / 8 | 12.4 / 2.60 / 0.79 / 9.78 | 30 |
+  | 64 / 256 / 16 / 64 / 8 | 11.9 / 2.49 / 0.74 / 9.49 | 19 |
+  | 64 / 128 / 64 / 64 / 8 | 20.3 / 4.23 / 1.10 / 18.1 | 0 |
+  | 64 / 256 / 32 / 64 / 16 | 17.6 / 3.40 / 0.87 / 14.4 | 0 |
+  | **64 / 512 / 32 / 64 / 16** | **9.8 / 2.08 / 0.63 / 7.9** | 5 |
+  | 64 / 512 / 16 / 64 / 16 | 13.2 / 2.25 / 0.71 / 9.95 | 46 |
+  | 64 / 512 / 64 / 64 / 16 | 11.3 / 2.38 / 0.72 / 9.13 | 12 |
+  | 64 / 512 / 32 / 32 / 16 | 16.0 / 3.31 / 1.01 / 12.2 | 0 |
+  | 32 / 512 / 32 / 64 / 16 | 24.3 / 4.90 / 1.29 / 19.6 | 18 |
+  | 64 / 512 / 32 / 128 / 16 | 20.2 / 3.53 / 0.99 / 17.3 | 315 |
+
+- Rejected, with numbers:
+  - KSTAGES 2 (software-pipelined KC loop): 14.2 vs 12.4 ms (64/256/32/64/8).
+  - BLOCK_W < BLOCK_N (smaller window tile at the winner): BW 32 13.0 ms, BW 16 20.0 ms.
+  - 32 warps: exceeds the dispatch limits (1024 threads x 256 VGPR; HSA
+    INVALID_DISPATCH_PARAMETERS). BN 128 + KC 16 at 16 warps needs 128 KB LDS.
+  - Zero-spill variants are all slower (best: 64/256/32/32/8 at 14.2 ms). The remaining 20
+    B scratch per lane (104 B gathered) is register-allocator noise in the main loops, not
+    the epilogue: with DEROTATE off it goes UP to 50 spills.
+  - Key splits for short tails: not needed. Per-row cost at R 64 is within ~20% of R 2048
+    (0.63 ms / 64 rows vs 16 ms / 2048 at 16K).
+
+**End to end** (DS4 2.04bpw, `bench/run_bench.py --pp 512 2048 --tg 128 --regen 3000 8000
+--long 16384`, same build, `EXL3_ROCM_DSA_PREFILL=0` vs default):
+
+| | off | on |
+|---|---|---|
+| pp512 | 281.4 | **352.0** (+25%) |
+| pp2048 | 367.7 | **518.0** (+41%) |
+| regen 3000 (184-token tail) | 867.9 ms | **681.4 ms** (-21%) |
+| regen 8000 (64-token tail) | 669.4 ms | **572.3 ms** (-15%) |
+| tg128 | 27.77 | 27.76 (untouched) |
+| tg64@16384 | 26.26 | 26.28 (decode untouched) |
+
+pp2048 kernel trace after (rocprofv3, `logs/prof/dsa_prefill_pp2048`,
+`bench/results/dsa_prefill_pp2048_trace_summary.txt`): wall 2962 -> 2003 ms per step;
+the attention kernel 950 -> 157 ms per step (22.1 -> 3.6 ms per call), 32.8% -> 8.0%.
+Top 5 now: exl3_moe_kernel 34.5%, _dsa_prefill_mqa_kernel 8.0%, exl3_wmma_gemm (fp16,
+1x2x4) 7.9%, exl3_wmma_gemm (fp32 out) 5.2%, exl3_wmma_gemm_ks1 3.8%.
+
+**Numerics / validation.**
+- Different reduction order (D chunked by 32; 64-key tiles instead of 32; window tiles 64
+  instead of 16). Error vs the fp64 reference is unchanged in every microbench case.
+- `test_dsa_kernels.py` ALL PASS; its H64/D512 one-shot cases (R 7/9/40/200/390/130/4096,
+  incl. NC_CHUNK, QC online and staged) run the new kernel (launch counter checked).
+  H8, H16/D288, H128/D576 fall back.
+- NC_BLOCK (DSpark draft; no test covers it) and token-major / no-sinks / no-derot: new vs
+  old kernel 4.9e-4 / 5.8e-4 of max |out| (fp16 output rounding), no NaN.
+- DS4 PPL (`MODELS=ds4 bench/run_ppl.sh`): 6.463333 vs 6.461696 (+0.025%).
+- `bench/run_gates.sh`: PASS (879 passed, 9 skipped).
+
+**Switches.**
+- `EXL3_ROCM_DSA_PREFILL=0` restores the upstream one-shot kernel.
+- `EXL3_ROCM_DSA_PREFILL_{HP,BD,KC,BLOCK_N,BLOCK_W,WARPS,KSTAGES}` override the tiling.
+- Kernels changed for the coherence check: prefill sparse attention in every DS4 layer
+  (every chunk with more than 8 rows, image chunks, the regeneration tail, DSpark draft).
+  Decode, the split/combine kernels, the indexer and GLM-5.2's DSA-on-MLA are unchanged.
+
+**Open.**
+- Online packed pools (-cq with a tail under 64 rows) still spill 307 VGPRs / 880 B: the H32
+  rotation of q and window chunks inside the KC loop (the same open item as decode).
+- The kernel is now below MoE and on par with the WMMA GEMMs. Next prefill levers are
+  outside attention (MoE 34.5%; PROFILE §8).

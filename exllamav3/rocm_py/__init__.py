@@ -34,6 +34,9 @@ Environment switches (all default to the safe value for this backend):
   EXL3_ROCM_DSA_DECODE=0   DeepSeek-V4 decode attention back on the (retuned)
                            upstream split kernel instead of the MQA kernel in
                            dsa_decode_rdna.py (see the note at the patch)
+  EXL3_ROCM_DSA_PREFILL=0  DeepSeek-V4 prefill attention back on the upstream
+                           one-shot kernel instead of the MQA kernel in
+                           dsa_prefill_rdna.py (see the note at the patch)
   EXL3_ROCM_MOE_PIPE=0     fused MoE prefill kernel on its old mainloop (the
                            shared exl3_gemm inner, 16-row tiles, one block per
                            WGP) instead of the pipelined one; read per call by
@@ -247,6 +250,27 @@ def apply() -> list[str]:
             applied.append(_dsad.install())
         except Exception as e:
             applied.append(f"!! FAILED DSA decode kernel patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # DSA prefill: MQA-specialized one-shot kernel (rocm_py/dsa_prefill_rdna.py)
+    # ------------------------------------------------------------------
+    # The upstream one-shot _dsa_attn_kernel (every DS4 prefill chunk) holds
+    # a 32 x 576 fp32 accumulator next to a resident 32 x 512 q tile: 256 VGPR,
+    # ~2.9K spills, ~5.2 KB scratch per lane, ~33% of pp2048 GPU time. Same
+    # cure as the decode kernel: all 64 heads per program, score reduction
+    # streamed over D in a runtime loop (q re-read per chunk), 16 warps so
+    # the 64 x 512 accumulator is 64 VGPRs. dsa_attn looks the kernel up as a
+    # module global, so a launch proxy routes eligible calls (DS4 shapes;
+    # not Q_SPLIT / OUT_LATENT, i.e. GLM-5.2 keeps the old kernel) with their
+    # own grid. EXL3_ROCM_DSA_PREFILL=0 restores the upstream kernel;
+    # EXL3_ROCM_DSA_PREFILL_{HP,BD,KC,BLOCK_N,BLOCK_W,WARPS,KSTAGES} override
+    # the tiling (sweep: rocm_tools/bench_dsa_prefill.py).
+    if _env_on("EXL3_ROCM_DSA_PREFILL", True):
+        try:
+            from . import dsa_prefill_rdna as _dsap
+            applied.append(_dsap.install())
+        except Exception as e:
+            applied.append(f"!! FAILED DSA prefill kernel patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # MultiLinear (mgemm) fusion
