@@ -40,16 +40,72 @@ namespace cg = cooperative_groups;
 #include "../../util.h"
 #include "../../util.cuh"
 #include "../../quant/comp_units/exl3_moe_instances.cuh"
+#include "exl3_moe_pipe_instances_rdna.hip.h"
 #include "exl3_moe_shape_rdna.hip.h"   // AFTER common (pulled in above): must
                                        // match the kernel's MOE_TILESIZE_K, since
                                        // blockDim is derived from it here
 #include "../../quant/exl3_devctx.cuh"
+#include "exl3_moe_inner_rdna.hip.h"                 // moe_pipe::smem_launch_bytes
 #include <set>
+#include <map>
+
+// Blocks of `kernel` the runtime can keep resident per SM (WGP) at the MoE launch shape,
+// capped at 2. The pipelined kernel is register-budgeted for two (EXL3_MOE_PIPE_WPE); the
+// grid is co-resident by design (group barriers spin), so the launch never counts on more
+// than the runtime reports. EXL3_ROCM_MOE_BPS=1 forces one block per WGP.
+static int moe_pipe_smem(int n_tile)
+{
+    return n_tile == 256 ? moe_pipe::smem_launch_bytes<MOE_TILESIZE_K, 256>()
+                         : moe_pipe::smem_launch_bytes<MOE_TILESIZE_K, 128>();
+}
+
+static int moe_blocks_per_sm(fp_exl3_moe_kernel kernel, int device, int smem)
+{
+    static int forced = -2;
+    if (forced == -2)
+    {
+        const char* e = getenv("EXL3_ROCM_MOE_BPS");
+        forced = e ? atoi(e) : -1;
+    }
+    if (forced == 1) return 1;
+    int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
+    cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int) exl3_rdna_smem_budget(device));
+    int nb = 0;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&nb, (const void*) kernel, block_dim, smem) != hipSuccess)
+    {
+        (void) hipGetLastError();
+        nb = 1;
+    }
+    return MAX(1, MIN(nb, 2));
+}
+
+static bool moe_pipe_enabled();
+
+// Expert group width (blocks per expert): MOE_SMS_PER_EXPERT (upstream 8), or
+// EXL3_ROCM_MOE_GROUP for sweeps. Sets the buffer count through exl3_moe_max_concurrency,
+// so it must be in the environment before the model loads.
+static int moe_group_width()
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char* e = getenv("EXL3_ROCM_MOE_GROUP");
+        v = e ? atoi(e) : MOE_SMS_PER_EXPERT;
+        if (v < 1) v = MOE_SMS_PER_EXPERT;
+    }
+    return v;
+}
+extern fp_exl3_moe_kernel exl3_moe_kernel_instances_pipe[];
 
 int exl3_moe_max_concurrency(int device)
 {
     int num_sms = DevCtx::instance().get_num_sms(device);
-    return num_sms / MOE_SMS_PER_EXPERT;
+    // Buffer count for the widest case: the pipelined kernel at its verified blocks per WGP
+    // (representative instance K = 2, N = 256, mul1; every pipe instance has the same
+    // register budget and LDS request). The launch re-checks the instance it runs.
+    int bps = moe_pipe_enabled() ? moe_blocks_per_sm(exl3_moe_kernel_instances_pipe[4 * 2 + 2 * 1 + 1], device, moe_pipe_smem(256)) : 1;
+    return MIN(num_sms * bps / moe_group_width(), MOE_MAX_GROUPS);
 }
 
 std::set<void*> moe_kernel_attr_set[MAX_DEVICES] = {};
@@ -80,6 +136,29 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
     exl3_moe_kernel_k7_n128_cb1(), exl3_moe_kernel_k7_n256_cb1(), exl3_moe_kernel_k7_n128_cb2(), exl3_moe_kernel_k7_n256_cb2(),
     exl3_moe_kernel_k8_n128_cb1(), exl3_moe_kernel_k8_n256_cb1(), exl3_moe_kernel_k8_n128_cb2(), exl3_moe_kernel_k8_n256_cb2()
 };
+
+// Pipelined mainloop instances (exl3_moe_inner_rdna.hip.h), same [K][cb - 1][N_off] order
+fp_exl3_moe_kernel exl3_moe_kernel_instances_pipe[] =
+{
+    exl3_moe_kernel_k0_n128_cb1_pipe(), exl3_moe_kernel_k0_n256_cb1_pipe(), exl3_moe_kernel_k0_n128_cb2_pipe(), exl3_moe_kernel_k0_n256_cb2_pipe(),
+    exl3_moe_kernel_k1_n128_cb1_pipe(), exl3_moe_kernel_k1_n256_cb1_pipe(), exl3_moe_kernel_k1_n128_cb2_pipe(), exl3_moe_kernel_k1_n256_cb2_pipe(),
+    exl3_moe_kernel_k2_n128_cb1_pipe(), exl3_moe_kernel_k2_n256_cb1_pipe(), exl3_moe_kernel_k2_n128_cb2_pipe(), exl3_moe_kernel_k2_n256_cb2_pipe(),
+    exl3_moe_kernel_k3_n128_cb1_pipe(), exl3_moe_kernel_k3_n256_cb1_pipe(), exl3_moe_kernel_k3_n128_cb2_pipe(), exl3_moe_kernel_k3_n256_cb2_pipe(),
+    exl3_moe_kernel_k4_n128_cb1_pipe(), exl3_moe_kernel_k4_n256_cb1_pipe(), exl3_moe_kernel_k4_n128_cb2_pipe(), exl3_moe_kernel_k4_n256_cb2_pipe(),
+    exl3_moe_kernel_k5_n128_cb1_pipe(), exl3_moe_kernel_k5_n256_cb1_pipe(), exl3_moe_kernel_k5_n128_cb2_pipe(), exl3_moe_kernel_k5_n256_cb2_pipe(),
+    exl3_moe_kernel_k6_n128_cb1_pipe(), exl3_moe_kernel_k6_n256_cb1_pipe(), exl3_moe_kernel_k6_n128_cb2_pipe(), exl3_moe_kernel_k6_n256_cb2_pipe(),
+    exl3_moe_kernel_k7_n128_cb1_pipe(), exl3_moe_kernel_k7_n256_cb1_pipe(), exl3_moe_kernel_k7_n128_cb2_pipe(), exl3_moe_kernel_k7_n256_cb2_pipe(),
+    exl3_moe_kernel_k8_n128_cb1_pipe(), exl3_moe_kernel_k8_n256_cb1_pipe(), exl3_moe_kernel_k8_n128_cb2_pipe(), exl3_moe_kernel_k8_n256_cb2_pipe()
+};
+
+// EXL3_ROCM_MOE_PIPE: 1 (default) = pipelined mainloop, 0 = the shared exl3_gemm inner as
+// before. Read on every call (getenv is ~100 ns against a millisecond-scale kernel), so a
+// tool can A/B both mainloops in one process by setting os.environ between calls
+static bool moe_pipe_enabled()
+{
+    const char* e = getenv("EXL3_ROCM_MOE_PIPE");
+    return !(e && e[0] == '0');
+}
 
 // RDNA: the 32 / 64-row tile instances (exl3_moe_kernel_instances_m32 / _m64 upstream)
 // are not built here -- exl3_gemm_inner_rdna.hip.h implements TILESIZE_M == 16 only.
@@ -289,20 +368,20 @@ void exl3_moe
     // With a known number of active experts, launch only as many groups as there are experts and widen them to
     // use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT
     int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
-    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= num_sms, "Concurrency too high for device num_sms");
-    int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
-    int group_size = MOE_SMS_PER_EXPERT;
-    if (num_active > 0)
-    {
-        num_groups = MIN(num_groups, num_active);
-        group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
-    }
-    dim3 grid_dim(group_size, 1, num_groups);
+    const bool pipe = moe_pipe_enabled();
 
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
     fp_exl3_moe_kernel kernel;
-    if (m_tile <= 16)
+    if (pipe)
+    {
+        // The pipelined kernel picks 16 / 32 / 64-row tiles per expert by itself (fixed-K
+        // instances), so the caller's m_tile tier split runs through the same instance
+        if (m_tile > 16)
+            TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
+        kernel = exl3_moe_kernel_instances_pipe[4 * K + 2 * cb_idx + N_off];
+    }
+    else if (m_tile <= 16)
     {
         kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
     }
@@ -314,6 +393,33 @@ void exl3_moe
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
         kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
     }
+
+    // Co-resident slots: SMs x blocks per SM (pipelined kernel: 2 when the runtime confirms
+    // it, cached per instance). The buffers were sized by exl3_moe_max_concurrency; a
+    // mainloop switch after allocation only lowers the group count, never oversubscribes
+    static std::map<void*, int> bps_cache[MAX_DEVICES];
+    int bps = 1;
+    if (pipe)
+    {
+        auto it = bps_cache[device].find((void*) kernel);
+        if (it == bps_cache[device].end())
+        {
+            bps = moe_blocks_per_sm(kernel, device, moe_pipe_smem(N_off ? 256 : 128));
+            bps_cache[device][(void*) kernel] = bps;
+        }
+        else bps = it->second;
+    }
+    const int slots = num_sms * bps;
+    int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
+    num_groups = MIN(num_groups, slots / moe_group_width());
+    TORCH_CHECK(num_groups >= 1, "exl3_moe: no co-resident expert group fits the device");
+    int group_size = moe_group_width();
+    if (num_active > 0)
+    {
+        num_groups = MIN(num_groups, num_active);
+        group_size = MIN(slots / num_groups, MOE_MAX_SMS_PER_EXPERT);
+    }
+    dim3 grid_dim(group_size, 1, num_groups);
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
@@ -388,7 +494,7 @@ void exl3_moe
         grid_dim,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        pipe ? moe_pipe_smem(N_off ? 256 : 128) : SMEM_MAX,
         stream
     );
 

@@ -897,6 +897,8 @@ Under `rocm_tools/`:
 | `gemm_coop_check.hip` | cooperative launch against the same work without it |
 | `moe_ref32.py` | fused MoE **and** the per-expert path against an fp32 reference built from dequantized weights |
 | `moe_check.py` | fused MoE against the per-expert path (two fp16 implementations — see its own caveats) |
+| `moe_inner_bench.hip` (build: `SRC=moe_inner_bench rocm_tools/build_gemv_tiles_bench.sh`) | standalone (no torch) old vs pipelined MoE mainloop on one expert-GEMM shape over 64 DRAM-resident matrices: bit-for-bit comparison and ms / GB/s per row count; `MIB_G`/`MIB_CONC` set blocks per group and groups (40 blocks = two per WGP) |
+| `bench_moe_kernel.py` | `ext.exl3_moe` alone on synthetic DS4 / Qwen expert tables (any bits, mul1 or mcg), ms and GB/s per token count; `--check` compares `EXL3_ROCM_MOE_PIPE=0` vs `1` bitwise in one process |
 | `nan_locate.py` | names the first module in a forward pass whose output goes non-finite |
 | `bench_model.py`, `bench_moe.py`, `bench_mgemm.py`, `bench_gemv_vs_gemm.py`, `bench_prefill_tiles.py`, `bench_decode_splits.py` | timing, median of repeats, flagging spreads above the noise floor |
 | `profile_decode.py` | rocprofv3 wrapper for a decode run; the profile-before-implementing tool |
@@ -1974,3 +1976,148 @@ M = 1 kernels 41-70), no scratch anywhere.
   #6) is the next ~0.4 ms/token.
 - The M = 4 row tile at K <= 3 is 99-105 VGPR (12 waves); U = 1 for M = 4 was slower
   in the core sweep (83.5 vs 78.6 us), so the table keeps U = 2.
+
+## Pipelined MoE mainloop (2026-09-27): DS4 pp512 123 -> 276, pp2048 217 -> 371 t/s
+
+Branch `opt/moe-mainloop` (PROFILE.md §8 rank 1, CODE_SCAN #2/#5/#19/#20). The fused
+MoE prefill kernel `exl3_moe_kernel` gets its own GEMM mainloop,
+`rocm/quant/exl3_moe_inner_rdna.hip.h`, selected at run time (`EXL3_ROCM_MOE_PIPE=0`
+restores the shared `exl3_gemm_kernel_inner`, read per call). `exl3_gemm` /
+`exl3_mgemm` are untouched: the shared inner is not edited.
+
+**Kernel, synthetic DS4 expert tables** (`rocm_tools/bench_moe_kernel.py`: 256 experts,
+4096<->2048, K2 mul1, uniform top-6, fused_rows 128; GB/s = trellis bytes of the
+touched experts / time):
+
+| tokens / forward | rows / expert | old ms (GB/s) | new ms (GB/s) | x |
+|---|---|---|---|---|
+| 256 | ~6 (max 15) | 56.27 (28.5) | **15.70 (102.2)** | 3.58 |
+| 512 | ~12 (max 23) | 61.25 (26.3) | **16.89 (95.4)** | 3.63 |
+| 1792 | ~42 (max 61) | 154.40 (10.4) | **29.37 (54.8)** | 5.26 |
+
+**Real model, MoE layer** (`bench_moe.py`, DS4, BlockSparseMLP.forward incl. routing,
+shared expert, reconstruct tier, gather; 42 layers):
+
+| prompt | old ms/layer | new, cap 128 | new, cap 512 (default) |
+|---|---|---|---|
+| 256 | 39.96 | **12.07** | |
+| 512 | 51.59 | 17.18 | **16.78** |
+| 1792 | 110.67 | 52.03 | **44.47** |
+
+**End to end** (`bench/run_bench.py`, same build, switch off / on; results in
+`bench/results/moe_mainloop/`):
+
+| | PIPE=0 | PIPE=1, cap 128 | PIPE=1, cap 512 (default) |
+|---|---|---|---|
+| DS4 pp512 | 122.73 | 275.67 | **281.97** (final rerun 278.43) |
+| DS4 pp2048 | 217.18 | 343.83 | **371.15** (final rerun 362.00) |
+| DS4 tg128 | 27.71 | 27.73 | 27.78 (27.67) |
+| Qwen3.8 pp512 | 271.68 (spread 5.9%) | | **596.14** |
+| Qwen3.8 pp2048 | 474.99 | | **740.90** |
+| Qwen3.8 tg128 | 25.44 | | 25.46 |
+
+pp2048 profile after (rocprofv3 kernel trace): `exl3_moe_kernel` 40% -> 18.5% of GPU
+time; `_dsa_attn_kernel` (32.8%) is now the top prefill kernel.
+
+**What the loop does** (details in the header of `exl3_moe_inner_rdna.hip.h`):
+- Each wave loads its own B (its FN 16x16 blocks per k-tile, only the dwords its lanes
+  decode: `exl3_lane_plan`) into a register ring DB = 4 k-tiles deep with
+  compile-time slots (unrolled loop), SGPR-base `global_load`s. No block barrier per
+  k-tile.
+- The GEMV tiles core's exact-integer decoder (`exl3_dq_tile_decode`), written
+  *transposed* ([n][k]) into a wave-private LDS block, so the WMMA B fragment is 2 x
+  `ds_load_b128` (was 16 `ds_store_b16` + 16 `ds_load_u16` + 8 shuffles). Same halves
+  in the same fragment slots -- `rdna_wmma.hip.h` fragment logic untouched, WMMA gate
+  PASS.
+- A (the gathered input, shared by all 16 waves) staged through LDS in chunks of
+  8 / row-blocks k-tiles: one uint4 per thread and one LDS-only barrier per chunk;
+  16-byte chunks XOR-swizzled by row (`(r>>1)^(r>>3)`) instead of padding.
+- LDS-only fences (`__builtin_amdgcn_fence(..., "workgroup", "local")`): no vmcnt(0)
+  drain, no `buffer_gl0_inv`.
+- Row tiles 16/32/48/64 chosen per expert inside the kernel (CODE_SCAN #20), sharing
+  one decoded B fragment across row blocks.
+- g, u, d through one call site (the old kernel had three, so clang outlined the inner:
+  FLAT loads, callee-saved spills). The column-end reduce is inlined per unrolled step
+  behind `[[unlikely]]`.
+- Budget: <= 192 VGPR (`amdgpu_waves_per_eu(EXL3_MOE_PIPE_WPE = 8)`), <= 32 KB LDS
+  (`smem_launch_bytes`), so **two blocks per WGP**. The host launches 40 blocks only
+  when `hipOccupancyMaxActiveBlocksPerMultiprocessor` says 2 (`EXL3_ROCM_MOE_BPS=1`
+  forces one). `exl3_moe_max_concurrency` returns 40 / 8 = 5 groups, so Python sizes 5
+  expert buffers; a mainloop switch after load only lowers the group count.
+- Python side (`rocm_py`, Py-hook): fused-row cap 128 -> 512 while the pipe is on
+  (`EXL3_ROCM_MOE_FUSED_ROWS`; upstream `EXL3_MOE_FUSED_ROWS` wins): hot experts stay
+  in the kernel instead of reconstruct + hgemm. DS4 pp2048 343.8 -> 371.2 (+8%).
+
+**The diagnosis moved twice -- read before optimizing this further:**
+1. CODE_SCAN #2's latency-bound reading was right for the OLD loop (1.4 us per
+   k-tile = the DRAM round trip). Once loads were pipelined, B-ring depth stopped
+   mattering: DB = 2 / 4 / 8 within 2% everywhere, and removing the B loads entirely
+   gains 2%.
+2. The new loop is **issue/VALU-bound**, measured by removal on the inner bench (1 block
+   per WGP, 12 rows, 1.296 ms base): no decode -30%, no WMMA -20%, no A staging -7%,
+   no LDS transpose -5%, no B loads -2%. The hot step is ~75 VALU (K2 decode of two
+   16x16 blocks) + 2 WMMA (32 cycles each) + ~25 SALU per wave; four waves per SIMD
+   reach ~60% of VALU peak. A second block per WGP (8 waves/SIMD) adds 11-13%.
+   Memory-only (loads, no compute) streams B at ~180 GB/s, so the 120 GB/s target is a
+   compute problem at these shapes, not a memory one.
+
+In-kernel phase split (debug build `-DEXL3_MOE_PIPE_PROF`, T=512): GEMMs 81%, gather +
+input Hadamard 5%, g/u Hadamard + activation 6%, d-out Hadamard 3%, group barriers 3%,
+scheduler 2%. At T=1792 the column-end reduce (fp16 2-byte stores, lock protocol,
+vmcnt drain) is ~13% of GEMM time.
+
+**Tried and not taken (inner bench, DS4 4096x2048 K2, ms for 12 / 42 rows):**
+- A per wave from global (L2) instead of LDS chunks: loads-only rate 105 vs 180 GB/s;
+  with compute present, ~equal at one block per WGP -- kept LDS for the LDS/VGPR budget.
+- Decode one tile ahead into a second staging set (`EXL3_MOE_PIPE_AHEAD=1`): 1.392 ->
+  1.295 at one block per WGP, but +16 KB LDS breaks the 32 KB two-block budget, and at
+  two blocks it is within noise. Off.
+- A chunk depth 4 vs 8 k-tiles: 1.178 / 2.156 vs 1.133 / 1.999 (two blocks). 8 kept.
+- A rows padded to 40 halves (like the shared inner) vs unpadded: same speed as the
+  swizzle but +25% LDS; unpadded without swizzle 1.232 / 2.542.
+- B staging stride 24 vs 16 halves: 16 costs ~4% unswizzled; the half-swap swizzle
+  recovers most of it and the stride fits the budget.
+- 64 KB LDS request at two blocks per WGP: the bench co-scheduled 40 blocks, but the
+  runtime's occupancy query says one block per 64 KB multiprocessor, so the launch
+  never relies on it.
+- Single out-of-line reduce re-entered through a `switch` over the ring slot: clang
+  tail-merged the unrolled steps and copied the A ring through phis with an
+  `s_waitcnt vmcnt(0)` per tile. Replaced by an inlined `[[unlikely]]` reduce per step.
+- Chunk barrier at a dynamic position (`a_slot == 0` counter): vmcnt(0) before the
+  chunk store every 8 tiles. The unroll is max(DB, AG) so chunk and slot positions are
+  compile-time.
+- Group width (`EXL3_ROCM_MOE_GROUP`, blocks per expert) at two blocks per WGP, T =
+  256/512/1792 ms: 4 -> 16.09/17.13/29.39, 5 -> 16.04/17.42/30.55, **8 -> 15.79/17.11/
+  29.98**, 10 -> 16.50/18.02/32.03, 20 -> 18.08/19.90/36.69. Upstream's 8 kept
+  (MOE_SMS_PER_EXPERT unchanged); at 8 every block owns whole output columns for DS4
+  (1024 k-tiles / 8 = one column of gate/up, two of down), so no fp16 partial sums.
+- DB = 2 for the 48-row tile (to drop 6 spills): 7% slower at 42 rows; the spills sit
+  in the kernel prologue / expert tail, outside every loop, so DB = 4 stays.
+
+**Numerics.** On the same grid (`EXL3_ROCM_MOE_BPS=1`: 2 groups x 10) the pipelined
+kernel is **bit-identical** to the old mainloop: `bench_moe_kernel --check` DS4 K2
+mul1, K1/K3/K5 mcg, K8, Qwen K4 mul1 and K6 mcg at 64/256/512/1792 tokens, and
+`moe_inner_bench` at 6-61 rows. The default grid (5 groups x 8) changes the stream-K
+split, which removes the fp16 partial-sum round trip for DS4 shapes: max |diff| vs the
+old grid 2.1e-3 (7.9e-4 of max |out|), and `moe_ref32` (fp32 reference, DS4 layers 0-1)
+relmean 0.0109/0.0112/0.0084/0.0108% vs 0.0111/0.0113/0.0085/0.0111% for the old
+kernel (bsz 64 / 256) -- equal or slightly closer. The fused-row cap moves hot experts
+from reconstruct + WMMA hgemm into the kernel (different accumulation order).
+PPL (wikitext2 100 x 2048, `bench/results/ppl_moe_mainloop/`): DS4 **6.461696** (stack
+6.461140, +0.0086%), Qwen3.8 **4.748012** (4.746908, +0.023%; with the cap left at 128
+it is 4.746794, -0.002%, so the cap -- hot experts through the fused kernel instead of
+reconstruct + WMMA hgemm -- is most of that), Gemma **18.633857** (dense, identical).
+`moe_check` DS4 bsz 16/64/256 worst 0.028%; gemm_check all pass; `bench/run_gates.sh`
+PASS (mgemv_check, reconstruct_had, dsa_kernels, WMMA gate, 879 pytest).
+
+**Portability.** `hipcc_probe --all` 123/123 on gfx1151/1100/1101/1200/1201. Pipe
+kernel K2 mul1: gfx1151 168 (N128) / 192 (N256, 6 spills, 28 B scratch outside the
+loops), gfx1100 172 / 192 (12 spills, 52 B, outside the loops), gfx1201 94 / 95 (the
+gfx12 WMMA traps as before; rocm_py steers MoE off gfx12). The old instances are
+unchanged (248 / 256 VGPR, 48-80 B scratch).
+
+**Open:** decode (VALU) and WMMA now bound the loop at pp512 shapes (95-102 GB/s
+synthetic, short of 120); the next levers are fewer VALU per weight in the K2 decode
+and trimming the column-end reduce (half2 stores via a lane exchange, release-only
+fences). Mixed-K models (K instances = 0) get the pipelined loop with the 16-row tile
+only; no mixed-K model was run.

@@ -52,3 +52,20 @@
 
 static_assert(EXL3_GEMM_BASE_THREADS * EXL3_RDNA_MOE_TILESIZE_K / 16 <= 1024,
     "MoE block width exceeds the maximum workgroup size");
+
+// -----------------------------------------------------------------------------
+// Pipelined MoE mainloop (exl3_moe_inner_rdna.hip.h) tuning
+// -----------------------------------------------------------------------------
+// EXL3_MOE_PIPE_DB: B register-ring depth, k-tiles in flight per wave (2, 4 or 8).
+#ifndef EXL3_MOE_PIPE_DB
+#define EXL3_MOE_PIPE_DB 4
+#endif
+static_assert(EXL3_MOE_PIPE_DB == 2 || EXL3_MOE_PIPE_DB == 4 || EXL3_MOE_PIPE_DB == 8,
+    "EXL3_MOE_PIPE_DB must be 2, 4 or 8");
+
+// EXL3_MOE_PIPE_WPE: waves per SIMD the pipelined kernel is register-budgeted for.
+// 8 (= 1536 / 8 = 192 VGPRs) lets two 512-thread blocks share a WGP; the host still
+// asks the runtime (hipOccupancyMaxActiveBlocksPerMultiprocessor) before using it.
+#ifndef EXL3_MOE_PIPE_WPE
+#define EXL3_MOE_PIPE_WPE 8
+#endif

@@ -34,6 +34,16 @@ Environment switches (all default to the safe value for this backend):
   EXL3_ROCM_DSA_DECODE=0   DeepSeek-V4 decode attention back on the (retuned)
                            upstream split kernel instead of the MQA kernel in
                            dsa_decode_rdna.py (see the note at the patch)
+  EXL3_ROCM_MOE_PIPE=0     fused MoE prefill kernel on its old mainloop (the
+                           shared exl3_gemm inner, 16-row tiles, one block per
+                           WGP) instead of the pipelined one; read per call by
+                           exl3_moe_rdna.hip. Also keeps the fused-row cap at 128
+  EXL3_ROCM_MOE_FUSED_ROWS=N  fused-MoE row cap with the pipelined mainloop
+                           (default 512; upstream EXL3_MOE_FUSED_ROWS wins)
+  EXL3_ROCM_MOE_BPS=1      pipelined MoE kernel at one block per WGP (default:
+                           two when the runtime occupancy query allows it)
+  EXL3_ROCM_MOE_GROUP=N    blocks per expert group for the fused MoE kernel
+                           (default MOE_SMS_PER_EXPERT = 8); set before load
 
   Bisect handles -- slow, for localising a numerics fault, never to leave on:
 
@@ -62,8 +72,8 @@ Environment switches (all default to the safe value for this backend):
                            (reconstruct_*_batch + hgemm_batched). Ported
                            mechanically, unvalidated on RDNA
   EXL3_ROCM_MOE_MTILE=1    let Python split fused-MoE launches into 16/32/64-row
-                           tiers. Pointless on RDNA, which only builds the
-                           16-row instance and runs every tier through it
+                           tiers. Pointless on RDNA, whose kernel picks the row
+                           tile per expert itself
 
 These are bisect handles, not permanent policy -- turn one on, run a prompt, see
 whether the output degrades. Each one's justification is a measurement recorded
@@ -669,9 +679,18 @@ def apply() -> list[str]:
     # tier is unexercised on RDNA, so the v1.4.4 per-expert loop stays default.
     #
     # MTILE makes Python issue up to three fused-MoE launches per layer, one per
-    # 16/32/64-row tier. exl3_moe_rdna.hip runs every tier through the 16-row
-    # instance (the only one built), so the split only adds launches.
-    # Both flags are module globals read at load / call time.
+    # 16/32/64-row tier. On RDNA the fused kernel picks its own row tile per
+    # expert (pipelined mainloop: 16/32/48/64 rows; old mainloop: 16 only), so
+    # the split only adds launches.
+    #
+    # Fused-row cap: experts with more rows than TEMP_ROWS_FUSED (upstream 128)
+    # leave the fused kernel for the reconstruct + hgemm tier. The pipelined
+    # mainloop (EXL3_ROCM_MOE_PIPE, default on) runs up to 64 rows per B decode,
+    # so it takes hot experts cheaper than reconstructing them: 512 measured DS4
+    # pp2048 343.8 -> 371.2 t/s (+8%), pp512 +2% (RDNA_NOTES "Pipelined MoE
+    # mainloop"). Upstream's EXL3_MOE_FUSED_ROWS, when set, wins; with the old
+    # mainloop (EXL3_ROCM_MOE_PIPE=0) the upstream 128 stays.
+    # All three are module globals read at load / call time.
     try:
         from ..modules import block_sparse_mlp as _bst2
         if not _env_on("EXL3_ROCM_BATCH_RECON", False):
@@ -679,7 +698,10 @@ def apply() -> list[str]:
             applied.append("batched expert reconstruct tier off (unvalidated on RDNA; EXL3_ROCM_BATCH_RECON=1)")
         if not _env_on("EXL3_ROCM_MOE_MTILE", False):
             _bst2.MTILE = False
-            applied.append("fused-MoE row-tile tiers off (only the 16-row instance exists on RDNA)")
+            applied.append("fused-MoE row-tile tiers off (the RDNA kernel tiles rows itself)")
+        if _env_on("EXL3_ROCM_MOE_PIPE", True) and "EXL3_MOE_FUSED_ROWS" not in os.environ:
+            _bst2.TEMP_ROWS_FUSED = int(os.environ.get("EXL3_ROCM_MOE_FUSED_ROWS", 512))
+            applied.append(f"fused-MoE row cap {_bst2.TEMP_ROWS_FUSED} (pipelined mainloop; EXL3_ROCM_MOE_FUSED_ROWS / EXL3_MOE_FUSED_ROWS)")
     except Exception as e:
         applied.append(f"!! FAILED batch-recon/mtile patch: {type(e).__name__}: {e}")
 

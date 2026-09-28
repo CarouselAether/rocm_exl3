@@ -12,6 +12,7 @@
 
 #include "../exl3_moe_kernel_rdna.hip.h"
 #include "../../../quant/comp_units/exl3_moe_instances.cuh"
+#include "../exl3_moe_pipe_instances_rdna.hip.h"
 
 // Asserts the include race was won, NOT a specific size: exl3_moe_common.cuh
 // would set SMEM_MAX to 90 KB behind an #ifndef if it got here first, which on
@@ -21,3 +22,6 @@ static_assert(SMEM_MAX == EXL3_RDNA_SMEM_MAX,
     "SMEM_MAX is not the RDNA value -- exl3_moe_kernel_rdna.hip.h must be included first");
 
 fp_exl3_moe_kernel exl3_moe_kernel_k0_n256_cb1() { return exl3_moe_kernel<0, 256, 1>; }
+
+// Pipelined mainloop (exl3_moe_inner_rdna.hip.h); EXL3_ROCM_MOE_PIPE=0 selects the getters above
+fp_exl3_moe_kernel exl3_moe_kernel_k0_n256_cb1_pipe() { return exl3_moe_kernel<0, 256, 1, MOE_TILESIZE_M, true>; }

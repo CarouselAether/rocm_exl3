@@ -39,6 +39,10 @@
 //
 // What the fork contributes is the barrier, below.
 //
+// 2026-09-27: PIPE = true instances run the g/u/d GEMMs through the pipelined mainloop
+// in exl3_moe_inner_rdna.hip.h (moe_gemm_rows_pipe below), one call site in a loop over
+// the three matrices; PIPE = false is the v1.3.0 body with the shared inner, unchanged.
+//
 // Include order is load-bearing: exl3_kernel_map_rdna.hip.h must be first,
 // because exl3_moe_common.cuh defines SMEM_MAX to 90 KB behind an #ifndef and
 // whichever header lands first wins. On a 64 KB part the 90 KB value would let
@@ -55,6 +59,7 @@
 #include "../../util.cuh"
 #include "../../quant/hadamard_inner.cuh"
 #include "exl3_gemm_inner_rdna.hip.h"
+#include "exl3_moe_inner_rdna.hip.h"
 #include "../../quant/exl3_devctx.cuh"
 
 #include <cuda/atomic>
@@ -164,8 +169,88 @@ void moe_gemm_tile
     #undef SHAPE_ARGS
 }
 
-template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M>
+// Pipelined mainloop (exl3_moe_inner_rdna.hip.h): one expert GEMM of token_count rows in
+// row tiles of 64 / 48 / 32 / 16 (the smallest that covers the rest, capped at 64),
+// sharing each dequantized B fragment across the row blocks.
+// Mixed-K kernels (t_bits == 0) keep the 16-row tile only, so the K switch does not
+// multiply into three row-tile copies.
+template<int t_bits, int cb, int N_TILE>
+__device__ __forceinline__
+void moe_gemm_rows_pipe
+(
+    const half* in_addr,
+    const uint16_t* trellis,
+    half* out_addr,
+    int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const int K
+#ifdef EXL3_MOE_PIPE_PROF
+    , uint64_t* prof
+#endif
+)
+{
+#ifdef EXL3_MOE_PIPE_PROF
+    #define PIPE_ARGS(MT) in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, prof
+#else
+    #define PIPE_ARGS(MT) in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks
+#endif
+    while (size_m > 0)
+    {
+        int tm;
+        if constexpr (t_bits)
+        {
+            if (size_m > 48)      { moe_pipe::moe_gemm_pipe<t_bits, cb, 4, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(64)); tm = 64; }
+            else if (size_m > 32) { moe_pipe::moe_gemm_pipe<t_bits, cb, 3, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(48)); tm = 48; }
+            else if (size_m > 16) { moe_pipe::moe_gemm_pipe<t_bits, cb, 2, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(32)); tm = 32; }
+            else                  { moe_pipe::moe_gemm_pipe<t_bits, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); tm = 16; }
+        }
+        else
+        {
+            switch (K)
+            {
+                case 1: moe_pipe::moe_gemm_pipe<1, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 2: moe_pipe::moe_gemm_pipe<2, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 3: moe_pipe::moe_gemm_pipe<3, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 4: moe_pipe::moe_gemm_pipe<4, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 5: moe_pipe::moe_gemm_pipe<5, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 6: moe_pipe::moe_gemm_pipe<6, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 7: moe_pipe::moe_gemm_pipe<7, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 8: moe_pipe::moe_gemm_pipe<8, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+            }
+            tm = 16;
+        }
+        in_addr += tm * size_k;
+        out_addr += tm * size_n;
+        size_m -= tm;
+    }
+    #undef PIPE_ARGS
+}
+
+// Debug-only phase timer (build with -DEXL3_MOE_PIPE_PROF): thread 0 of every block
+// accumulates wall-clock ticks (100 MHz) per phase and printf's them at kernel exit
+#ifdef EXL3_MOE_PIPE_PROF
+    #define MOE_PROF_DECL uint64_t prof_acc[10] = {}; uint64_t prof_in[4] = {}; uint64_t prof_last = wall_clock64();
+    #define MOE_PROF_MARK(i) if (threadIdx.x == 0) { uint64_t now_ = wall_clock64(); prof_acc[i] += now_ - prof_last; prof_last = now_; }
+    #define MOE_PROF_DUMP if (threadIdx.x == 0) printf("moeprof g%d b%d: scan %llu gath %llu g %llu u %llu guad %llu d %llu bar %llu dout %llu tick %llu tail %llu\n", \
+        group_idx, block_idx, prof_acc[0], prof_acc[1], prof_acc[2], prof_acc[3], prof_acc[4], prof_acc[5], prof_acc[6], prof_acc[7], prof_acc[8], prof_acc[9]); \
+        if (threadIdx.x == 0) printf("moeinner g%d b%d: inner %llu reduce %llu tiles %llu calls %llu\n", group_idx, block_idx, prof_in[0], prof_in[1], prof_in[2], prof_in[3]);
+#else
+    #define MOE_PROF_DECL
+    #define MOE_PROF_MARK(i)
+    #define MOE_PROF_DUMP
+#endif
+
+// PIPE selects the mainloop: true = moe_gemm_rows_pipe (EXL3_ROCM_MOE_PIPE=1, default),
+// false = the shared exl3_gemm_kernel_inner exactly as before (EXL3_ROCM_MOE_PIPE=0)
+//
+// The pipelined instances are built for EXL3_MOE_PIPE_WPE waves per SIMD (8: <= 192 VGPRs),
+// so two 512-thread blocks fit one WGP; the host launches that many only after the
+// runtime occupancy query confirms it (the grid must be co-resident, see exl3_moe).
+template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M, bool PIPE = false>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
+__attribute__((amdgpu_waves_per_eu(PIPE ? EXL3_MOE_PIPE_WPE : 1)))
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
     const int group_idx = blockIdx.z;
@@ -198,6 +283,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     // expert matching its current ticket. Initial tickets are the group indices; after finishing an expert, a group
     // draws the next unclaimed ticket, so load balances greedily without assuming uniform cost per expert
     int ticket = group_idx;
+    MOE_PROF_DECL
 
     // Loop over experts
     int start = 0;
@@ -263,7 +349,9 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             group_barrier(group_idx, group_size, barrier_counters_sense);
         };
 
+        MOE_PROF_MARK(0)
         had_gather_gu_in();
+        MOE_PROF_MARK(1)
 
         // GEMM over the expert's rows in tiles of M_TILE. The wide instances finish an
         // expert's remainder with the largest smaller tile that covers it (64 -> 32 -> 16) so a
@@ -300,11 +388,6 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             gemm(in_addr, out_addr, trellis, K, hidden_dim, intermediate_dim);
         };
 
-        if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
-        group_barrier(group_idx, group_size, barrier_counters_sense);
-
         // Output hadamard for g, u + activation+gate + input hadamard for d
         auto had_guad = [&]()
         {
@@ -329,16 +412,51 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             group_barrier(group_idx, group_size, barrier_counters_sense);
         };
 
-        had_guad();
-
         // d GEMM
         auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
         {
             gemm(in_addr, out_addr, trellis, K, intermediate_dim, hidden_dim);
         };
 
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        if constexpr (PIPE)
+        {
+            // g, u and d through ONE call site, so the pipelined mainloop is inlined once per
+            // row tile (three call sites made clang outline the old one: FLAT loads and
+            // callee-saved spills). Same order and barriers as the sequence below
+            #pragma nounroll
+            for (int p = gated ? 0 : 1; p < 3; ++p)
+            {
+                if (p == 2)
+                {
+                    group_barrier(group_idx, group_size, barrier_counters_sense);
+                    had_guad();
+                    MOE_PROF_MARK(4)
+                }
+                const half* in_addr    = p == 0 ? temp_state_g : (p == 1 ? temp_state_u : temp_intermediate_g);
+                half* out_addr         = p == 0 ? temp_intermediate_g : (p == 1 ? temp_intermediate_u : temp_state_g);
+                const uint16_t* trellis = p == 0 ? exp_gate_trellis : (p == 1 ? exp_up_trellis : exp_down_trellis);
+                const int K            = p == 0 ? K_gate : (p == 1 ? K_up : K_down);
+                const int size_k       = p == 2 ? intermediate_dim : hidden_dim;
+                const int size_n       = p == 2 ? hidden_dim : intermediate_dim;
+                moe_gemm_rows_pipe<t_bits, cb, MOE_TILESIZE_N>(in_addr, trellis, out_addr, token_count, size_k, size_n, locks, K
+#ifdef EXL3_MOE_PIPE_PROF
+                    , prof_in
+#endif
+                );
+                MOE_PROF_MARK(p == 0 ? 2 : (p == 1 ? 3 : 5))
+            }
+        }
+        else
+        {
+            if (gated)
+                gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
+            gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+            group_barrier(group_idx, group_size, barrier_counters_sense);
+            had_guad();
+            gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        }
         group_barrier(group_idx, group_size, barrier_counters_sense);
+        MOE_PROF_MARK(6)
 
         // Output hadamard for d + scatter add
         auto had_d_out = [&]()
@@ -385,6 +503,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         had_d_out();
+        MOE_PROF_MARK(7)
 
         // Draw the next ticket and publish it to the group through the end-of-expert barrier, which also protects
         // the temp buffers for reuse. Grabbed tickets continue from num_groups since 0..num_groups-1 are implicit
@@ -392,7 +511,10 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             sched[2 + group_idx] = num_groups + atomicAdd(&sched[0], 1);
         group_barrier(group_idx, group_size, barrier_counters_sense);
         ticket = sched[2 + group_idx];
+        MOE_PROF_MARK(8)
     }
+    MOE_PROF_MARK(9)
+    MOE_PROF_DUMP
 
     // Retire group; last group out resets the scheduler for the next launch. The acq_rel increment orders each
     // group's earlier ticket grabs before the last group's reset (plain atomics are relaxed, so without this a
