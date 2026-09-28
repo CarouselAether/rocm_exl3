@@ -26,6 +26,12 @@
 //
 // Regime: m <= HGEMM_NARROW_MAX_M (8) and N <= HGEMM_NARROW_MAX_N (256), any K,
 // fp16 or fp32 C. EXL3_RDNA_HGEMM_NARROW_N overrides the N cutoff (0 disables).
+//
+// Second call site, same place: wmma_gemm_try() (rocm/wmma_gemm_rdna.hip) runs the
+// vendored rocm_wmma_gemm WMMA kernels for m > 8 on gfx1151/gfx1100/gfx1101, where
+// hipBLAS's fp32-output GEMM runs a VALU kernel with no matrix cores (3-6x slower than
+// its own fp16-output path; PROFILE.md section 6). EXL3_ROCM_WMMA_GEMM=0 disables it,
+// EXL3_ROCM_WMMA_GEMM_F16=0 disables it for fp16 output only. See RDNA_NOTES.md.
 // =============================================================================
 
 #include <cuda_fp16.h>
@@ -35,6 +41,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
+#include "rocm/wmma_gemm_rdna.hip.h"
 #include <limits>
 
 /*
@@ -221,6 +228,14 @@ static void hgemm_gemmex_impl
     if (hgemm_narrow_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m,
                          a.device().index(), stream))
         return;
+
+    // ROCm sibling: WMMA GEMM for m > 8 where the arch has a tuned table (see file header)
+    if (wmma_gemm_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m,
+                      a.device().index(), stream))
+    {
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
 
     // Set cuBLAS modes and workspace
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
