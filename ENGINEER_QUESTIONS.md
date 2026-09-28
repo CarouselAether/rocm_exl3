@@ -79,7 +79,7 @@ Q-1 to Q-10 were answered by the maintainer in a kickoff interview (2026-09-26),
 - Answer:
 
 ### Q-12: Should DS4 keep the extra last-page prefill forward (recurrent checkpoint) by default?
-- Status: open
+- Status: answered
 - Asked by: Phase 0 session, 2026-09-27
 - Context:
   - `generator/job.py:1305-1313` (upstream) runs a separate forward for the final partial page of every prompt on recurrent-state models, "to get the latest possible checkpoint". DS4 qualifies.
@@ -91,4 +91,9 @@ Q-1 to Q-10 were answered by the maintainer in a kickoff interview (2026-09-26),
   - B: skip the split when the remainder is small, or when no follow-up is expected (a per-request or server flag);
   - C: keep the split but make small-chunk MoE cheap. That comes mostly for free if the MoE mainloop fix (PROFILE.md #1) lands, and it shrinks A's cost proportionally.
 - What I did meanwhile: nothing changed. Measured and documented only. It is a candidate for a Python-side hook if the maintainer picks B.
-- Answer:
+- Follow-up (2026-09-27; maintainer asked how it affects regeneration):
+  - For recurrent models, prefix reuse is capped at the last page with a stashed recurrent state (`pagetable.py:268-296`).
+  - Prefill stashes happen only at `recurrent_checkpoint_interval_pp` boundaries (32768 by default) and at this last-page split (`job.py:1600-1620`).
+  - Without the split, regenerating or continuing any prompt under 32K would re-prefill the whole prompt. With it, only the tail (at most 255 tokens) is re-prefilled.
+  - Recommendation: KEEP option A, and pay down its cost via the MoE mainloop fix. The maintainer has not overridden this, so it is treated as keep-for-now.
+- Answer: (maintainer, in chat, 2026-09-27) Keep the page split. First-prompt speed is for benchmarks; regeneration deep into a conversation is what users care about. Status: answered.
