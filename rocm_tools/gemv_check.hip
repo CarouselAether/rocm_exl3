@@ -143,13 +143,14 @@ void run_case(int size_k, int size_n)
     const size_t smem = SPLITK ? exl3_gemv_smem_bytes_splitk(WARPS)
                                : exl3_gemv_smem_bytes(WARPS);
 
-    // Both dot-tile cores: core=0 is the barrier-free direct core (the runtime
-    // default), core=1 the LDS core (EXL3_GEMV_LDS=1). Same reference, same
-    // gates -- the direct core's whole risk is its layout claims, which show
-    // up here as gross error, not as a tolerance miss.
-    for (int core = 0; core < 2; core++)
+    // Every dot-tile core: core=0 is the barrier-free direct core
+    // (EXL3_ROCM_GEMV_TILES=0), core=1 the LDS core (EXL3_GEMV_LDS=1), core=2
+    // the tiles core (the runtime default, exl3_gemv_tiles_rdna.hip.h). Same
+    // reference, same gates -- a core's whole risk is its layout claims, which
+    // show up here as gross error, not as a tolerance miss.
+    for (int core = 0; core < 3; core++)
     {
-    const bool lds_core = core != 0;
+    const int lds_core = core;
     (void) hipMemset(dC, 0, (size_t) size_n * 4);
 
     if (SPLITK)
@@ -196,7 +197,7 @@ void run_case(int size_k, int size_n)
     printf("  bits=%d cb=%d waves=%-2d %s %s %s k=%-5d n=%-5d %s  "
            "err/RMS=%.5f  worst_rel=%.4f  outliers=%d\n",
            bits, cb, WARPS, SPLITK ? "splitk" : "single",
-           lds_core ? "lds " : "dir ",
+           lds_core == 1 ? "lds " : lds_core == 2 ? "tile" : "dir ",
            CFP32 ? "fp32" : "fp16", size_k, size_n,
            err == hipSuccess ? "ok  " : hipGetErrorString(err),
            rms_ref > 0 ? rms_err / rms_ref : 0.0, max_rel, bad);

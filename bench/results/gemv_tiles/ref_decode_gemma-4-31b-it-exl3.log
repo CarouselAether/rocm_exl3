@@ -1,0 +1,5 @@
+ -- thermal_guard: kill at Tctl >= 99.5 C, log /home/carousel/Desktop/exlproject/logs/thermal/20260927-185142.csv
+  48 steps, logits (48, 262144) torch.float32
+  text: " The sky appears blue because of a phenomenon called Rayleigh scattering. When sunlight enters Earth's atmosphere, it interacts with gas molecules and small particles, which scatter shorter wavelength"
+reference written to bench/results/gemv_tiles/ref_decode_gemma-4-31b-it-exl3.pt
+ -- thermal_guard: peak Tctl 64.8 C, rc 0

@@ -91,6 +91,56 @@ bool exl3_gemv_lds_core()
     return atoi(env) != 0;
 }
 
+// EXL3_ROCM_GEMV_TILES=0 restores the barrier-free direct core (bit-identical
+// outputs, the pre-2026-09-27 instruction stream and launch grids);
+// EXL3_GEMV_LDS=1 still pins the LDS core over both. Re-read per call.
+int exl3_gemv_core_mode()
+{
+    if (exl3_gemv_lds_core()) return EXL3_GEMV_CORE_LDS;
+    const char* env = std::getenv("EXL3_ROCM_GEMV_TILES");
+    if (env && atoi(env) == 0) return EXL3_GEMV_CORE_DIRECT;
+    return EXL3_GEMV_CORE_TILES;
+}
+
+// N-tiles per wave (see exl3_gemv_kernel_rdna.hip.h). Per-arch table: 2 on
+// every RDNA part (gfx1151 sweep 2026-09-27: T = 2 beats T = 1 at every bit
+// width on the split-K shapes, rocm_tools/gemv_tiles_bench.hip; the others
+// unmeasured, same default) -- but only while the halved grid still carries
+// about 13 waves per SIMD: below that the block count, not the per-wave
+// instruction count, limits (DS4 shared down 2048->4096 K4, 256 tiles x 4
+// warps: T = 2 27.5 us, T = 1 25.3 us; shared gate/up 2 x 128 tiles x 8
+// warps: T = 2 46.4, T = 1 48.4). The wave floor scales with the part's
+// multiProcessorCount (20 WGPs on gfx1151 -> 1024 waves).
+// EXL3_GEMV_TILES_T=1|2 overrides for sweeps.
+int exl3_gemv_tiles_tpb(int core, int device, int n_tiles, int bszm, int warps)
+{
+    if (core != EXL3_GEMV_CORE_TILES) return 1;
+    const char* env = std::getenv("EXL3_GEMV_TILES_T");
+    if (env)
+    {
+        int v = atoi(env);
+        return v >= 2 ? EXL3_GEMV_TILES_TMAX : 1;
+    }
+    static int mpc[64] = {};
+    int sms = 20;
+    if (device >= 0 && device < 64)
+    {
+        if (!mpc[device])
+        {
+            int v = 0;
+            if (hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, device) != hipSuccess || v <= 0)
+            {
+                (void) hipGetLastError();
+                v = 20;
+            }
+            mpc[device] = v;
+        }
+        sms = mpc[device];
+    }
+    const long waves_t2 = (long) (n_tiles / 2) * bszm * warps;
+    return waves_t2 >= 1024L * sms / 20 ? 2 : 1;
+}
+
 // -----------------------------------------------------------------------------
 // Eligibility
 // -----------------------------------------------------------------------------
@@ -246,7 +296,7 @@ static void exl3_gemv_rdna_launch
         shared_mem_size = exl3_gemv_smem_bytes_splitk(warps_per_block);
     }
 
-    const bool lds_core = exl3_gemv_lds_core();
+    const int lds_core = exl3_gemv_core_mode();
 
     #define LAUNCH_GEMV_WAVES_K(bits_val, codebook, warps, kernel_name) \
         if (c_fp32) { \
@@ -562,7 +612,7 @@ void exl3_gemv_graph_dot_kernel
     Exl3GemvGraphParams* __restrict__ pb,
     const int size_k,
     const int size_n,
-    const bool lds_core,
+    const int core,
     const bool fuse_out
 )
 {
@@ -592,16 +642,10 @@ void exl3_gemv_graph_dot_kernel
     const int tile_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
     if (tile_n >= n_tiles) return;
 
-    float accum = lds_core
-        ? exl3_gemv_dot_tile<bits, cb>
-          (
-              sh_a, B, size_k, n_tiles, tile_n, lane, my_sh_b,
-              my_sh_b_quant, 0, size_k / 16
-          )
-        : exl3_gemv_dot_tile_direct<bits, cb>
-          (
-              sh_a, B, n_tiles, tile_n, lane, 0, size_k / 16
-          );
+    float accum = exl3_gemv_dot_tile_sel<bits, cb, true, true>
+    (
+        core, sh_a, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant, 0, size_k / 16
+    );
 
     if (fuse_out)
         exl3_gemv_fused_epilogue<c_fp32>
@@ -634,7 +678,7 @@ void exl3_gemv_graph_dot_kernel_splitk
     Exl3GemvGraphParams* __restrict__ pb,
     const int size_k,
     const int size_n,
-    const bool lds_core,
+    const int core,
     const bool fuse_out
 )
 {
@@ -656,17 +700,17 @@ void exl3_gemv_graph_dot_kernel_splitk
     half* sh_b_dq = (half*) shared_mem;
     uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
     float* sh_red = (float*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
-    half* sh_a = (half*) (sh_red + WARPS_PER_BLOCK * 16);
+    half* sh_a = (half*) (sh_red + WARPS_PER_BLOCK * 16 * EXL3_GEMV_TILES_TMAX);
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
     exl3_gemv_rotate_in<WARPS_PER_BLOCK>(A, suh, sh_a, size_k, warp_id, lane);
     __syncthreads();
 
-    float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
+    float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK, true>
     (
         sh_a, B, size_k, n_tiles, tile_n, warp_id, lane,
-        my_sh_b, my_sh_b_quant, sh_red, lds_core
+        my_sh_b, my_sh_b_quant, sh_red, core
     );
 
     if (warp_id != 0) return;
@@ -790,7 +834,7 @@ bool exl3_gemv_graph_try_launch
         }
         size_t smem = exl3_gemv_smem_bytes_fused(warps_per_block, splitk, size_k);
 
-        const bool lds_core = exl3_gemv_lds_core();
+        const int lds_core = exl3_gemv_core_mode();
 
         #define LAUNCH_GGEMV_WAVES_K(bits_val, codebook, warps, kernel_name) \
             if (c_fp32) { \

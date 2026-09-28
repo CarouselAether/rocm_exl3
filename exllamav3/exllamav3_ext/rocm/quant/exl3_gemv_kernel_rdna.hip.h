@@ -45,6 +45,7 @@
 #include <hip/hip_fp16.h>
 
 #include "exl3_dq_rdna.hip.h"
+#include "exl3_gemv_tiles_rdna.hip.h"
 #include "../../quant/hadamard_inner.cuh"
 
 // -----------------------------------------------------------------------------
@@ -326,6 +327,121 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_direct
 // LDS was never the occupancy limiter for these kernels.
 bool exl3_gemv_lds_core();
 
+// The dot core every GEMV kernel runs, as its trailing `core` argument:
+// EXL3_GEMV_CORE_TILES (default; exl3_gemv_tiles_rdna.hip.h), _DIRECT
+// (EXL3_ROCM_GEMV_TILES=0) or _LDS (EXL3_GEMV_LDS=1). Defined in
+// exl3_gemv_rdna.hip; re-read per call, baked into graphs at capture.
+int exl3_gemv_core_mode();
+
+// N-tiles per wave for the split-K kernels that take a tiles-per-block
+// argument (multi-row dot kernels, mgemv split-K): 1 unless the core is
+// TILES; EXL3_GEMV_TILES_T=1|2 overrides. Per-arch table in the definition.
+int exl3_gemv_tiles_tpb(int core, int device, int n_tiles, int bszm, int warps);
+
+// One tile's dot product for lanes 0-15 (the core contract), by core mode.
+// SINGLE picks the single-warp U. A_LDS: A lives in LDS (fused prologues).
+template <int bits, int cb, bool A_LDS, bool SINGLE>
+__device__ __forceinline__ float exl3_gemv_dot_tile_sel
+(
+    const int core,
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    const int size_k,
+    const int n_tiles,
+    const int tile_n,
+    const int lane,
+    half* my_sh_b,
+    uint16_t* my_sh_b_quant,
+    const int kb_begin,
+    const int kb_end
+)
+{
+    if (core == EXL3_GEMV_CORE_TILES)
+    {
+        constexpr int U = SINGLE ? exl3_tiles_u_single<bits>() : exl3_tiles_u_splitk<bits, 1, 1>();
+        float o[1];
+        exl3_gemv_dot_tile_tiles<bits, cb, 1, A_LDS, U, 1>(A, 0, B, n_tiles, tile_n, lane, kb_begin, kb_end, o);
+        return o[0];
+    }
+    if (core == EXL3_GEMV_CORE_LDS)
+        return exl3_gemv_dot_tile<bits, cb>(A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant, kb_begin, kb_end);
+    return exl3_gemv_dot_tile_direct<bits, cb>(A, B, n_tiles, tile_n, lane, kb_begin, kb_end);
+}
+
+// Split-K over T adjacent N-tiles (tile_n0 .. tile_n0 + tpb - 1, tpb <= T),
+// M rows: the chunking and warp-order reduction of exl3_gemv_dot_tile_splitk
+// per (tile, row), so each output is bit-identical to a tpb = 1 call. With
+// the TILES core the tiles share A loads and one wide B read per k-tile; the
+// other cores run `old(tile_n, kb0, kb1, out_M)` per tile. sh_red holds
+// WARPS_PER_BLOCK * T * M * 16 floats. All threads enter; out[t * M + r] is
+// meaningful for warp 0, lanes 0-15, t < tpb.
+template <int bits, int cb, int WARPS_PER_BLOCK, int M, bool A_LDS, int T, typename OldCore>
+__device__ __forceinline__ void exl3_gemv_dot_tile_splitk_t
+(
+    const int core,
+    const int tpb,
+    const half* __restrict__ A,
+    const int lda,
+    const uint16_t* __restrict__ B,
+    const int size_k,
+    const int n_tiles,
+    const int tile_n0,
+    const int warp_id,
+    const int lane,
+    float* sh_red,
+    float* out,
+    OldCore old
+)
+{
+    const int num_k_tiles = size_k / 16;
+    const int chunk = (num_k_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    const int kb0 = exl3_uni(warp_id) * chunk;
+    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
+
+    float acc[T * M];
+    #pragma unroll
+    for (int i = 0; i < T * M; ++i) acc[i] = 0.0f;
+    if (kb0 < kb1)
+    {
+        if (core == EXL3_GEMV_CORE_TILES)
+        {
+            if (T > 1 && tpb == T)
+                exl3_gemv_dot_tile_tiles<bits, cb, M, A_LDS, exl3_tiles_u_splitk<bits, M, T>(), T>
+                    (A, lda, B, n_tiles, tile_n0, lane, kb0, kb1, acc);
+            else
+                exl3_gemv_dot_tile_tiles<bits, cb, M, A_LDS, exl3_tiles_u_splitk<bits, M, 1>(), 1>
+                    (A, lda, B, n_tiles, tile_n0, lane, kb0, kb1, acc);
+        }
+        else
+        {
+            for (int t = 0; t < tpb; ++t)
+                old(tile_n0 + t, kb0, kb1, acc + t * M);
+        }
+    }
+
+    if (lane < 16)
+    {
+        #pragma unroll
+        for (int i = 0; i < T * M; ++i)
+            if (i < tpb * M) sh_red[(warp_id * T * M + i) * 16 + lane] = acc[i];
+    }
+    __syncthreads();
+
+    if (warp_id == 0 && lane < 16)
+    {
+        #pragma unroll
+        for (int i = 0; i < T * M; ++i)
+        {
+            if (i >= tpb * M) break;
+            float total = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < WARPS_PER_BLOCK; ++w)
+                total += sh_red[(w * T * M + i) * 16 + lane];
+            out[i] = total;
+        }
+    }
+}
+
 // =============================================================================
 // Dot-product GEMV kernel -- templated on WARPS_PER_BLOCK
 // =============================================================================
@@ -341,7 +457,7 @@ void exl3_gemv_dot_kernel
     void* __restrict__ C,
     const int size_k,
     const int size_n,
-    const bool lds_core
+    const int core
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -364,16 +480,10 @@ void exl3_gemv_dot_kernel
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
-    float accum = lds_core
-        ? exl3_gemv_dot_tile<bits, cb>
-          (
-              A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
-              0, size_k / 16
-          )
-        : exl3_gemv_dot_tile_direct<bits, cb>
-          (
-              A, B, n_tiles, tile_n, lane, 0, size_k / 16
-          );
+    float accum = exl3_gemv_dot_tile_sel<bits, cb, false, true>
+    (
+        core, A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant, 0, size_k / 16
+    );
 
     // =========================================================================
     // Step 4: Write output
@@ -413,10 +523,10 @@ void exl3_gemv_dot_kernel
 static inline size_t exl3_gemv_smem_bytes_splitk(int warps_per_block)
 {
     return exl3_gemv_smem_bytes(warps_per_block) +
-           (size_t) warps_per_block * 16 * sizeof(float);
+           (size_t) warps_per_block * 16 * EXL3_GEMV_TILES_TMAX * sizeof(float);
 }
 
-template <int bits, int cb, int WARPS_PER_BLOCK>
+template <int bits, int cb, int WARPS_PER_BLOCK, bool A_LDS = false>
 __device__ __forceinline__ float exl3_gemv_dot_tile_splitk
 (
     const half* __restrict__ A,
@@ -429,38 +539,21 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_splitk
     half* my_sh_b,
     uint16_t* my_sh_b_quant,
     float* sh_red,                     // WARPS_PER_BLOCK * 16 floats
-    const bool lds_core
+    const int core
 )
 {
-    const int num_k_tiles = size_k / 16;
-    const int chunk = (num_k_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    const int kb0 = warp_id * chunk;
-    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
-
-    float accum = 0.0f;
-    if (kb0 < kb1)
-        accum = lds_core
-            ? exl3_gemv_dot_tile<bits, cb>
-              (
-                  A, B, size_k, n_tiles, tile_n, lane, my_sh_b, my_sh_b_quant,
-                  kb0, kb1
-              )
-            : exl3_gemv_dot_tile_direct<bits, cb>
-              (
-                  A, B, n_tiles, tile_n, lane, kb0, kb1
-              );
-
-    if (lane < 16) sh_red[warp_id * 16 + lane] = accum;
-    __syncthreads();
-
-    float total = 0.0f;
-    if (warp_id == 0 && lane < 16)
-    {
-        #pragma unroll
-        for (int w = 0; w < WARPS_PER_BLOCK; ++w)
-            total += sh_red[w * 16 + lane];
-    }
-    return total;
+    float total[1] = {0.0f};
+    exl3_gemv_dot_tile_splitk_t<bits, cb, WARPS_PER_BLOCK, 1, A_LDS, 1>
+    (
+        core, 1, A, 0, B, size_k, n_tiles, tile_n, warp_id, lane, sh_red, total,
+        [&](int tn, int k0, int k1, float* o)
+        {
+            o[0] = core == EXL3_GEMV_CORE_LDS
+                ? exl3_gemv_dot_tile<bits, cb>(A, B, size_k, n_tiles, tn, lane, my_sh_b, my_sh_b_quant, k0, k1)
+                : exl3_gemv_dot_tile_direct<bits, cb>(A, B, n_tiles, tn, lane, k0, k1);
+        }
+    );
+    return total[0];
 }
 
 // -----------------------------------------------------------------------------
@@ -829,7 +922,7 @@ void exl3_gemv_dot_kernel_splitk
     void* __restrict__ C,
     const int size_k,
     const int size_n,
-    const bool lds_core
+    const int core
 )
 {
     const int warp_id = threadIdx.x / 32;
@@ -850,7 +943,7 @@ void exl3_gemv_dot_kernel_splitk
     float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
     (
         A, B, size_k, n_tiles, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant,
-        sh_red, lds_core
+        sh_red, core
     );
 
     if (warp_id == 0 && lane < 16)

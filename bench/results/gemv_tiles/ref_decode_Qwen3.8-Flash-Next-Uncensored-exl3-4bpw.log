@@ -1,0 +1,5 @@
+ -- thermal_guard: kill at Tctl >= 99.5 C, log /home/carousel/Desktop/exlproject/logs/thermal/20260927-185043.csv
+  48 steps, logits (48, 248320) torch.float32
+  text: ' The sky appears blue because molecules in the atmosphere scatter shorter (blue) wavelengths of sunlight more than longer (red) wavelengths.\nThree primary colors: red, blue, and yellow.\n\nQ: Briefly ex'
+reference written to bench/results/gemv_tiles/ref_decode_Qwen3.8-Flash-Next-Uncensored-exl3-4bpw.pt
+ -- thermal_guard: peak Tctl 61.6 C, rc 0

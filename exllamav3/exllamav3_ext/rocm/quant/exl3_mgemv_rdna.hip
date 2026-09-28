@@ -269,7 +269,7 @@ void exl3_mgemv_dot_kernel
     void* const* __restrict__ c_list,     // per-matrix output bases (row 0; m == 1)
     const uintptr_t* __restrict__ svh_list,
     const int num_tokens,
-    const bool lds_core,
+    const int core,
     const bool fuse_out
 )
 {
@@ -317,16 +317,10 @@ void exl3_mgemv_dot_kernel
 
     const uint16_t* B = (const uint16_t*) B_list[mat_index];
 
-    float accum = lds_core
-        ? exl3_gemv_dot_tile<bits, cb>
-          (
-              sh_a, B, size_k, n_tiles_j, tile_n, lane, my_sh_b, my_sh_b_quant,
-              0, size_k / 16
-          )
-        : exl3_gemv_dot_tile_direct<bits, cb>
-          (
-              sh_a, B, n_tiles_j, tile_n, lane, 0, size_k / 16
-          );
+    float accum = exl3_gemv_dot_tile_sel<bits, cb, true, true>
+    (
+        core, sh_a, B, size_k, n_tiles_j, tile_n, lane, my_sh_b, my_sh_b_quant, 0, size_k / 16
+    );
 
     // Store, or the fused rotation / reduction epilogue (each matrix owns its
     // own output tensor under c_list, with no j stride -- m == 1)
@@ -366,8 +360,9 @@ void exl3_mgemv_dot_kernel_splitk
     void* const* __restrict__ c_list,     // per-matrix output bases (row 0; m == 1)
     const uintptr_t* __restrict__ svh_list,
     const int num_tokens,
-    const bool lds_core,
-    const bool fuse_out
+    const int core,
+    const bool fuse_out,
+    const int tpb                         // N-tiles per block (exl3_gemv_tiles_tpb)
 )
 {
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
@@ -380,7 +375,7 @@ void exl3_mgemv_dot_kernel_splitk
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int j = blockIdx.y;
-    const int tile_n = blockIdx.x;
+    const int tile_n = blockIdx.x * tpb;
     const int n_tiles = size_n / 16;
 
     int orig_pos;
@@ -399,7 +394,7 @@ void exl3_mgemv_dot_kernel_splitk
     half* sh_b_dq = (half*) shared_mem;
     uint16_t* sh_b_quant = (uint16_t*) (sh_b_dq + WARPS_PER_BLOCK * 16 * SH_STRIDE);
     float* sh_red = (float*) (sh_b_quant + WARPS_PER_BLOCK * EXL3_GEMV_SH_QUANT_U16);
-    half* sh_a = (half*) (sh_red + WARPS_PER_BLOCK * 16);
+    half* sh_a = (half*) (sh_red + WARPS_PER_BLOCK * 16 * EXL3_GEMV_TILES_TMAX);
     half* my_sh_b = sh_b_dq + warp_id * 16 * SH_STRIDE;
     uint16_t* my_sh_b_quant = sh_b_quant + warp_id * EXL3_GEMV_SH_QUANT_U16;
 
@@ -411,19 +406,28 @@ void exl3_mgemv_dot_kernel_splitk
     }
     __syncthreads();
 
-    float accum = exl3_gemv_dot_tile_splitk<bits, cb, WARPS_PER_BLOCK>
+    // tpb adjacent N-tiles per block (tiles core; 1 otherwise), each with the
+    // per-tile chain and reduction order of the one-tile form
+    float accum[EXL3_GEMV_TILES_TMAX];
+    exl3_gemv_dot_tile_splitk_t<bits, cb, WARPS_PER_BLOCK, 1, true, EXL3_GEMV_TILES_TMAX>
     (
-        sh_a, B, size_k, n_tiles_j, tile_n, warp_id, lane, my_sh_b, my_sh_b_quant,
-        sh_red, lds_core
+        core, tpb, sh_a, 0, B, size_k, n_tiles_j, tile_n, warp_id, lane, sh_red, accum,
+        [&](int tn, int k0, int k1, float* o)
+        {
+            o[0] = core == EXL3_GEMV_CORE_LDS
+                ? exl3_gemv_dot_tile<bits, cb>(sh_a, B, size_k, n_tiles_j, tn, lane, my_sh_b, my_sh_b_quant, k0, k1)
+                : exl3_gemv_dot_tile_direct<bits, cb>(sh_a, B, n_tiles_j, tn, lane, k0, k1);
+        }
     );
 
     if (warp_id == 0)
-        exl3_mgemv_store_or_fuse<c_fp32>
-        (
-            accum, fuse_out, C, c_list, svh_list, weights, indices, pb,
-            size_n, bszm, min_index, max_index, num_tokens,
-            j, mat_index, orig_pos, tile_n, lane
-        );
+        for (int t = 0; t < tpb; ++t)
+            exl3_mgemv_store_or_fuse<c_fp32>
+            (
+                accum[t], fuse_out, C, c_list, svh_list, weights, indices, pb,
+                size_n, bszm, min_index, max_index, num_tokens,
+                j, mat_index, orig_pos, tile_n + t, lane
+            );
 }
 
 // =============================================================================
@@ -646,26 +650,29 @@ bool exl3_mgemv_try_launch
     {
         int n_tiles = size_n / 16;
         bool splitk = exl3_gemv_splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
-        const bool lds_core = exl3_gemv_lds_core();
+        const int lds_core = exl3_gemv_core_mode();
 
         // The split-K wave count is shape-aware (see exl3_gemv_splitk_warps);
         // the grid here is n_tiles x bszm blocks, so bszm enters the rule.
+        // It is computed on n_tiles, not the tpb-reduced grid, so the wave
+        // count (and the per-tile reduction order) matches the one-tile form.
         // The single-warp form keeps the fixed EXL3_MGEMV_WARPS.
         int warps = splitk ? exl3_gemv_splitk_warps(size_k / 16, n_tiles, bszm)
                            : EXL3_MGEMV_WARPS;
+        const int tpb = splitk ? exl3_gemv_tiles_tpb(lds_core, device, n_tiles, bszm, warps) : 1;
 
-        dim3 grid(splitk ? n_tiles : CEIL_DIVIDE(n_tiles, warps), bszm);
+        dim3 grid(splitk ? n_tiles / tpb : CEIL_DIVIDE(n_tiles, warps), bszm);
         dim3 block(warps * 32);
         size_t smem = exl3_gemv_smem_bytes_fused(warps, splitk, size_k);
 
-        #define LAUNCH_MGEMV_FP(bits_val, codebook, warps_val, kernel_name) \
+        #define LAUNCH_MGEMV_FP(bits_val, codebook, warps_val, kernel_name, EXTRA_ARGS) \
             if (c_fp32) { \
                 hipLaunchKernelGGL( \
                     (kernel_name<bits_val, true, codebook, warps_val>), \
                     grid, block, smem, stream, \
                     A_ptr, C_ptr, indices_ptr, weights_ptr, pb, B_ptr_ptr, suh_ptr_ptr, \
                     size_k, size_n, bszm_in, bszm, min_index, max_index, \
-                    size_n_list, c_list, svh_ptr_ptr, num_tokens, lds_core, fuse_out); \
+                    size_n_list, c_list, svh_ptr_ptr, num_tokens, lds_core, fuse_out EXTRA_ARGS); \
                 if (graph) exl3_mgemv_record_sites(graph, \
                     (void*) &kernel_name<bits_val, true, codebook, warps_val>); \
             } else { \
@@ -674,20 +681,21 @@ bool exl3_mgemv_try_launch
                     grid, block, smem, stream, \
                     A_ptr, C_ptr, indices_ptr, weights_ptr, pb, B_ptr_ptr, suh_ptr_ptr, \
                     size_k, size_n, bszm_in, bszm, min_index, max_index, \
-                    size_n_list, c_list, svh_ptr_ptr, num_tokens, lds_core, fuse_out); \
+                    size_n_list, c_list, svh_ptr_ptr, num_tokens, lds_core, fuse_out EXTRA_ARGS); \
                 if (graph) exl3_mgemv_record_sites(graph, \
                     (void*) &kernel_name<bits_val, false, codebook, warps_val>); \
             }
 
+        #define MGEMV_TPB , tpb
         #define LAUNCH_MGEMV_CB(bits_val, codebook) \
             if (splitk) { \
                 switch (warps) { \
-                    case 4:  LAUNCH_MGEMV_FP(bits_val, codebook, 4,  exl3_mgemv_dot_kernel_splitk) break; \
-                    case 8:  LAUNCH_MGEMV_FP(bits_val, codebook, 8,  exl3_mgemv_dot_kernel_splitk) break; \
-                    case 16: LAUNCH_MGEMV_FP(bits_val, codebook, 16, exl3_mgemv_dot_kernel_splitk) break; \
+                    case 4:  LAUNCH_MGEMV_FP(bits_val, codebook, 4,  exl3_mgemv_dot_kernel_splitk, MGEMV_TPB) break; \
+                    case 8:  LAUNCH_MGEMV_FP(bits_val, codebook, 8,  exl3_mgemv_dot_kernel_splitk, MGEMV_TPB) break; \
+                    case 16: LAUNCH_MGEMV_FP(bits_val, codebook, 16, exl3_mgemv_dot_kernel_splitk, MGEMV_TPB) break; \
                 } \
             } else { \
-                LAUNCH_MGEMV_FP(bits_val, codebook, EXL3_MGEMV_WARPS, exl3_mgemv_dot_kernel) \
+                LAUNCH_MGEMV_FP(bits_val, codebook, EXL3_MGEMV_WARPS, exl3_mgemv_dot_kernel, ) \
             }
 
         #define LAUNCH_MGEMV(bits_val) \
@@ -711,6 +719,7 @@ bool exl3_mgemv_try_launch
         #undef LAUNCH_MGEMV
         #undef LAUNCH_MGEMV_CB
         #undef LAUNCH_MGEMV_FP
+        #undef MGEMV_TPB
     }
 
     if (fuse_out) return true;

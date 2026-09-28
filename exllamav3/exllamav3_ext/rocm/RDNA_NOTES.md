@@ -458,6 +458,13 @@ its prefill would be blocked on WMMA absence anyway.)
 
 ### Software-pipelining the direct core: tried, rejected (2026-08-13)
 
+> **2026-09-27 update:** the conclusion below held for the core as it was
+> (~97 VALU cycles per tile). Once the decode itself was cut to ~40 cycles
+> per tile, batching the loads of U = 2-4 k-tiles (no rotation, no
+> prologue/epilogue, in-order decode) became a large win at K = 1-4 --
+> see "GEMV tiles core" at the end of this file. The rotation form measured
+> here is still not what to redo.
+
 The former open item — overlap tile t+1's B loads with tile t's dq/dot —
 was implemented and measured, and the code was reverted. Record of both
 halves, because each kills a different future re-attempt:
@@ -883,8 +890,10 @@ Under `rocm_tools/`:
 | tool | checks |
 |---|---|
 | `wmma_check.hip` | WMMA operand order and fragment layout against a CPU reference |
-| `gemm_check.hip`, `gemv_check.hip` | GEMM / GEMV kernels against a CPU reference; gemv_check runs both dot cores, and `GEMV_SWEEP=1` adds the DRAM-resident bandwidth sweep (build with the FLAGS block from `build_coop_check.sh` minus the torch libs, single TU) |
+| `gemm_check.hip`, `gemv_check.hip` | GEMM / GEMV kernels against a CPU reference; gemv_check runs all three dot cores (direct, LDS, tiles; build: `SRC=gemv_check rocm_tools/build_gemv_tiles_bench.sh`), and `GEMV_SWEEP=1` adds the DRAM-resident bandwidth sweep (build with the FLAGS block from `build_coop_check.sh` minus the torch libs, single TU) |
 | `mgemv_check.py` | mgemv against the cooperative kernel on real weights: packing, grouped reduce, every routing config |
+| `gemv_tiles_bench.hip` (+ `build_gemv_tiles_bench.sh`) | standalone (no torch) direct core vs tiles core at every (U, T): bit-for-bit comparison and DRAM-resident us / GB/s on DS4/Qwen/Gemma shapes |
+| `bench_gemv_kernels.py` | the real GEMV dispatches (ext.exl3_gemm / exl3_mgemm) on DS4 decode shapes, `--ab` = EXL3_ROCM_GEMV_TILES 0 vs 1 in one process |
 | `gemm_coop_check.hip` | cooperative launch against the same work without it |
 | `moe_ref32.py` | fused MoE **and** the per-expert path against an fp32 reference built from dequantized weights |
 | `moe_check.py` | fused MoE against the per-expert path (two fp16 implementations — see its own caveats) |
@@ -1833,3 +1842,135 @@ MTP spread is 15-18% in both runs (per-prompt variance). Saved ~8.8 ms/token aga
 - seq > 1 rows are separate programs: the MTP verify re-reads the shared keys per row.
 - Scratch users re-enter the decode stream only with `-cq`. Watch for the per-layer
   scratch stall (see "DS4 per-layer stall" above) if -cq decode looks slow.
+
+## GEMV tiles core (2026-09-27): DS4 tg128 22.0 -> 27.7 t/s, bit-identical
+
+Branch `opt/gemv-tiles` (PROFILE.md §8 rank 2, CODE_SCAN #3/#4/#18). A new dot core
+for every EXL3 GEMV, `rocm/quant/exl3_gemv_tiles_rdna.hip.h`, selected at runtime
+(`EXL3_ROCM_GEMV_TILES=0` restores the direct core; `EXL3_GEMV_LDS=1` still pins the
+LDS core). Same lane layout, same fdot2 chains in the same order, same split-K
+reduction: **every output is bit-identical** to the direct core.
+
+**The diagnosis was half wrong, in a useful way.** PROFILE §5 read "VALU issue per
+wave-cycle 0.04" as low VALU use. Per SIMD that is 0.04 x ~14 resident waves ~= 0.55,
+and a per-op throughput microbench (instr/SIMD/clk, wave32, gfx1151) showed where it
+went:
+
+| op | rate | op | rate |
+|---|---|---|---|
+| v_add, v_bfe, v_perm, v_alignbit, v_lshl_or | 0.96 | **v_mul_lo_u32, v_mul_hi_u32** | **0.24** (quarter) |
+| **v_sad_u8, v_sad_hi_u8, v_msad_u8** | 0.96 | **v_dot4_u32_u8, v_dot8_u32_u4** | **0.49** (half) |
+| v_mad_u32_u16, v_pk_mul_lo_u16, v_mul_lo_u16 | 0.93-0.96 | v_mul_u32_u24, v_mad_u32_u24 | 0.96 |
+| v_pk_fma_f16, v_dot2_f32_f16 | 0.92-0.95 | | |
+
+The old K=2 loop was 56 VALU instructions = **97 VALU cycles per 16x16 tile per
+lane** (8 quarter-rate hash multiplies, 8 half-rate dp4a byte sums, two 64-bit
+shifts, ~17 ops of 64-bit per-lane address math, a divergent exec-mask loop); K=4 95
+cycles. At the measured 120 us/call that is ~65% of the SIMD's issue -- VALU-bound,
+with the rest exposed latency (one 64-byte tile in flight per wave at K=2).
+
+**What the core does (all exact integer arithmetic):**
+- Hash multiply `x * C mod 2^32` for a 16-bit x: `r = v_pk_mul_lo_u16 src, [0|C_hi]`
+  (op_sel picks x's half; the low lane is x*0) then `v_mad_u32_u16 src, C_lo, r`.
+  Two full-rate ops for one quarter-rate op; x may sit in either half of a register,
+  so windows at bit 0 / 16 need no extraction and the rest one shift (no mask). The
+  cb 0 additive constant rides in the same two ops (`v_pk_mad_u16`).
+- Byte sum: `v_sad_u8(P, 0, 0x64006400)` then `v_sad_hi_u8(P1, 0, s)` gives the
+  decoded pair already packed as `[0x6400+s0 | 0x6400+s1]` -- replaces two half-rate
+  dp4a and the and/lshl_or packing (mul1, cb 2; mcg/3inst keep their lop3+hadd tail).
+- fshift at K=1/2/4 is one `v_alignbit` (shift < 32).
+- Addressing: tile base, k range, pointers are `readfirstlane`'d, loads are
+  `global_load v, vOff, s[base] offset:imm` with a loop-invariant 32-bit lane offset.
+  **LLVM trap:** in a loop, LICM hoists the offset's zero-extension to the preheader,
+  ISel then sees a bare 64-bit VGPR add and emits 2 VALU of address math per load
+  (never the saddr form). An empty `asm volatile("" : "+v"(off))` per iteration keeps
+  the zext in the loop; the register is carried unchanged, zero cost.
+- U k-tiles' loads issued together, then decoded in k order (U = 2-4 at K <= 3; the
+  fdot2 chains are the same sequence as U = 1), and T = 2 adjacent N-tiles per wave
+  sharing the A loads (one 2 x 32*K byte contiguous read per k-tile). Per-arch table
+  `exl3_tiles_u_splitk` / `exl3_gemv_tiles_tpb`; T = 2 only while the halved grid
+  keeps >= 1024 waves (scaled by multiProcessorCount), else T = 1.
+
+**Instruction counts** (hot loop, per tile per lane, from the ISA of
+`rocm_tools/gemv_tiles_bench.hip`; VALU cycles weight quarter-rate x4, half-rate x2):
+
+| kernel | before VALU / cycles / VMEM | after VALU / cycles / VMEM |
+|---|---|---|
+| K=2 mul1 split-K (gate/up) | 56 / 97 / 4 | 39 / 39 / 3 (U2T2: 3 VMEM incl. shared A) |
+| K=2 mul1 split-K, A in LDS (down) | 53 / 94 / 2+1 lds | 39.5 / 39.5 / 2+0.5 lds |
+| K=4 mul1 split-K | 57 / 95 / 4 | 37 / 37 / 3 |
+| K=6 mul1 single-warp (head) | 72 / 134 / 6 | 48 / 72 / 6 |
+| K=6 mcg split-K (Gemma) | 85 / 139 / 6 | 52 / 76 / 5 |
+
+(K = 5/6/8 keep the generic dq4 64-bit fshift, 8 quarter-rate shifts per tile.)
+
+**Per-kernel, real dispatch** (`rocm_tools/bench_gemv_kernels.py --ab`: whole call =
+rotation + dot + fused epilogue, DRAM-resident, DS4 shapes; before = 3cf11c5 build):
+
+| shape | before us | off us | on us | on GB/s | on G w/s | x vs before |
+|---|---|---|---|---|---|---|
+| routed gate/up K2 4096->2048 x6 | 121.0 | 115.8 | **74.2** | **169.7** | 679 | 1.63 |
+| routed gate/up K2, m=3 | 133.2 | 133.3 | 83.8 | 150.2 | 601 | 1.59 |
+| routed down K2 2048->4096 x6, weighted | 132.2 | 126.3 | **82.3** | **152.8** | 611 | 1.61 |
+| wo_a K4 4096->1024 x8 | 106.0 | 105.1 | 84.3 | 199.0 | 398 | 1.26 |
+| wo_a K4, m=3 | 112.3 | 110.7 | 86.9 | 193.0 | 386 | 1.29 |
+| shared gate/up K4 4096->2048 x2 | 59.8 | 59.0 | 46.3 | 181.2 | 362 | 1.29 |
+| wo_b K4 8192->4096 | 102.0 | 98.6 | 79.7 | 210.4 | 421 | 1.28 |
+| wo_b K4, m=3 | 109.9 | 105.0 | 80.3 | 208.9 | 418 | 1.37 |
+| wq_b K4 1024->32768 | 99.7 | 96.7 | 84.0 | 199.8 | 400 | 1.19 |
+| wq_b K4, m=3 | 108.8 | 102.5 | 85.8 | 195.6 | 391 | 1.27 |
+| shared down K4 2048->4096 (T=1 by the wave floor) | 30.2 | 29.2 | 26.2 | 160.2 | 320 | 1.15 |
+| head K6 4096->129280 | 1906 | 1874 | 1746 | 227.5 | 303 | 1.09 |
+
+("off" is the new build with `EXL3_ROCM_GEMV_TILES=0`: the direct core with the
+same launch geometry as before; it reads a few % faster than the old build on some
+rows, unexplained, within run-to-run noise of the kernel bench.)
+
+The U x T sweep behind the table (`rocm_tools/gemv_tiles_bench.hip`, core only, no
+epilogue): T = 2 wins at every K on split-K shapes (K2 gate/up: U1T1 94.8, U2T1
+77.6, U4T1 75.1, **U2T2 70.2**, U4T2 73.5 us); K4 prefers U1T2 (wo_b 74.7 vs
+U2T1 77.3); K7-8 gain only from the decode (U1). The single-warp lm_head prefers
+U4T1. Short-k, small grids (256 tiles x 4 warps) lose with T = 2 -> the wave floor.
+
+**End to end** (bench/run_bench.py, same build, switch on/off; stack before 21.5 /
+20.5 / 23.8):
+
+| | tiles on | tiles off | |
+|---|---|---|---|
+| DS4 tg128 | **27.68** | 22.02 | +25.7% |
+| DS4 tg64 @ 16K | **26.07** | 20.92 | +24.6% |
+| DS4 MTP ndt=2 (greedy, acc 81%) | **32.01** | 24.72 | +29% (spread 15-17% both: prompt mix) |
+| DS4 pp512 | 123.3 | 122.4 | untouched path |
+| Qwen3.8 tg128 | 25.41 | 24.44 | +4.0% |
+| Gemma-4-31B tg128 | 7.70 | 7.52 | +2.4% (K6 mcg, near its ~9.7 roofline) |
+
+**Correctness.** `rocm_tools/gemv_tiles_bench` 19 shapes x 7 (U,T) modes bit-identical
+to the direct core (bits 1-8, cb 0/1/2, M 1/4, A in global and LDS); `gemv_check`
+now runs all three cores against the independent reconstruct reference, all pass;
+`mgemv_bitwise` DS4 + Qwen PASS against references saved on the 3cf11c5 build;
+`decode_bitwise` DS4 / Qwen / Gemma PASS (and DS4 with `EXL3_GEMV_TILES_T=1` and
+with `=0`); `multirow_check` PASS; `bench/run_gates.sh` PASS (879 passed).
+PPL (wikitext2 100 x 2048): DS4 6.461140 (= stack); Qwen3.8 4.746908 with the switch on
+**and** off -- the -0.017% against the Phase 0 4.747702 is the stack's WMMA prefill
+GEMM, not this change (PPL runs the prefill GEMMs; the GEMV path is bit-identical).
+Portability: `hipcc_probe --all` 123/123 on gfx1151/1100/1101/1200/1201; max dot-kernel VGPR
+105 (gfx1151/1100) / 112 (gfx1201) for the M=4 row tile at K <= 3 (12 waves/SIMD;
+M = 1 kernels 41-70), no scratch anywhere.
+
+**Tried and not taken / open:**
+- mul24 decomposition of the hash multiply (`v_mul_u32_u24` + `v_mad_u32_u24` + a
+  shift): 3-4 full-rate ops vs 2 for the pk_mul/mad16 pair. Not built.
+- `v_dot4` -> `v_sad_u8` alone would be a 1-cycle-per-weight win; `v_sad_hi_u8`
+  also folds the packing, so both were taken together.
+- K = 5/6/8 still run the generic dq4 with the 64-bit funnel shift (8 quarter-rate
+  ops per tile). A per-lane precomputed `shift >= 32` operand select would make it
+  alignbit + 2 cndmask; worth ~2-5% on Gemma (K6) and lm_head, which already sit
+  at 200-227 GB/s. Not done.
+- Release-only fences for non-last split-K arrivals (CODE_SCAN #10): not measured.
+  With T = 2 a warp arrives twice per block; the fence cost is in the epilogue only.
+- The weighted down projection is still the LDS-prologue mgemv kernel: 82 us real
+  vs 69 us for the same core with A pre-staged -- the per-block rotation and the
+  reduce tail. Moving it to the multi-row path with a weighted epilogue (CODE_SCAN
+  #6) is the next ~0.4 ms/token.
+- The M = 4 row tile at K <= 3 is 99-105 VGPR (12 waves); U = 1 for M = 4 was slower
+  in the core sweep (83.5 vs 78.6 us), so the table keeps U = 2.

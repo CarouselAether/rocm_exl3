@@ -251,7 +251,7 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_splitk_mr
 
 static inline size_t exl3_gemv_mr_smem_bytes(int warps, int M)
 {
-    return (size_t) warps * M * 16 * sizeof(float);
+    return (size_t) warps * M * EXL3_GEMV_TILES_TMAX * 16 * sizeof(float);
 }
 
 // =============================================================================
@@ -410,30 +410,41 @@ __device__ __forceinline__ void exl3_gemv_mr_body
     const uint16_t* __restrict__ B,
     const int size_k,
     const int n_tiles_j,
-    const int tile_n,
+    const int tile_n,               // first of the block's tpb tiles
     void* Cb,
     const int64_t row_off,
     const int ldc,
     const int rows_valid,
     const half* __restrict__ svh,
-    int* seg_counter,
+    int* seg_counters,              // this slot's counters, indexed by segment
     const int warp_id,
-    const int lane
+    const int lane,
+    const int core,
+    const int tpb
 )
 {
     extern __shared__ char shared_mem[];
     float* sh_red = (float*) shared_mem;
 
-    float acc[M];
-    exl3_gemv_dot_tile_splitk_mr<bits, cb, WARPS_PER_BLOCK, M>
+    // tpb adjacent N-tiles per block with the tiles core (1 otherwise); each
+    // tile's rows keep the one-tile chain and reduction order
+    constexpr int T = EXL3_GEMV_TILES_TMAX;
+    float acc[T * M];
+    exl3_gemv_dot_tile_splitk_t<bits, cb, WARPS_PER_BLOCK, M, false, T>
     (
-        A, lda, B, size_k, n_tiles_j, tile_n, warp_id, lane, sh_red, acc
+        core, tpb, A, lda, B, size_k, n_tiles_j, tile_n, warp_id, lane, sh_red, acc,
+        [&](int tn, int k0, int k1, float* o)
+        {
+            exl3_gemv_dot_tile_direct_mr<bits, cb, M>(A, lda, B, n_tiles_j, tn, lane, k0, k1, o);
+        }
     );
     if (warp_id != 0) return;
-    exl3_gemv_fused_epilogue_mr<c_fp32, M>
-    (
-        acc, Cb, row_off, ldc, rows_valid, tile_n, lane, svh, seg_counter
-    );
+    for (int t = 0; t < tpb; ++t)
+        exl3_gemv_fused_epilogue_mr<c_fp32, M>
+        (
+            acc + t * M, Cb, row_off, ldc, rows_valid, tile_n + t, lane, svh,
+            seg_counters + (tile_n + t) / 8
+        );
 }
 
 template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M>
@@ -445,18 +456,20 @@ void exl3_gemv_mr_dot_single
     Exl3GemvMrParams* __restrict__ pb,
     const int size_k,
     const int size_n,
-    const int size_m
+    const int size_m,
+    const int core,
+    const int tpb
 )
 {
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int tile_n = blockIdx.x;
+    const int tile_n = blockIdx.x * tpb;
     const int n_tiles = size_n / 16;
     exl3_gemv_mr_body<bits, c_fp32, cb, WARPS_PER_BLOCK, M>
     (
         pb->A_had, size_k, pb->B, size_k, n_tiles, tile_n,
         pb->C, 0, size_n, size_m, pb->svh,
-        pb->seg_counters + tile_n / 8, warp_id, lane
+        pb->seg_counters, warp_id, lane, core, tpb
     );
 }
 
@@ -477,13 +490,15 @@ void exl3_gemv_mr_dot_multi
     const int min_index,
     const int max_index,
     const int* __restrict__ size_n_list,  // per-matrix widths; size_n is the max
-    void* const* __restrict__ c_list      // per-matrix output bases (m rows, stride n_j)
+    void* const* __restrict__ c_list,     // per-matrix output bases (m rows, stride n_j)
+    const int core,
+    const int tpb
 )
 {
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int j = blockIdx.y;
-    const int tile_n = blockIdx.x;
+    const int tile_n = blockIdx.x * tpb;
     const int n_tiles = size_n / 16;
 
     int orig_pos;
@@ -502,7 +517,7 @@ void exl3_gemv_mr_dot_multi
         A_had + (int64_t) j * size_m * size_k, size_k,
         (const uint16_t*) B_list[mat_index], size_k, n_tiles_j, tile_n,
         Cb, row_off, ldc, size_m, (const half*) svh_list[mat_index],
-        pb->seg_counters + j * n_segs + tile_n / 8, warp_id, lane
+        pb->seg_counters + j * n_segs, warp_id, lane, core, tpb
     );
 }
 
@@ -619,10 +634,12 @@ bool exl3_gemv_multirow_try_launch
         const int n_tiles = size_n / 16;
         const int warps = exl3_gemv_mr_warps(size_k, n_tiles, 1);
         const int m_tile = exl3_gemv_mr_row_tile(size_m);
-        dim3 grid(n_tiles, 1);
+        const int core = exl3_gemv_core_mode();
+        const int tpb = exl3_gemv_tiles_tpb(core, device, n_tiles, 1, warps);
+        dim3 grid(n_tiles / tpb, 1);
         dim3 block(warps * 32);
         size_t smem = exl3_gemv_mr_smem_bytes(warps, m_tile);
-        LAUNCH_MR(exl3_gemv_mr_dot_single, pb, size_k, size_n, size_m)
+        LAUNCH_MR(exl3_gemv_mr_dot_single, pb, size_k, size_n, size_m, core, tpb)
     }
     return true;
 }
@@ -694,11 +711,13 @@ bool exl3_mgemv_multirow_try_launch
         const int n_tiles = size_n / 16;
         const int warps = exl3_gemv_mr_warps(size_k, n_tiles, bszm);
         const int m_tile = exl3_gemv_mr_row_tile(size_m);
-        dim3 grid(n_tiles, bszm);
+        const int core = exl3_gemv_core_mode();
+        const int tpb = exl3_gemv_tiles_tpb(core, device, n_tiles, bszm, warps);
+        dim3 grid(n_tiles / tpb, bszm);
         dim3 block(warps * 32);
         size_t smem = exl3_gemv_mr_smem_bytes(warps, m_tile);
         LAUNCH_MR(exl3_gemv_mr_dot_multi, pb, B_ptr_ptr, svh_ptr_ptr, A_had_ptr,
-                  size_k, size_n, size_m, bszm, min_index, max_index, size_n_list, c_list)
+                  size_k, size_n, size_m, bszm, min_index, max_index, size_n_list, c_list, core, tpb)
     }
     return true;
 }

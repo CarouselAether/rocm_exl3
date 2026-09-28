@@ -129,6 +129,19 @@ assumes on NVIDIA. Doubling it was tried and reverted — the apparent 6-7% gain
 did not survive repeat measurement. Kept so the question can be re-answered on
 parts with a different CU count or CU/WGP ratio.
 
+## `gemv_tiles_bench.hip`, `bench_gemv_kernels.py`
+
+The GEMV tiles core (RDNA_NOTES "GEMV tiles core"). The standalone bench compares
+the direct core and the tiles core at every (U, T) bit for bit and times them
+DRAM-resident on DS4 / Qwen / Gemma shapes; `bench_gemv_kernels.py` times the real
+dispatches through the extension, on/off in one process.
+
+```bash
+rocm_tools/build_gemv_tiles_bench.sh && /tmp/gemv_tiles_bench [name-filter]
+SRC=gemv_check rocm_tools/build_gemv_tiles_bench.sh && /tmp/gemv_check
+python rocm_tools/bench_gemv_kernels.py --ab
+```
+
 ## On measurement noise
 
 The decode step has a **4.7% run-to-run spread** (1.6% stdev over 8 repeats) on
