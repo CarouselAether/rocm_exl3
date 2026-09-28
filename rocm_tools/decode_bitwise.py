@@ -39,6 +39,9 @@ def main():
     ap.add_argument("-n", "--new_tokens", type=int, default=48)
     ap.add_argument("--save", metavar="FILE")
     ap.add_argument("--compare", metavar="FILE")
+    ap.add_argument("--prompt_repeat", type=int, default=1,
+                    help="repeat the prompt N times (e.g. 40 -> ~800 tokens) so the prefill runs the "
+                         "large-row (R > 32) paths too; the first logits row then covers the prefill")
     args = ap.parse_args()
     if bool(args.save) == bool(args.compare):
         ap.error("exactly one of --save / --compare")
@@ -50,7 +53,8 @@ def main():
     model.load(progressbar=False)
     generator = Generator(model=model, cache=cache, tokenizer=tokenizer)
 
-    ids = tokenizer.encode(PROMPT, add_bos=True)
+    ids = tokenizer.encode(PROMPT * args.prompt_repeat, add_bos=True)
+    print(f"  prompt: {ids.shape[-1]} tokens")
     job = Job(input_ids=ids, max_new_tokens=args.new_tokens,
               sampler=ArgmaxSampler(), return_logits=True)
     generator.enqueue(job)

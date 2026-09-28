@@ -773,6 +773,167 @@ void gr_finalize_kernel
 }
 
 
+// -----------------------------------------------------------------------------
+// ROCm sibling: GatedResidual decode mix, restructured (Qwen3.8, 97 sites per token)
+// -----------------------------------------------------------------------------
+// rocprofv3 on Qwen3.8-Flash-Next decode (b22b243, ctx 512): gr_dots_kernel 60.8 us and
+// gr_finalize_kernel 37.5 us per site, 9.5 ms of a 34.8 ms busy token (27%) -- for 6.6 MB of
+// fp16 weights each, i.e. ~110 and ~175 GB/s against ~210 achievable.
+//
+// gr_dots_rows_kernel: gr_dots_kernel with RB fn rows per block instead of one. The thread ->
+// column map (8-half column c = tid + 128 k), each per-stream fmaf chain, the __shfl_down
+// tree (or its DPP twin, lane 0 bit-identical) and the 4-warp sum are unchanged, so every
+// dot is bit-identical; what changes is that a block loads its stream quads ONCE into
+// registers and then streams RB fn rows with all of a row's loads in flight (the one-row
+// kernel had 325 blocks each re-reading the 40 KB stream stack and ~2.5 dependent loop
+// trips per stream). The sum-of-squares row runs in its own block, verbatim.
+//
+// gr_finalize_kernel stays as it is: it already runs at ~180 GB/s, and a variant that put
+// the up-gate loads ahead of the prologue and moved the butterflies to DPP measured slower
+// (36.5 -> 37.9 us; RDNA_NOTES "Qwen3.8 decode").
+//
+// EXL3_ROCM_GR_DOTS=0 restores the one-row kernel (runtime switch, same build);
+// EXL3_ROCM_GR_RB picks rows per block (2 / 4 / 8, default 4).
+
+template <bool DPP>
+__device__ __forceinline__ float gr_warp_sum_lane0(float a)
+{
+    if constexpr (DPP) return hc_warp_sum_lane0(a);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        a += __shfl_down_sync(0xffffffffu, a, offset);
+    return a;
+}
+
+template <int H, int RB, int NI, bool DPP>
+__global__ __launch_bounds__(GR_THREADS_A)
+void gr_dots_rows_kernel
+(
+    const float* __restrict__ streams,   // (R, H, D)
+    const half* __restrict__ fn,         // (M, H * D) half, norm weight folded in
+    float* __restrict__ dots,            // (R, M + 1, H)
+    const int M,
+    const int D
+)
+{
+    const int r = blockIdx.y;
+    const int D4 = D / 4;
+    const int D8 = D / 8;
+    const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    __shared__ float red[RB][H][GR_THREADS_A / 32];
+
+    const int nrb = (M + RB - 1) / RB;
+    if (blockIdx.x == nrb)
+    {
+        // sum-of-squares row: gr_dots_kernel's j == M branch
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+        {
+            float a = 0.0f;
+            for (int c = threadIdx.x; c < D4; c += GR_THREADS_A)
+            {
+                float4 s = s4[(size_t) h * D4 + c];
+                a = fmaf(s.x, s.x, fmaf(s.y, s.y, fmaf(s.z, s.z, fmaf(s.w, s.w, a))));
+            }
+            a = gr_warp_sum_lane0<DPP>(a);
+            if (lane == 0) red[0][h][warp] = a;
+        }
+        __syncthreads();
+        if (threadIdx.x < H)
+        {
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < GR_THREADS_A / 32; ++w)
+                v += red[0][threadIdx.x][w];
+            dots[((size_t) r * (M + 1) + M) * H + threadIdx.x] = v;
+        }
+        return;
+    }
+
+    const int j0 = blockIdx.x * RB;
+
+    // this thread's stream values, every stream: 8 columns at c = tid + 128 k
+    float4 sa[H][NI], sb[H][NI];
+    #pragma unroll
+    for (int h = 0; h < H; ++h)
+        #pragma unroll
+        for (int k = 0; k < NI; ++k)
+        {
+            const int c = threadIdx.x + k * GR_THREADS_A;
+            if (c < D8)
+            {
+                sa[h][k] = s4[(size_t) h * D4 + 2 * c];
+                sb[h][k] = s4[(size_t) h * D4 + 2 * c + 1];
+            }
+        }
+
+    #pragma unroll
+    for (int rr = 0; rr < RB; ++rr)
+    {
+        const int j = j0 + rr;
+        if (j >= M) break;                                   // block-uniform
+        int4 f[H][NI];
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            #pragma unroll
+            for (int k = 0; k < NI; ++k)
+            {
+                const int c = threadIdx.x + k * GR_THREADS_A;
+                if (c < D8) f[h][k] = ((const int4*) (fn + ((size_t) j * H + h) * D))[c];
+            }
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+        {
+            float a = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < NI; ++k)
+            {
+                const int c = threadIdx.x + k * GR_THREADS_A;
+                if (c < D8)
+                {
+                    const float4 s0 = sa[h][k];
+                    const float4 s1 = sb[h][k];
+                    half4 w0 = *(half4*) &f[h][k].x;
+                    half4 w1 = *(half4*) &f[h][k].z;
+                    a = fmaf(s0.x, LOW_TO_FLOAT(w0.x), a);
+                    a = fmaf(s0.y, HIGH_TO_FLOAT(w0.x), a);
+                    a = fmaf(s0.z, LOW_TO_FLOAT(w0.y), a);
+                    a = fmaf(s0.w, HIGH_TO_FLOAT(w0.y), a);
+                    a = fmaf(s1.x, LOW_TO_FLOAT(w1.x), a);
+                    a = fmaf(s1.y, HIGH_TO_FLOAT(w1.x), a);
+                    a = fmaf(s1.z, LOW_TO_FLOAT(w1.y), a);
+                    a = fmaf(s1.w, HIGH_TO_FLOAT(w1.y), a);
+                }
+            }
+            a = gr_warp_sum_lane0<DPP>(a);
+            if (lane == 0) red[rr][h][warp] = a;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < RB * H)
+    {
+        const int rr = threadIdx.x / H;
+        const int h = threadIdx.x % H;
+        const int j = j0 + rr;
+        if (j < M)
+        {
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < GR_THREADS_A / 32; ++w)
+                v += red[rr][h][w];
+            dots[((size_t) r * (M + 1) + j) * H + h] = v;
+        }
+    }
+}
+
+static int gr_env_int(const char* name, int def)
+{
+    const char* env = std::getenv(name);
+    return env ? atoi(env) : def;
+}
+
+
 // Residual update for one sublayer site: x[h, d] <- post[h] * y[d] + sum_h' comb[h', h] *
 // x[h', d]. Without comb (GatedResidual): x[h, d] <- post[h] * y[d] + x[h, d]. Pure per-column
 // mix of the H stream rows, so it runs in place: each thread loads all H values of its columns
@@ -1314,12 +1475,39 @@ void gr_mix
     TORCH_CHECK(fn.size(1) == H * D && w.numel() == H * D, "gr_mix: dims");
     TORCH_CHECK(dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix: dots shape");
 
-    dim3 grid_a(M + 1, R);
-    gr_dots_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
-    (
-        (const float*) streams.data_ptr(), (const half*) fn.data_ptr(),
-        (float*) dots.data_ptr(), M, D
-    );
+    // ROCm sibling: RB-rows-per-block dots (bit-identical; see gr_dots_rows_kernel)
+    static const bool gr_dots_on = gr_env_int("EXL3_ROCM_GR_DOTS", 1) != 0;
+    static const int gr_rb = gr_env_int("EXL3_ROCM_GR_RB", 4);
+    const bool dpp = hc_dpp_enabled();
+    const int ni = (D / 8 + GR_THREADS_A - 1) / GR_THREADS_A;
+    bool launched = false;
+    if (gr_dots_on && ni >= 1 && ni <= 3 && (gr_rb == 2 || gr_rb == 4 || gr_rb == 8))
+    {
+        dim3 grid_r((M + gr_rb - 1) / gr_rb + 1, R);
+        #define GR_DOTS_ARGS (const float*) streams.data_ptr(), (const half*) fn.data_ptr(), (float*) dots.data_ptr(), M, D
+        #define GR_DOTS_NI(RB_, DPP_) \
+            if (ni == 1) gr_dots_rows_kernel<4, RB_, 1, DPP_><<<grid_r, GR_THREADS_A, 0, stream>>>(GR_DOTS_ARGS); \
+            else if (ni == 2) gr_dots_rows_kernel<4, RB_, 2, DPP_><<<grid_r, GR_THREADS_A, 0, stream>>>(GR_DOTS_ARGS); \
+            else gr_dots_rows_kernel<4, RB_, 3, DPP_><<<grid_r, GR_THREADS_A, 0, stream>>>(GR_DOTS_ARGS);
+        #define GR_DOTS_RB(DPP_) \
+            if (gr_rb == 2) { GR_DOTS_NI(2, DPP_) } \
+            else if (gr_rb == 4) { GR_DOTS_NI(4, DPP_) } \
+            else { GR_DOTS_NI(8, DPP_) }
+        if (dpp) { GR_DOTS_RB(true) } else { GR_DOTS_RB(false) }
+        #undef GR_DOTS_RB
+        #undef GR_DOTS_NI
+        #undef GR_DOTS_ARGS
+        launched = true;
+    }
+    if (!launched)
+    {
+        dim3 grid_a(M + 1, R);
+        gr_dots_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
+        (
+            (const float*) streams.data_ptr(), (const half*) fn.data_ptr(),
+            (float*) dots.data_ptr(), M, D
+        );
+    }
     cuda_check(cudaPeekAtLastError());
 
     // Phase C is warp-per-column-quad: chunk at warp granularity (4 * NUM_THREADS / 32
@@ -1335,7 +1523,8 @@ void gr_mix
         (const float*) streams.data_ptr(), (const float*) dots.data_ptr(), \
         (const half*) upt.data_ptr(), (const half*) w.data_ptr(), \
         post_p, mixed.data_ptr(), D, LR, chunk_cols, (float) rms_eps
-    if (mixed.dtype() == at::kHalf)
+    const bool half_out = mixed.dtype() == at::kHalf;
+    if (half_out)
         gr_finalize_kernel<4, true><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS);
     else
         gr_finalize_kernel<4, false><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS);
@@ -1440,15 +1629,94 @@ void exl3_rocm_hc_mix
                   partials, &post, &comb, collapsed, nullptr, pend_p, nrm_p);
 }
 
+// =============================================================================
+// ROCm sibling: GatedResidual prefill gate-mean in one pass (exl3_rocm::gr_gate_mean)
+// =============================================================================
+// The prefill form of GatedResidual._mix (R > 32 rows) ends in
+//   mixed = (sigmoid(g.float()).view(R, H, D) * normed.float().view(R, H, D)).mean(-2).half()
+// which torch runs as 2 upcast copies, a sigmoid, a multiply and a mean over fp32 (R, H * D)
+// temporaries: ~1.6 ms per site at R = 2048 (rocprofv3, Qwen3.8 pp2048, 95 sites per
+// forward). This kernel reads g and normed once (half) and writes mixed, with torch's
+// arithmetic per element: sigmoid as 1 / (1 + expf(-x)), the product in fp32, the mean as
+// ((0 + p0 + p1) + p2) + p3 times 1 / H (the reduce kernel's accumulation order for a
+// 4-long strided reduction), RNE to half. Checked bitwise against the torch expression by
+// rocm_tools/gr_mix_bench.py --prefill. EXL3_ROCM_GR_PREFILL=0 (rocm_py) keeps torch.
+
+template <int H>
+__global__ __launch_bounds__(256)
+void gr_gate_mean_kernel
+(
+    const half* __restrict__ g,          // (R, H, D)
+    const half* __restrict__ normed,     // (R, H, D)
+    half* __restrict__ mixed,            // (R, D)
+    const int R,
+    const int D
+)
+{
+    // torch rounds the product before the sum: no fma contraction anywhere in here
+    #pragma clang fp contract(off)
+    const int D4 = D / 4;
+    const size_t n = (size_t) R * D4;
+    const float inv_h = 1.0f / (float) H;
+    for (size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += (size_t) gridDim.x * blockDim.x)
+    {
+        const size_t r = idx / D4;
+        const int c = (int) (idx - r * D4);
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+        {
+            const size_t off = ((r * H + h) * (size_t) D4 + c) * 4;
+            const half4 gv = *(const half4*) (g + off);
+            const half4 nv = *(const half4*) (normed + off);
+            // plain operators under contract(off): the HIP __fmul_rn / __fadd_rn helpers are
+            // header inlines whose fmul / fadd keep the TU's contract flag and still fused
+            const float p0 = (1.0f / (1.0f + expf(-LOW_TO_FLOAT(gv.x)))) * LOW_TO_FLOAT(nv.x);
+            const float p1 = (1.0f / (1.0f + expf(-HIGH_TO_FLOAT(gv.x)))) * HIGH_TO_FLOAT(nv.x);
+            const float p2 = (1.0f / (1.0f + expf(-LOW_TO_FLOAT(gv.y)))) * LOW_TO_FLOAT(nv.y);
+            const float p3 = (1.0f / (1.0f + expf(-HIGH_TO_FLOAT(gv.y)))) * HIGH_TO_FLOAT(nv.y);
+            acc.x = acc.x + p0;
+            acc.y = acc.y + p1;
+            acc.z = acc.z + p2;
+            acc.w = acc.w + p3;
+        }
+        half2* out2 = (half2*) (mixed + r * D);
+        out2[c * 2] = __floats2half2_rn(acc.x * inv_h, acc.y * inv_h);
+        out2[c * 2 + 1] = __floats2half2_rn(acc.z * inv_h, acc.w * inv_h);
+    }
+}
+
+void exl3_rocm_gr_gate_mean(const at::Tensor& g, const at::Tensor& normed, at::Tensor mixed)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(g.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(g, kHalf);
+    TORCH_CHECK_DTYPE(normed, kHalf);
+    TORCH_CHECK_DTYPE(mixed, kHalf);
+    TORCH_CHECK(g.is_contiguous() && normed.is_contiguous() && mixed.is_contiguous(), "gr_gate_mean: contiguous inputs required");
+    TORCH_CHECK(g.dim() == 3 && g.size(1) == 4 && normed.sizes() == g.sizes(), "gr_gate_mean: g / normed must be (R, 4, D)");
+    const int R = g.size(0);
+    const int D = g.size(2);
+    TORCH_CHECK(D % 4 == 0 && mixed.numel() == (int64_t) R * D, "gr_gate_mean: dims");
+    const int64_t n = (int64_t) R * (D / 4);
+    const int blocks = (int) std::min<int64_t>((n + 255) / 256, 65535);
+    if (n == 0) return;
+    gr_gate_mean_kernel<4><<<blocks, 256, 0, stream>>>
+        ((const half*) g.data_ptr(), (const half*) normed.data_ptr(), (half*) mixed.data_ptr(), R, D);
+    cuda_check(cudaPeekAtLastError());
+}
+
 TORCH_LIBRARY_FRAGMENT(exl3_rocm, m)
 {
     m.def("hc_mix_rdna(Tensor(a!) x, Tensor? y, Tensor? post_a, Tensor? comb_a, Tensor fn, Tensor base, "
           "Tensor scale, float rms_eps, float hc_eps, int sinkhorn_iters, Tensor(b!) partials, "
           "Tensor(c!) post, Tensor(d!) comb, Tensor(e!) collapsed, Tensor? norm_w, Tensor(f!)? norm_y, "
           "float norm_eps, float norm_bias, float norm_scale) -> ()");
+    m.def("gr_gate_mean(Tensor g, Tensor normed, Tensor(a!) mixed) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(exl3_rocm, CUDA, m)
 {
     m.impl("hc_mix_rdna", &exl3_rocm_hc_mix);
+    m.impl("gr_gate_mean", &exl3_rocm_gr_gate_mean);
 }

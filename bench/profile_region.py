@@ -147,9 +147,12 @@ def main():
     ap.add_argument("--steps", type=int, default=32)
     ap.add_argument("--mtp", action="store_true")
     ap.add_argument("-ndt", type=int, default=2)
+    ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[],
+                    help="extra model_init args, as run_bench.py (e.g. --extra -ngr)")
     a = ap.parse_args()
 
     ia = ["-m", a.model_dir, "-cs", str(a.cache_size)] + (["--mtp", "-ndt", str(a.ndt)] if a.mtp else [])
+    ia += a.extra
     p = argparse.ArgumentParser()
     model_init.add_args(p, cache=True, add_sampling_args=False, add_draft_model_args=True,
                         default_autosplit_max_batch_size=4)

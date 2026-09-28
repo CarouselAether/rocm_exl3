@@ -85,6 +85,7 @@ Environment switches (all default to the safe value for this backend):
   EXL3_ROCM_HC_FUSE=0      mHC apply_ runs as its own launch instead of inside
                            the next site's mix
   EXL3_ROCM_HC_NORM=0      the RMSNorm after each mHC mix runs as its own launch
+  EXL3_ROCM_GR_PREFILL=0   GatedResidual (Qwen3.8) prefill gate-mean back on torch ops
   (C++ side, same build: EXL3_ROCM_ROUTER_GEMV=0, EXL3_ROCM_ROUTER_FUSE=0,
   EXL3_ROCM_MR_WEIGHTED=0, EXL3_ROCM_HC_DPP=0 -- see RDNA_NOTES "Decode leftovers")
 
@@ -1031,6 +1032,59 @@ def apply() -> list[str]:
             applied.append(f"fused-MoE row cap {_bst2.TEMP_ROWS_FUSED} (pipelined mainloop; EXL3_ROCM_MOE_FUSED_ROWS / EXL3_MOE_FUSED_ROWS)")
     except Exception as e:
         applied.append(f"!! FAILED batch-recon/mtile patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # GatedResidual (Qwen3.8) prefill mix: gate-mean in one kernel
+    # ------------------------------------------------------------------
+    # GatedResidual._mix at R > FUSED_MAX_R (prefill chunks) ends in
+    #   (sigmoid(g.float()).view(R, H, D) * normed.float().view(R, H, D)).mean(-2).half()
+    # -- two fp32 upcasts, a sigmoid, a multiply and a mean over (R, H * D) fp32
+    # temporaries, ~1.6 ms per site at R = 2048 on gfx1151 (Qwen3.8 pp2048 trace,
+    # b22b243: 95 sites per forward, ~11% of the forward). torch.ops.exl3_rocm.
+    # gr_gate_mean (rocm/hc_mix_rdna.hip) does it in one pass over the two half
+    # tensors with the same per-element arithmetic, bit-identical to the torch
+    # expression (rocm_tools/gr_mix_bench.py --prefill). Everything before it
+    # (norm, the two GEMMs, silu, post) is the upstream code verbatim.
+    # EXL3_ROCM_GR_PREFILL=0 restores the torch expression.
+    if _env_on("EXL3_ROCM_GR_PREFILL", True):
+        try:
+            import torch
+            import torch.nn.functional as _F
+            from ..modules import hyperconnections as _hcm
+            from ..ext import exllamav3_ext as _ext
+            _ = torch.ops.exl3_rocm.gr_gate_mean   # raises if the build lacks the op
+            _GR = _hcm.GatedResidual
+            _orig_gr_mix = _GR._mix
+
+            def _gr_mix_rdna(self, streams, cached = True):
+                H, Dh = self.hc_mult, self.hidden_size
+                R = streams.shape[0] * streams.shape[1]
+                if R <= self.FUSED_MAX_R or H != 4 or Dh % 4 != 0 or not streams.is_cuda:
+                    return _orig_gr_mix(self, streams, cached)
+                s3 = streams.reshape(R, H, Dh)
+                if s3.dtype != torch.float:
+                    s3 = s3.float()
+                if not s3.is_contiguous():
+                    s3 = s3.contiguous()
+                dev = s3.device
+                post = torch.empty((R, H), dtype = torch.float, device = dev) \
+                    if self.use_combine else None
+                normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
+                _ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
+                              self.rms_eps, 0.0, 1.0, False, False, H)
+                dm = torch.matmul(normed.view(R, H * Dh), self.proj_h.t())
+                t = _F.silu(dm[:, : self.rank] / H)
+                if self.use_combine:
+                    post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
+                g = torch.matmul(t, self.up_h.t())
+                mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
+                torch.ops.exl3_rocm.gr_gate_mean(g.view(R, H, Dh), normed.view(R, H, Dh), mixed)
+                return post, mixed
+
+            _GR._mix = _gr_mix_rdna
+            applied.append("GatedResidual prefill mix: gate-mean fused (EXL3_ROCM_GR_PREFILL)")
+        except Exception as e:
+            applied.append(f"!! FAILED GatedResidual prefill patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # HIP graphs: report the effective state (the decision is made in C++)
