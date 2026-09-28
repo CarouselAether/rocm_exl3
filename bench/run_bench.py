@@ -53,6 +53,8 @@ ap.add_argument("-ndt", "--num_draft_tokens", type=int, default=2)
 ap.add_argument("--long", type=int, default=0, help="also run tg64 after an N-token prompt")
 ap.add_argument("--gen_chunk", type=int, default=None,
                 help="Generator max_chunk_size (default: Generator's 2048, as the server uses). -chunk_size via --extra only sizes load-time buffers")
+ap.add_argument("--regen", type=int, nargs="*", default=[],
+                help="regeneration workloads: prompt lengths; each run primes a prompt, then re-sends it and times\n                the cached-prefix + tail prefill (latency ms), which is what a user feels on regenerate")
 ap.add_argument("--label", default="")
 ap.add_argument("--out", default=os.path.join(HERE, "results"))
 ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra model_init args, e.g. --extra -cq 8")
@@ -167,6 +169,27 @@ def tg_rate(f):
     return f["new_tokens"] / f["time_generate"]
 
 
+def regen_workload(n, runs, generator, tokenizer, rng):
+    """Prime a fresh prompt (untimed), re-send it identically, and time the second prefill."""
+    out = {"name": f"regen{n}", "runs": []}
+    for r in range(runs + 1):
+        ids = rand_ids(tokenizer, n, rng)
+        run_job(generator, ids, 1)                       # prime: stores pages + recurrent stash
+        smp = Sampler(); smp.start()
+        f = run_job(generator, ids, 1)
+        gpu = smp.stop()
+        rec = {"rate": f["time_prefill"] * 1e3, "cached_tokens": f.get("cached_tokens", 0),
+               "prompt_tokens": f["prompt_tokens"], "gpu": gpu}
+        (out.setdefault("warmup", rec) if r == 0 else out["runs"].append(rec))
+    lat = [x["rate"] for x in out["runs"]]
+    out["median"] = statistics.median(lat)
+    out["spread"] = (max(lat) - min(lat)) / out["median"]
+    out["unit"] = "ms"
+    cached = out["runs"][0]["cached_tokens"]
+    print(f"  {out['name']:10} {out['median']:9.1f} ms   spread {out['spread']:5.1%}  cached {cached}/{n}", flush=True)
+    return out
+
+
 def workload(name, make_ids, n_new, rate, runs, generator, sampler=None):
     out = {"name": name, "runs": [], "cached_seen": 0}
     for r in range(runs + 1):
@@ -244,6 +267,9 @@ def main():
         if args.tg:
             res.append(workload(f"tg{args.tg}", lambda r: rand_ids(tokenizer, args.tg_ctx, rng), args.tg,
                                 tg_rate, args.runs, gen))
+            save()
+        for n in args.regen:
+            res.append(regen_workload(n, args.runs, gen, tokenizer, rng))
             save()
         if args.long:
             res.append(workload(f"tg64@{args.long}", lambda r: rand_ids(tokenizer, args.long, rng), 64,
