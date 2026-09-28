@@ -31,6 +31,9 @@ Environment switches (all default to the safe value for this backend):
   EXL3_ROCM_RDNA4_FUSED_MOE=1  on gfx120x, do not steer MoE off the fused
                            kernel (whose WMMA traps on gfx12); for a future
                            gfx12 WMMA port
+  EXL3_ROCM_DSA_DECODE=0   DeepSeek-V4 decode attention back on the (retuned)
+                           upstream split kernel instead of the MQA kernel in
+                           dsa_decode_rdna.py (see the note at the patch)
 
   Bisect handles -- slow, for localising a numerics fault, never to leave on:
 
@@ -210,6 +213,30 @@ def apply() -> list[str]:
             applied.append("DSA split kernel retuned for RDNA (BLOCK_H=8, num_warps=8; spills 2050->438)")
         except Exception as e:
             applied.append(f"!! FAILED DSA retune patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # DSA decode: MQA-specialized split kernel (rocm_py/dsa_decode_rdna.py)
+    # ------------------------------------------------------------------
+    # Even retuned, the upstream split kernel spills (~700 VGPRs, 2.2 KB
+    # scratch/lane) and costs 160-225 us per call at ANY context -- 16% of
+    # DS4 decode (PROFILE.md §4). Root cause: a loop-invariant q tile is kept
+    # resident as the WMMA A operand (replicated across half-waves on RDNA3,
+    # 16 x 512 per warp = 256 VGPRs), next to a BLOCK_H x 576 fp32
+    # accumulator. The replacement gives each program all 64 heads of the
+    # single KV head and one 128-column block of the output, streams the score
+    # reduction over D, and writes the same workspace for the same combine:
+    # 0 spills, ~22 us at ctx 512. The C++ launch is unchanged (BLOCK_H /
+    # N_SPLITS set the grid). Layered on top of EXL3_ROCM_DSA_TUNE, which
+    # still governs anything this kernel declines (Q_SPLIT / OUT_LATENT:
+    # GLM-5.2's DSA-on-MLA). EXL3_ROCM_DSA_DECODE=0 restores the retuned
+    # upstream kernel; EXL3_ROCM_DSA_DECODE_{SPLITS,BLOCK_H,HP,BLOCK_N,
+    # BLOCK_W,KC,WARPS} override the tuning (sweep: rocm_tools/bench_dsa_decode.py).
+    if _env_on("EXL3_ROCM_DSA_DECODE", True):
+        try:
+            from . import dsa_decode_rdna as _dsad
+            applied.append(_dsad.install())
+        except Exception as e:
+            applied.append(f"!! FAILED DSA decode kernel patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # MultiLinear (mgemm) fusion

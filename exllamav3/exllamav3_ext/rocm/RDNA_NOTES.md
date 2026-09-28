@@ -1687,3 +1687,149 @@ Perplexity (wikitext2, 100 x 2048, `bench/run_ppl.sh`): DS4 6.461140 vs baseline
 existing JSON, so a re-run with new `-m/-n/-k` measures only those), then
 `gen_wmma_gemm_table.py` again and rebuild. `gen_wmma_gemm_table.py --check` tells you
 whether the generated files are stale.
+
+## DSA decode MQA kernel (2026-09-27): DS4 tg128 18.07 -> 21.52 t/s
+
+`_dsa_attn_split_kernel` (DeepSeek-V4 decode sparse attention, split phase) cost
+160-225 us per call at every context: 43 calls/token, 16% of decode (PROFILE.md §4).
+The 2026-08-28 retune (`EXL3_ROCM_DSA_TUNE`, BLOCK_H 8 / 8 warps) cut the spills enough
+to kill the per-layer scratch stall, but the kernel itself stayed slow.
+
+**Root cause.** Two things drive the register pressure:
+- A loop-invariant q tile is hoisted and held as the WMMA A operand. RDNA3 WMMA
+  replicates A/B across the two half-waves, so a 16 x 512 A panel is 256 VGPRs per warp
+  on its own.
+- Every program also carries a BLOCK_H x 576 fp32 accumulator (D_c padded to 512, plus
+  64 rope columns).
+
+The result is 256 VGPRs, ~700 spilled, and 2.2 KB scratch per lane in every tuning
+(sweep below). Each split sees only ~8-40 keys, so the call is all fixed cost.
+Window-only layers, which have the FEWEST keys, were the slowest at 217 us. WMMA was
+emitted (205 v_wmma), so "no WMMA" was not the problem.
+
+**Fix.** `rocm_py/dsa_decode_rdna.py:_dsa_decode_mqa_kernel` is a drop-in split kernel
+(same arguments, same workspace layout, same combine, unchanged C++ launch):
+- One program = HP heads (32) x one BD-wide output column block (256) x one key split.
+- Scores are the full 512-wide q.K, reduced in a RUNTIME loop of KC = 64 chunks with q
+  re-read per chunk (L1/L2 hits). A static unroll or an invariant q brings the spills
+  back. Scores are recomputed per column block, which is cheap at decode key counts.
+- Accumulator is 32 x 256 fp32 = 64 VGPRs over 128 lanes.
+- The virtual key row is [c | r] = 512 wide: ring/chunk rows are contiguous; pool rows
+  are pool_c ++ pool_r.
+- Packed pools (QC) use a column-range variant of the plane loader, in the same H32
+  domain as upstream.
+- Grid: the C++ launches (rows x H/BLOCK_H, n_splits); the kernel reads pid % (H/BLOCK_H)
+  as (head group, column block). m / l are written by column block 0; the other column
+  blocks compute identical values.
+
+**Tuning (production).** bc_dsa.BLOCK_H 16 (the combine's head block), HP 32 -> BD 256,
+BLOCK_N = BLOCK_W 32, KC 64, 4 warps, stages 1, N_SPLITS 8 (single value for ctx 512 and
+16K; BCDsaBatch hardcodes 8). Tool: `rocm_tools/bench_dsa_decode.py` (`--sweep-old`,
+`--sweep-new` with `EXL3_DSA_SWEEP=tile|splits`). Measured with CUDA-graph replay, us per
+split + combine, DS4 shapes.
+
+Old kernel sweep (csa ctx 512 seq 1; baseline H8 w8 s2 ns16 = 169 us):
+
+| knob | values -> us |
+|---|---|
+| n_splits (H8 w8 s2) | 1: 160, 2: 137, 4: 105, 8: 123, 16: 170; at 16K top-k 255 / 194 / 174 / 160 / 221 |
+| BLOCK_H x warps, s1 | H8: w4 115, w8 181, w16 374; H16: w4 80, w8 96; H32: w4 70, w8 70; H64: w8 74 |
+| stages 2 | same or worse everywhere (H32 w4 s2 192) |
+| BLOCK_N / BLOCK_W | N16W16 153, N32W16 166, N32W32 295; N64 exceeds 64 KB LDS |
+
+Every old variant spills (555-3219 spills). The best is ~70 us, so tuning alone cannot
+reach 40 us.
+
+New kernel sweep (4 splits unless noted, columns = csa512 | csa16K-topk | csa512 seq3 |
+csa512 qc4):
+- BLOCK_N 32 beats 16 everywhere (16: 26-43 us at 512).
+- KC 128 spills at 4 warps, and KC 32 is slower.
+- 8 warps beat 4 only for the QC column.
+- Best tiles:
+  - H16/HP32/BD256/w4: 18.1 | 39.1 | 28.8 | 42.2
+  - H8/HP32/BD128/w4: 20.1 | 38.6 | 34.9 | 34.0
+  - H16/HP64/BD128/w4: 20.1 | 40.3 | 32.1 | 40.3
+- Splits (H16/HP32/BD256/w4): 2: 28.7, 4: 18.1, 8: **15.5**, 16: 23.4 at 512; 16K top-k
+  77 / 40 / **34** / 37. 16 splits is slower even for window-only layers (each program is
+  latency-bound, and the combine grows).
+- KSTAGES 2 (software pipelining of the KC loop) is slower everywhere except QC: rejected.
+
+**Before / after** (us per split + combine call; old = retuned upstream kernel, H8 w8 ns16):
+
+| case | old | new | new spills / scratch B |
+|---|---|---|---|
+| csa ctx512 seq1 | 169 | **15.5** | 0 / 0 |
+| csa ctx512 seq1 qc4 | 159 | 30.6 | 169 / 616 |
+| csa ctx512 seq3 (MTP verify) | 451 | 28.4 | 0 / 0 |
+| csa ctx512 seq3 qc4 | 383 | 49.2 | 169 / 616 |
+| hca ctx512 seq1 / seq3 | 212 / 575 | 20.2 / 33.5 | 0 / 0 |
+| win ctx512 seq1 / seq3 | 217 / 592 | 15.4 / 28.3 | 0 / 0 |
+| csa-topk ctx16K seq1 | 218 | **33.0** | 10 / 32 |
+| csa-topk ctx16K seq1 qc4 | 218 | 64.8 | 177 / 624 |
+| csa-topk ctx16K seq3 / seq3 qc4 | 649 / 609 | 57.9 / 95.3 | |
+| hca ctx16K seq1 / seq3 | 170 / 455 | 15.3 / 28.5 | 0 / 0 |
+| MULTIROW csa512 B2 / topk16K seq3 qc4 B2 / hca16K seq2 B3 | 244 / 836 / 614 | 33.6 / 172 / 59.4 | |
+
+Error vs the fp64 reference is unchanged (4.7e-4 vs 5.0e-4 at csa512; QC 7e-4..1.4e-3 on
+both). Old: 256 VGPR, 709 spills, 2256 B scratch. New (fp16 pool): 256 VGPR allocated,
+0 spills, 0 scratch.
+
+**End to end** (DS4 2.04bpw, `bench/run_bench.py`, same build, `EXL3_ROCM_DSA_DECODE=0`
+vs default):
+
+| | off | on |
+|---|---|---|
+| tg128 | 18.07 | **21.52** (+19%) |
+| tg64@16384 | 17.39 | **20.46** (+18%) |
+| pp512 | 122.9 | 121.2 (untouched path; noise) |
+| MTP ndt 2 | 20.73 (acc 77%) | **23.82** (acc 81%) |
+
+MTP spread is 15-18% in both runs (per-prompt variance). Saved ~8.8 ms/token against
+43 x (207 - 19) us = 8.1 ms predicted.
+
+**Numerics / validation.**
+- `test_dsa_kernels.py` ALL PASS. The eager `dsa_attn` split path goes through a launch
+  proxy, so the test's `run(8)` exercises the new kernel on every H64/D512 case; H8,
+  H16/D288 and H128/D576 fall back to upstream.
+- PPL is unaffected by construction: prefill uses the one-shot `_dsa_attn_kernel`.
+- Decode A/B (`rocm_tools/decode_agree.py`, 3 prompts x 256 greedy tokens, the third a
+  3K-token prompt reaching the top-k regime; old run twice = bit-exact control):
+
+  | prompt | prefix match | KL max | top-10 max |
+  |---|---|---|---|
+  | 0 | 37/256 (diverges at a near-tie, top-2 gap 0.109) | 5.0e-2 | 1.9 |
+  | 1 | 169/256 (near-tie, top-2 gap 0.031) | 6.4e-3 | 0.5 |
+  | 2 | 256/256 | 1.8e-2 | 1.5 |
+
+  Noise floor: the UPSTREAM kernel with only N_SPLITS 16 -> 8 (a pure reduction-order
+  change) gives the same class: top-10 max 2.1 / 0.77 / 1.66, KL max 3.4e-2 / 1.9e-2 /
+  4.9e-3, and the same divergence at prompt 1 step 169. `EXL3_ROCM_DSA_TUNE=0` vs 1 is
+  bit-identical, so the head-block split does not reorder anything.
+
+  The same A/B on the other two routes:
+
+  | route | prefix match (prompts 0 / 1 / 2) | top-2 gap at divergence | KL max | top-10 max |
+  |---|---|---|---|---|
+  | `--batch` (3 concurrent jobs: BCDsaBatch MULTIROW, 8 splits) | 256 / 172 / 256 | 0.000 | 3.4e-2 / 8.4e-3 / 1.6e-2 | 3.1 / 0.91 / 1.6 |
+  | `--cq 8` (packed pools, QC 8) | 51 / 54 / 256 | 0.125 / 0.000 | 8.1e-2 / 8.9e-3 / 2.5e-2 | 1.5 / 0.44 / 1.7 |
+- DS4 PPL (`MODELS=ds4 bench/run_ppl.sh`): 6.461140, identical to the stack.
+- `bench/run_gates.sh`: PASS (879 passed, 9 skipped; test_mla_dsa's Q_SPLIT paths take the
+  fallback).
+
+**Switches.**
+- `EXL3_ROCM_DSA_DECODE=0` restores the retuned upstream kernel.
+- `EXL3_ROCM_DSA_DECODE_{SPLITS,BLOCK_H,HP,BLOCK_N,BLOCK_W,KC,KSTAGES,WARPS}` override
+  the tuning.
+- Declined shapes fall back to upstream: Q_SPLIT / OUT_LATENT (GLM-5.2 DSA-on-MLA,
+  bc_mla), non-power-of-two D, and H not tileable.
+- Kernels changed for the coherence check: decode split attention in every DS4 layer
+  (graphed BCDsa, batched BCDsaBatch, eager dsa_attn split path). Prefill and the
+  combine are unchanged.
+
+**Open.**
+- QC pools still spill 169-243 VGPRs (616-916 B scratch). That is the H32 rotation of
+  q / window chunks in the KC loop; pre-rotating q once would need a workspace.
+- CSA top-k at 16K: 10 spills / 32 B.
+- seq > 1 rows are separate programs: the MTP verify re-reads the shared keys per row.
+- Scratch users re-enter the decode stream only with `-cq`. Watch for the per-layer
+  scratch stall (see "DS4 per-layer stall" above) if -cq decode looks slow.

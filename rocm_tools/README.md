@@ -75,6 +75,30 @@ logits, which is the only way to reach the single-matrix graph GEMV path (it
 runs inside the BC modules, which no binding exposes). A tolerance check
 cannot tell a pure refactor from a few-ulp change; these can.
 
+## `decode_agree.py`
+
+The tolerance counterpart for changes that legitimately reorder arithmetic, such
+as the DSA decode kernel. Greedy-decodes three prompts (the third ~3K tokens,
+which puts DeepSeek-V4 into the indexer top-k regime). It reports the
+matched-token prefix, the top-2 gap at the divergence, and the max logit
+difference, top-10 difference and KL over the steps whose context is identical.
+`--batch` decodes the prompts concurrently (batched graphs); `--cq N` uses the
+quantized cache.
+
+```bash
+EXL3_ROCM_DSA_DECODE=0 python rocm_tools/decode_agree.py -m /path/to/model --save ref.pt
+python rocm_tools/decode_agree.py -m /path/to/model --compare ref.pt
+```
+
+## `bench_dsa_decode.py`
+
+DeepSeek-V4 decode sparse attention (split + combine) at the graphed path's
+shapes and arguments: CSA/HCA/window layers, ctx 512/16K, 1 or 3 query rows,
+fp16 or packed pools, batched jobs (`--mr`). Checks against an fp64 reference
+and reports graph-replay µs per call plus VGPR/spill/scratch from the compiled
+AMDGCN. `--sweep-old` and `--sweep-new` (`EXL3_DSA_SWEEP=tile|splits`) are the
+parameter sweeps behind RDNA_NOTES "DSA decode MQA kernel".
+
 ## Re-verifying after a ROCm upgrade
 
 ROCm changed substantially between 7.1 and 7.2 — several workarounds in the
