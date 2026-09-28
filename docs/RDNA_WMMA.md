@@ -552,3 +552,22 @@ No cell matched neither. The hardware does read both halves: lanes 0-15
 feed the even output columns and lanes 16-31 feed the odd ones. The replication
 in Rule 2.1 is therefore required for correctness, not merely harmless. This
 was measured once, on gfx1151 only.
+
+### 8.x Confirmation: the behaviour is inherent to the silicon (2026-09-27)
+
+AMD's instruction-level emulator had the same mismatch, and fixed it by modelling the hardware exactly:
+- ROCm/rocm-systems issue #12056: "`V_DOT2_F32_{F16,BF16}` and WMMA do not match gfx1151 silicon".
+- PR #12120: "Match RDNA3 and RDNA4 DOT2 and WMMA arithmetic to hardware".
+
+The PR's model:
+- RDNA3 `v_wmma_f32_16x16x16_f16` runs as **eight sequential DOT2 steps** with architecture-specific integer (fixed-point) accumulation. RDNA4 runs as four DOT4 steps.
+- Each architecture has its own subnormal handling and rounding boundaries.
+- The model matches silicon bit for bit (1.2e8 F32 outputs checked).
+
+No mode or flag changes it. That explains the truncation and the mixed-sign bias measured above.
+
+**Decision: no mitigation.**
+- An exact result would need split-precision emulation (hi/lo fp16 operand split, about 3 WMMAs per product), which triples matrix cost.
+- The effect is 1–5 ulp_f32 of the largest intermediate. That is about 4000× smaller than the fp16 input quantization (2^-11 relative), and far below EXL3 weight quantization error.
+- Correctness is guarded by the bounded check plus the golden-file regression (`rocm_tools/wmma_gate.hip`), not by IEEE bit-exactness.
+- RDNA4 (gfx12) will round differently again, so it needs its own golden file if it is ever tested.

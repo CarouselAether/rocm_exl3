@@ -69,7 +69,7 @@ class CancellingStreamResponse(EventSourceResponse):
                 await aclose()
 from pydantic import BaseModel, ConfigDict, Field
 
-from exllamav3 import AsyncGenerator, AsyncJob, model_init
+from exllamav3 import AsyncGenerator, AsyncJob, Generator, Job, model_init
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.generator.sampler import (
     ComboSampler, CustomSampler, SS_LogitBias, SS_RepP, SS_PresFreqP, SS_Argmax,
@@ -528,6 +528,7 @@ async def lifespan(app: FastAPI):
         ngram_match_min = a.ngram_match_min,
         dynamic_draft_tokens = a.dynamic_draft,
         draft_confidence = a.draft_confidence,
+        max_chunk_size = a.prefill_chunk_size,
         cpu_cache_size = int(a.cpu_cache_size * 1024 ** 3),
         recurrent_cache_size = int(a.recurrent_cache_size * 1024 ** 3),
     )
@@ -955,6 +956,29 @@ async def native_completion(request: Request, body: NativeCompletionRequest):
 # ---------------------------------------------------------------------------
 
 @torch.inference_mode()
+def warmup(args):
+    """Run two short jobs before serving, so one-time work (Triton JIT, HIP graph capture, autotune)
+    does not land on real requests. Measured before this existed (DS4, 2026-09-27): request 1 decoded
+    at 10.9 t/s and request 2 at 6.8 t/s, against 17.8 t/s steady. The second job reuses the first
+    one's prefix so the prefix-cached prefill path is exercised too."""
+    t0 = time.time()
+    gen = Generator(
+        model = state.model, cache = state.cache, tokenizer = state.tokenizer,
+        draft_model = state.draft_model, draft_cache = state.draft_cache,
+        num_draft_tokens = args.num_draft_tokens, max_chunk_size = args.prefill_chunk_size,
+    )
+    vocab = state.tokenizer.actual_vocab_size
+    ids = torch.randint(int(vocab * 0.05), int(vocab * 0.95), (1, PAGE_SIZE * 2 + 37),
+                        generator = torch.Generator().manual_seed(0))
+    for prompt in (ids, torch.cat([ids, ids[:, :19]], dim = -1)):
+        gen.enqueue(Job(input_ids = prompt, max_new_tokens = 32))
+        while gen.num_remaining_jobs():
+            gen.iterate()
+    del gen
+    print(f" -- Warmup done in {time.time() - t0:.1f}s", flush = True)
+
+
+@torch.inference_mode()
 def main(args):
     state.args = args
     state.model_name = args.served_model_name or Path(args.model_dir).name
@@ -971,10 +995,17 @@ def main(args):
             print(f" !! That is a very large KV cache allocation and may not fit in memory. "
                   f"Pass -cs to cap it (e.g. -cs 32768), or -cq to quantize it.", flush = True)
 
+    # The Generator chunks prefill at --prefill_chunk_size; model_init's -chunk_size only sizes the
+    # load-time buffers, so it must be at least as large
+    if args.prefill_chunk_size > args.chunk_size:
+        args.chunk_size = args.prefill_chunk_size
+
     # Load model, cache, tokenizer, optional draft model (same as chat.py)
     (state.model, state.config, state.cache, state.tokenizer,
      state.draft_model, _draft_config, state.draft_cache) = model_init.init(args)
     state.context_length = state.cache.max_num_tokens
+    if not args.no_warmup:
+        warmup(args)
 
     # Stop tokens: model EOS list plus tokenizer EOS
     stop_ids = set()
@@ -1041,5 +1072,7 @@ if __name__ == "__main__":
     parser.add_argument("-drym", "--dry_multiplier", type = float, default = 0.0, help = "DRY multiplier, 0 to disable (default)")
     parser.add_argument("-dryb", "--dry_base", type = float, default = 1.75, help = "DRY base, default = 1.75")
     parser.add_argument("-dryal", "--dry_allowed_length", type = int, default = 2, help = "DRY allowed repeat length, default = 2")
+    parser.add_argument("-pcs", "--prefill_chunk_size", type = int, default = 2048, help = "Prompt tokens per prefill forward pass (Generator max_chunk_size), default: 2048. Larger chunks amortize weight streaming on MoE models; -chunk_size is raised to match if smaller")
+    parser.add_argument("-nwu", "--no_warmup", action = "store_true", help = "Skip the startup warmup (two short jobs that absorb JIT/graph-capture cost before the first request)")
     parser.add_argument("-dryln", "--dry_penalty_last_n", type = int, default = -1, help = "DRY scan range in tokens, -1 = whole context (default), 0 disables")
     main(parser.parse_args())

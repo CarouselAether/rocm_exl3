@@ -56,6 +56,8 @@ Server flags:
 | `-maxr` | server-side cap on response tokens (default: fill remaining context) |
 | `-ctk` | default chat-template kwargs as JSON, e.g. `'{"enable_thinking": false}'` |
 | `-lw` / `-lmr` | loop-detection stop (off by default) |
+| `-pcs N` | prefill chunk size (Generator `max_chunk_size`, default 2048) |
+| `-nwu` | skip the startup warmup |
 
 ## Endpoints
 
