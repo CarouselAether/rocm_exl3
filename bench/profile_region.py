@@ -108,7 +108,11 @@ def prefill_region(gen, tok, ctx, seed):
 
 
 def decode_region(gen, tok, ctx, steps, seed, sampler):
-    gen.enqueue(Job(input_ids=rand_ids(tok, ctx, seed), max_new_tokens=steps + 8, sampler=sampler))
+    # A step can emit several tokens under MTP / draft decoding (up to ndt + 1): size the job
+    # so it outlasts the region, or the region's tail steps are idle generator iterations
+    # (the job finished) that dilute every per-step figure. The untraced remainder runs off
+    # in run_to_end.
+    gen.enqueue(Job(input_ids=rand_ids(tok, ctx, seed), max_new_tokens=steps * 8 + 8, sampler=sampler))
     # run until the first token is out (prefill done), untraced
     first = False
     while not first:

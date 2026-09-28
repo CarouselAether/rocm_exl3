@@ -167,6 +167,15 @@ ROCM_EXCLUDE = (
     # rocm_py routes bsz <= MAX_BSZN MoE decode to the fused exl3_moe kernel
     # instead. Its comp_units instances are already covered by "quant/comp_units/".
     "quant/exl3_moe_coop.cu",    # -> rocm/quant/exl3_moe_coop_rdna.hip (disabled stub)
+    # The router GEMV (routing_gemv_kernel) runs DS4's 2 MB router at ~55 GB/s: a 32-block
+    # grid with one 128-byte load in flight per wave. The sibling issues the loads ahead of
+    # the (unchanged, bit-identical) fdot chain on an E-wave grid, and covers m = 2..8 rows
+    # (MTP verify) instead of hgemm. EXL3_ROCM_ROUTER_GEMV=0 restores upstream's kernel.
+    "/routing.cu",               # -> rocm/routing_rdna.hip
+    # hc_mix's warp reductions (25 accumulators x 5 __shfl_down, the 20-iteration sinkhorn's
+    # __shfl_xor chain) lower to ds_bpermute; the sibling moves the same lane values with DPP,
+    # bit-identical. EXL3_ROCM_HC_DPP=0 restores the shuffles.
+    "/hc_mix.cu",                # -> rocm/hc_mix_rdna.hip
 )
 
 def _collect_sources():

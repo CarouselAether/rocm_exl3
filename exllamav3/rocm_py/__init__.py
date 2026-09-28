@@ -77,6 +77,16 @@ Environment switches (all default to the safe value for this backend):
   EXL3_ROCM_MOE_MTILE=1    let Python split fused-MoE launches into 16/32/64-row
                            tiers. Pointless on RDNA, whose kernel picks the row
                            tile per expert itself
+  EXL3_ROCM_MOE_BATCH=0    MoE decode back on the per-token mgemm loop (the
+                           batched route runs every token of a bsz <= 8 call
+                           in one set of launches)
+  EXL3_ROCM_MOE_FUSED=0    batched MoE decode on four mgemm-route launches
+                           instead of torch.ops.exl3_rocm.moe_decode
+  EXL3_ROCM_HC_FUSE=0      mHC apply_ runs as its own launch instead of inside
+                           the next site's mix
+  EXL3_ROCM_HC_NORM=0      the RMSNorm after each mHC mix runs as its own launch
+  (C++ side, same build: EXL3_ROCM_ROUTER_GEMV=0, EXL3_ROCM_ROUTER_FUSE=0,
+  EXL3_ROCM_MR_WEIGHTED=0, EXL3_ROCM_HC_DPP=0 -- see RDNA_NOTES "Decode leftovers")
 
 These are bisect handles, not permanent policy -- turn one on, run a prompt, see
 whether the output degrades. Each one's justification is a measurement recorded
@@ -547,6 +557,7 @@ def apply() -> list[str]:
     # (raises on ROCm) for the day exl3_moe_coop is ported.
     if not _env_on("EXL3_ROCM_MOE_BSZN", False):
         try:
+            import torch
             from ..modules import block_sparse_mlp as _bsn
             from ..ext import exllamav3_ext as _ext
             _bsn_cls = _bsn.BlockSparseMLP
@@ -555,10 +566,80 @@ def apply() -> list[str]:
 
             if _env_on("EXL3_ROCM_MOE_MGEMM_ROUTE", True):
 
+                # EXL3_ROCM_MOE_BATCH (default on, 2026-09-28; RDNA_NOTES "Decode
+                # leftovers"): every token of the call in one set of launches instead of
+                # the per-token loop below. The slots are flattened (token-major,
+                # S = bsz * top_k): gate and up run once over S slots (the input rows
+                # replicated per slot by one copy at bsz > 1; broadcast at bsz 1), the
+                # activation over the S valid rows only (not all MAX_BSZN * top_k), and
+                # down once with num_tokens = bsz, whose grouped weighted reduce leaves
+                # token t's routed sum in out_d row t. out_bszn is then a view of those
+                # rows (when the down width is the hidden width), so the per-token
+                # copy_ goes too. At bsz 1 that is 5 launches per layer instead of 7 and
+                # the same arithmetic (bit-identical); at bsz 3 (MTP verify) 6 instead of
+                # 21. num_tokens is also passed to gate/up (no reduce there): the RDNA
+                # GEMV sizes its split-K from the per-token slot count, so each slot keeps
+                # the m == 1 reduction order and verify rows stay bit-identical to plain
+                # decode. Expert-range shards (min_expert >= 0) keep the loop.
+                _moe_batch = _env_on("EXL3_ROCM_MOE_BATCH", True)
+
+                # EXL3_ROCM_MOE_FUSED (default on, 2026-09-28): the same block through
+                # torch.ops.exl3_rocm.moe_decode (rocm/quant/exl3_gemv_multirow_rdna.hip):
+                # gate and up as one 2S-slot GEMV, the activation folded into the down
+                # projection's input rotation -- 4 launches instead of 7 (bsz 1) / 8
+                # (bsz > 1), same arithmetic. Set up at load for gated SILU experts with
+                # matching gate/up K and codebook and fp16 intermediates; anything else
+                # stays on the mgemm route above.
+                _moe_fused = _env_on("EXL3_ROCM_MOE_FUSED", True)
+
+                def _mgemm_bszN_batched(mod, y, selected_experts, routing_weights):
+                    cfg = mod.experts_cfg
+                    bsz = y.shape[0]
+                    top_k = selected_experts.shape[-1]
+                    S = bsz * top_k
+                    fz = mod._rocm_fused
+                    if fz is not None and 2 * S <= fz["rows"] and y.is_contiguous():
+                        torch.ops.exl3_rocm.moe_decode(
+                            y, selected_experts, routing_weights,
+                            fz["gu_trellis"], fz["gu_suh"], fz["gu_svh"],
+                            mod.multi_down.ptrs_trellis, mod.multi_down.ptrs_suh, mod.multi_down.ptrs_svh,
+                            fz["yh"], fz["gu"], cfg.interm_a, cfg.out_d,
+                            fz["K_gu"], fz["cb_gu"], fz["K_d"], fz["cb_d"], fz["act_limit"])
+                        if not mod._rocm_out_alias:
+                            width = cfg.out_bszn.shape[-1]
+                            cfg.out_bszn[:bsz].copy_(cfg.out_d.view(cfg.out_d.shape[0], -1)[:bsz, :width])
+                        return
+                    mg, mu, md = mod.multi_gate, mod.multi_up, mod.multi_down
+                    sel = selected_experts.view(1, S)
+                    w = routing_weights.view(1, S)
+                    if bsz == 1:
+                        A = y.view(1, 1, -1)
+                    else:
+                        Hi = y.shape[-1]
+                        A = mod._rocm_arep[:S]
+                        A.view(bsz, top_k, Hi).copy_(y.view(bsz, 1, Hi).expand(bsz, top_k, Hi))
+                    ig, iu, ia = cfg.interm_g[:S], cfg.interm_u[:S], cfg.interm_a[:S]
+                    if mod.gated:
+                        _ext.exl3_mgemm(
+                            A, mg.ptrs_trellis, ig, mg.ptrs_suh, cfg.yh, mg.ptrs_svh,
+                            sel, None, mg.K, -1, mg.mcg, mg.mul1, -1, -1, 0, bsz, None, None)
+                    _ext.exl3_mgemm(
+                        A, mu.ptrs_trellis, iu, mu.ptrs_suh, cfg.yh, mu.ptrs_svh,
+                        sel, None, mu.K, -1, mu.mcg, mu.mul1, -1, -1, 0, bsz, None, None)
+                    mod.activation_fn_call(ig if mod.gated else iu, iu, ia, mod.act_limit)
+                    _ext.exl3_mgemm(
+                        ia, md.ptrs_trellis, cfg.out_d, md.ptrs_suh, cfg.interm_g, md.ptrs_svh,
+                        sel, w, md.K, -1, md.mcg, md.mul1, -1, -1, 0, bsz, None, None)
+                    if not mod._rocm_out_alias:
+                        width = cfg.out_bszn.shape[-1]
+                        cfg.out_bszn[:bsz].copy_(cfg.out_d.view(cfg.out_d.shape[0], -1)[:bsz, :width])
+
                 def _mgemm_bszN(mod, y, selected_experts, routing_weights):
                     cfg = mod.experts_cfg
                     bsz = y.shape[0]
                     mine, maxe = cfg.min_expert, cfg.max_expert
+                    if _moe_batch and mine < 0:
+                        return _mgemm_bszN_batched(mod, y, selected_experts, routing_weights)
                     A = y.unsqueeze(1).unsqueeze(1)          # (bsz, 1, 1, Hi)
                     sel = selected_experts.unsqueeze(1)      # (bsz, 1, top_k)
                     w = routing_weights.unsqueeze(1)         # (bsz, 1, top_k)
@@ -598,7 +679,61 @@ def apply() -> list[str]:
                 def _load_mgemm_route(self, *args, **kwargs):
                     r = _orig_bsn_load(self, *args, **kwargs)
                     self.bc_sh_exp = False
+                    self._rocm_out_alias = False
+                    self._rocm_fused = None
+                    cfg = getattr(self, "experts_cfg", None)
+                    # (min_expert >= 0 keeps the per-token loop, whose copy_ into
+                    # out_bszn[i] would land on the next token's scratch rows)
+                    if _moe_batch and cfg is not None and cfg.out_bszn is not None \
+                            and cfg.min_expert < 0:
+                        import torch
+                        from ..util.tensor import g_tensor_cache
+                        rows = cfg.interm_g.shape[0]
+                        Hi = self.multi_up.in_features if self.multi_up is not None else None
+                        if Hi is not None:
+                            self._rocm_arep = g_tensor_cache.get(
+                                self.device, (rows, 1, Hi), torch.half, "rocm_moe_arep")
+                        # Routed sums land in out_d rows 0..bsz-1: read them in place when
+                        # the rows are exactly the hidden width
+                        od = cfg.out_d.view(cfg.out_d.shape[0], -1)
+                        H = cfg.out_bszn.shape[-1]
+                        if od.shape[-1] == H and od.dtype == cfg.out_bszn.dtype \
+                                and od.shape[0] >= cfg.out_bszn.shape[0]:
+                            cfg.out_bszn = od[:cfg.out_bszn.shape[0]]
+                            self._rocm_out_alias = True
+                        self._rocm_fused = _moe_fused_setup(self, cfg, rows, Hi) if _moe_fused else None
                     return r
+
+                def _moe_fused_setup(self, cfg, rows, Hi):
+                    import torch
+                    from ..util.tensor import g_tensor_cache
+                    mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
+                    if not (self.gated and mg is not None and mu is not None and md is not None):
+                        return None
+                    if self.activation_fn_call is not _ext.silu_mul:
+                        return None
+                    if not hasattr(torch.ops, "exl3_rocm") or not hasattr(torch.ops.exl3_rocm, "moe_decode"):
+                        return None
+                    if mg.K != mu.K or bool(mg.mcg) != bool(mu.mcg) or bool(mg.mul1) != bool(mu.mul1):
+                        return None
+                    if any(getattr(l.inner, "bias", None) is not None for ml in (mg, mu, md) for l in ml.linears):
+                        return None
+                    I = cfg.interm_a.shape[-1]
+                    if cfg.interm_a.dtype != torch.half or cfg.interm_g.dtype != torch.half:
+                        return None
+                    if cfg.out_d.dtype != torch.float or Hi % 128 or I % 128 or cfg.out_d.shape[-1] % 128:
+                        return None
+                    cbk = lambda ml: 2 if ml.mul1 else (1 if ml.mcg else 0)
+                    return {
+                        "rows": 2 * rows,
+                        "gu_trellis": torch.cat([mg.ptrs_trellis, mu.ptrs_trellis]).contiguous(),
+                        "gu_suh": torch.cat([mg.ptrs_suh, mu.ptrs_suh]).contiguous(),
+                        "gu_svh": torch.cat([mg.ptrs_svh, mu.ptrs_svh]).contiguous(),
+                        "yh": g_tensor_cache.get(self.device, (2 * rows, Hi), torch.half, "rocm_moe_yh2"),
+                        "gu": g_tensor_cache.get(self.device, (2 * rows, I), torch.half, "rocm_moe_gu"),
+                        "K_gu": int(mg.K), "cb_gu": cbk(mg), "K_d": int(md.K), "cb_d": cbk(md),
+                        "act_limit": float(self.act_limit or 0.0),
+                    }
 
                 def _forward_mgemm_route(self, *args, **kwargs):
                     bc = self.bc
@@ -634,6 +769,174 @@ def apply() -> list[str]:
                 applied.append("MoE bsz<=MAX_BSZN decode -> fused exl3_moe (EXL3_ROCM_MOE_MGEMM_ROUTE=0)")
         except Exception as e:
             applied.append(f"!! FAILED MoE bszN patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # Hyper-connections: apply_ folded into the next site's mix (2026-09-28)
+    # ------------------------------------------------------------------
+    # DS4 runs 86 mHC sites per decoded token, each HyperConnection.apply_
+    # (one hc_apply launch, in place on the residual streams) directly followed
+    # by the next site's mix (partials + finalize) on the same stream tensor --
+    # attn site -> the block's mlp site, mlp site -> the next block's attn site.
+    # EXL3_ROCM_HC_FUSE (default on) defers the apply at decode-class row counts
+    # (R <= 32) and hands it to that mix, which runs torch.ops.exl3_rocm.
+    # hc_mix_rdna: the apply fused into the partials kernel (rocm/hc_mix_rdna.hip),
+    # one launch less per site, bit-identical to apply + mix.
+    #
+    # EXL3_ROCM_HC_NORM (default on): the RMSNorm a TransformerBlock runs on the
+    # collapsed stream right after each mix (attn_norm / mlp_norm) is folded into
+    # the mix's finalize kernel -- its last-arriving block per row replays the norm
+    # kernel's arithmetic bit for bit -- and the norm's own forward then returns
+    # that pre-normed buffer untouched (recognised by its data pointer, one-shot).
+    # Another launch less per site.
+    #
+    # The deferred apply is flushed (run as the plain hc_apply) before anything
+    # else can see the streams: any other HyperConnection call, HyperHead.forward
+    # (the final collapse), and prepare_for_device when the tensor would change
+    # device. Nothing is deferred while states are being exported or during
+    # conversion (quant_preserve / capture), and a mix on any tensor other than
+    # the pending one flushes first.
+    if _env_on("EXL3_ROCM_HC_FUSE", True):
+        try:
+            import torch
+            from ..modules import hyperconnections as _hcm
+            from ..modules import module as _modm
+            from ..ext import exllamav3_ext as _ext
+            from ..util.tensor import g_tensor_cache as _gtc
+            _ = torch.ops.exl3_rocm.hc_mix_rdna   # raises if the build lacks the op
+            from ..modules import transformer as _trm
+            from ..modules import rmsnorm as _rmsm
+            _hc_norm_on = _env_on("EXL3_ROCM_HC_NORM", True)
+
+            _HC = _hcm.HyperConnection
+            _orig_hc_apply = _HC.apply_
+            _orig_hc_mix = _HC.mix
+            _orig_head_fwd = _hcm.HyperHead.forward
+            _orig_prep = _modm.Module.prepare_for_device
+            _hc_pend = [None]   # (x, y, post, comb) of the deferred apply
+
+            def _hc_flush():
+                p = _hc_pend[0]
+                if p is None:
+                    return
+                _hc_pend[0] = None
+                x, y, post, comb = p
+                b, s_, H, D = x.shape
+                R = b * s_
+                _ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H))
+
+            def _hc_apply_rdna(self, x, y, post, comb, params):
+                _hc_flush()
+                b, s_, H, D = x.shape
+                if b * s_ <= 32 and H == 4 and D % 4 == 0 \
+                        and "quant_preserve" not in params and "capture" not in params \
+                        and not params.get("export_state_layers") \
+                        and x.dtype == torch.float and x.is_contiguous() \
+                        and y.dtype == torch.float and y.is_contiguous() \
+                        and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
+                    _hc_pend[0] = (x, y, post, comb)
+                    return x
+                return _orig_hc_apply(self, x, y, post, comb, params)
+
+            def _hc_mix_rdna(self, streams, params):
+                p = _hc_pend[0]
+                b, s_, H, D = streams.shape
+                R = b * s_
+                fusable = self.hc_mult == 4 and R <= 32 and streams.dtype == torch.float \
+                    and D % 4 == 0 and streams.is_contiguous()
+                if p is not None and not (fusable and p[0] is streams):
+                    _hc_flush()
+                    p = None
+                nrm = getattr(self, "_rocm_norm", None) if fusable else None
+                if nrm is not None and (D // 4 > 1024 or (nrm.weight is not None and (
+                        nrm.weight.dtype not in (torch.bfloat16, torch.half) or nrm.weight.numel() != D))):
+                    nrm = None
+                if p is None and nrm is None:
+                    return _orig_hc_mix(self, streams, params)
+                _hc_pend[0] = None
+                chunks = _ext.hc_mix_num_chunks(R, H * D)
+                M1 = 2 * H + H * H + 1
+                dev = streams.device
+                partials = _gtc.get_bucketed(dev, R * chunks * M1, torch.float, "hc_mix_partials").view(R, chunks, M1)
+                post = _gtc.get_bucketed(dev, R * H, torch.float, "hc_post").view(R, H)
+                comb = _gtc.get_bucketed(dev, R * H * H, torch.float, "hc_comb").view(R, H, H)
+                collapsed = _gtc.get_bucketed(dev, R * D, torch.half, "hc_coll").view(R, D)
+                if self.fn_h is None:
+                    self.fn_h = self.fn.half()
+                if p is not None:
+                    _, y, post_a, comb_a = p
+                    y, post_a, comb_a = y.view(R, D), post_a.view(R, H), comb_a.view(R, H, H)
+                else:
+                    y = post_a = comb_a = None
+                if nrm is not None:
+                    normed = _gtc.get_bucketed(dev, R * D, torch.half, "hc_normed").view(R, D)
+                    torch.ops.exl3_rocm.hc_mix_rdna(
+                        streams.view(R, H, D), y, post_a, comb_a,
+                        self.fn_h, self.base, self.scale, self.rms_eps, self.hc_eps, self.sinkhorn_iters,
+                        partials, post, comb, collapsed,
+                        nrm.weight, normed, nrm.rms_norm_eps, nrm.constant_bias, nrm.constant_scale)
+                    nrm._rocm_prenormed = normed.data_ptr()
+                    out = normed
+                else:
+                    torch.ops.exl3_rocm.hc_mix_rdna(
+                        streams.view(R, H, D), y, post_a, comb_a,
+                        self.fn_h, self.base, self.scale, self.rms_eps, self.hc_eps, self.sinkhorn_iters,
+                        partials, post, comb, collapsed,
+                        None, None, 0.0, 0.0, 1.0)
+                    out = collapsed
+                return post.view(b, s_, H), comb.view(b, s_, H, H), out.view(b, s_, D)
+
+            def _hc_head_fwd_rdna(self, x, params, out_dtype = None):
+                _hc_flush()
+                return _orig_head_fwd(self, x, params, out_dtype)
+
+            def _prep_rdna(self, x, params):
+                if _hc_pend[0] is not None and x.device != self.device:
+                    _hc_flush()
+                return _orig_prep(self, x, params)
+
+            # Norm fold: link each block's HC site to the RMSNorm it runs next, and let
+            # that norm pass the pre-normed buffer through
+            if _hc_norm_on:
+                _orig_tb_init = _trm.TransformerBlock.__init__
+                _orig_rms_fwd = _rmsm.RMSNorm.forward
+                _rmsm.RMSNorm._rocm_prenormed = None
+
+                def _norm_foldable(n):
+                    return isinstance(n, _rmsm.RMSNorm) and not n.span_heads \
+                        and getattr(n, "groups", 1) == 1
+
+                def _tb_init_rdna(self, *args, **kwargs):
+                    _orig_tb_init(self, *args, **kwargs)
+                    for hc, nm in ((self.attn_hc, self.attn_norm), (self.mlp_hc, self.mlp_norm)):
+                        if isinstance(hc, _HC) and _norm_foldable(nm):
+                            hc._rocm_norm = nm
+
+                def _rms_fwd_rdna(self, x, params, out_dtype = None, residual = None, residual_in = None):
+                    pn = self._rocm_prenormed
+                    if pn is not None:
+                        self._rocm_prenormed = None
+                        if pn == x.data_ptr() and residual is None and residual_in is None \
+                                and x.dtype == torch.half and (out_dtype or self.out_dtype or torch.half) == torch.half \
+                                and (self.weight is None or self.weight.dtype in (torch.bfloat16, torch.half)):
+                            if self.key in params.get("export_state_norm_keys", ()):
+                                states = params.get("export_states")
+                                if states is None:
+                                    states = params["export_states"] = []
+                                states.append(x.half())
+                            return x
+                    return _orig_rms_fwd(self, x, params, out_dtype, residual, residual_in)
+
+                _trm.TransformerBlock.__init__ = _tb_init_rdna
+                _rmsm.RMSNorm.forward = _rms_fwd_rdna
+                applied.append("mHC mix + following RMSNorm in one finalize at R <= 32 (EXL3_ROCM_HC_NORM)")
+
+            _HC.apply_ = _hc_apply_rdna
+            _HC.mix = _hc_mix_rdna
+            _hcm.HyperHead.forward = _hc_head_fwd_rdna
+            _modm.Module.prepare_for_device = _prep_rdna
+            applied.append("mHC apply_ folded into the next site's mix at R <= 32 (EXL3_ROCM_HC_FUSE)")
+        except Exception as e:
+            applied.append(f"!! FAILED HC fuse patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # RDNA4 (gfx120x): fused MoE kernel unavailable -- per-expert fallback

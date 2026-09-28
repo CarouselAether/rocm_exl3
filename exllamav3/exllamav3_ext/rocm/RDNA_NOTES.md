@@ -2256,3 +2256,206 @@ Top 5 now: exl3_moe_kernel 34.5%, _dsa_prefill_mqa_kernel 8.0%, exl3_wmma_gemm (
   rotation of q and window chunks inside the KC loop (the same open item as decode).
 - The kernel is now below MoE and on par with the WMMA GEMMs. Next prefill levers are
   outside attention (MoE 34.5%; PROFILE §8).
+
+## Decode leftovers (2026-09-28): DS4 tg128 27.5 -> 30.1 t/s, MTP ndt=2 31.4 -> 41.7, bit-identical
+
+Branch `opt/decode-leftovers` (PLAN target: 30+ plain decode on DS4). Seven changes, each
+behind its own switch in one build; every one keeps the output bit-identical (decode_bitwise
+DS4 / Qwen3.8 / Gemma all-on vs all-off PASS).
+
+**The profile first** (`bench/results/decode_profile_c6c19ca.txt`, rocprofv3, ctx 512, 32
+steps, c6c19ca): 37.20 ms/step wall under the profiler, 32.77 busy, 1735 kernels, 4.42 ms of
+gaps (mean 2.55 us). The GEMVs were already at the ~206 GB/s roofline (dense K4 199-210,
+routed K2 170-180, head 227). The host runs **~7 ms ahead** of the GPU (p50 launch-to-start
+slack over every dispatch), so decode is GPU-bound and every dependent launch costs its ~2.5
+us command-processor gap in GPU time. What was left was the router (37.8 us/call, 55 GB/s),
+the weighted down projection on the LDS-prologue kernel (82.5 us vs 69.8 for the same bytes
+on gate/up), and launches: 7 per routed-MoE layer, 4 per mHC site (86 sites).
+
+MTP (-ndt 2): the per-token MoE loop (21 launches per layer at m = 3) and a router that
+went to hgemm at m = 3 (narrow split-K, two launches, ~40 us). **profile_region.py fix:** it
+enqueued a steps + 8 = 40-token job, which an MTP run finishes mid-region at ~2.5 tokens per
+step (the tail steps were idle generator iterations, diluting every per-step figure); the job
+is now 8 x steps + 8. With the fix, same build: all switches off 77.82 ms/step (busy 60.90,
+2854 kernels), all on 68.25 (busy 52.93, 2017 kernels), 82 tokens per 32 steps both. MTP
+also carries ~15 ms/step of host-sync gaps under the profiler (7-8 pageable
+hipMemcpyWithStream + 3 hipDeviceSynchronize per step, generator side, both builds).
+
+### What changed
+
+| switch (default on) | change | where |
+|---|---|---|
+| `EXL3_ROCM_ROUTER_GEMV` | router GEMV, m = 1..8, loads in flight; m == 1 with 16-byte loads and a per-wave LDS transpose that keeps upstream's lane -> column chain (bit-identical) | `rocm/routing_rdna.hip` (sibling of routing.cu) |
+| `EXL3_ROCM_ROUTER_FUSE` | router + top-k in one launch (last-arriving block runs the top-k body verbatim) | same |
+| `EXL3_ROCM_MR_WEIGHTED` | weighted MoE down on the multi-row path with the mgemv fused epilogue (grouped reduce) | `rocm/quant/exl3_gemv_multirow_rdna.hip` |
+| `EXL3_ROCM_MOE_BATCH` | MoE decode route runs all bsz <= 8 tokens in one set of launches; act over the S valid rows only; out_bszn aliases out_d (no copy_) | `rocm_py/__init__.py` |
+| `EXL3_ROCM_MOE_FUSED` | `torch.ops.exl3_rocm.moe_decode`: gate+up as one 2S-slot GEMV, silu*up folded into the down projection's input rotation; 4 launches per layer (was 7 at bsz 1, 21 at bsz 3) | multirow sibling + rocm_py |
+| `EXL3_ROCM_HC_DPP` | hc_mix partials / sinkhorn cross-lane ops on DPP instead of ds_bpermute | `rocm/hc_mix_rdna.hip` (sibling of hc_mix.cu) |
+| `EXL3_ROCM_HC_FUSE` | mHC apply_ deferred into the next site's mix, fused into its partials kernel | same + rocm_py |
+| `EXL3_ROCM_HC_NORM` | the RMSNorm after each mix replayed inside the mix's finalize (one block per row, row in LDS) | same + rocm_py |
+
+(`EXL3_ROCM_ROUTER_U` = 2/4/8/16 picks the router's blocks in flight, default 8.)
+
+### Step by step (rocprofv3, same harness, ms/step profiled wall; each row adds to the one above)
+
+| step | wall | kernels/step | what moved |
+|---|---|---|---|
+| c6c19ca | 37.20 | 1735 | |
+| router m <= 8 (dword kernel, U16) + weighted down on multi-row + batched route | 36.13 (-1.07) | 1735 | router 37.8 -> 22.3 us; down 82.5 -> 69.7 us; per-token copy_ gone, down's rotation now its own launch |
+| router 16-byte loads + LDS transpose (U8) + fused top-k | 35.85 (-0.28) | 1695 | router + top-k 37.8 + 4.2 us -> 17.7 us, 40 launches |
+| fused MoE decode op | 34.97 (-0.88) | 1566 | gate + up one launch: 2 x 70.8 -> 131.3 us; act folded; 7 -> 4 launches per layer |
+| hc_mix on DPP | 34.66 (-0.31) | 1566 | partials 8.4 -> 6.6 us, finalize 5.3 -> 4.0 us |
+| hc apply folded into the next mix | 34.47 (-0.19) | 1481 | apply 2.2 + partials 6.6 -> 7.8 us |
+| RMSNorm folded into the finalize | 34.27 (-0.20) | 1395 | finalize 4.0 + rms_norm 2.3 -> 6.7 us |
+| **total** | **-2.93** | **-340** | busy 32.77 -> 30.67, gaps 4.42 -> 3.59 ms |
+
+### End to end (bench/run_bench.py, one build, median of 3; `=0` rows turn one switch off)
+
+DS4 `--pp 512 --tg 128 --long 16384`:
+
+| config | pp512 | tg128 | tg64 @ 16K |
+|---|---|---|---|
+| **all on** | 353.6 | **29.99** | **27.93** |
+| all off (= c6c19ca paths) | 350.0 | 27.52 | 25.78 |
+| ROUTER_GEMV=0 (also drops the fuse) | 348.0 | 29.08 | 27.21 |
+| ROUTER_FUSE=0 | 349.5 | 30.02 | 27.93 |
+| MR_WEIGHTED=0 | 349.8 | 30.07 | 28.04 |
+| MOE_BATCH=0 (also drops the fused op) | 349.3 | 29.18 | 27.24 |
+| MOE_FUSED=0 | 351.4 | 29.40 | 27.47 |
+| HC_DPP=0 | 347.7 | 29.95 | 27.89 |
+| HC_FUSE=0 | 351.4 | 29.81 | 27.79 |
+| HC_NORM=0 | 348.7 | 30.01 | 27.93 |
+
+(pp512 moves within noise: every change is decode-only -- R <= 32 / m <= 8 gates.)
+MR_WEIGHTED is flat because the fused op carries the down projection. ROUTER_FUSE,
+HC_DPP and HC_NORM were each below one run's noise in that matrix, so they got an
+alternating A/B, tg128 only, 5 runs per point, three rounds (on / fuse=0 / dpp=0 / norm=0
+in turn):
+
+| round | all on | ROUTER_FUSE=0 | HC_DPP=0 | HC_NORM=0 |
+|---|---|---|---|---|
+| 1 | 30.10 | 30.06 | 29.96 | 30.02 |
+| 2 | 30.13 | 30.09 | 29.98 | 30.00 |
+| 3 | 30.12 | 30.08 | 29.97 | 29.99 |
+| ms/token vs on | 33.20 | +0.04 | +0.17 | +0.12 |
+
+Small, but every round orders the same way; all three stay on.
+
+DS4 MTP `--mtp -ndt 2` (greedy, three natural prompts; per-prompt t/s and acceptance):
+
+| config | median | per prompt | acceptance |
+|---|---|---|---|
+| **all on** | **41.67** | 35.03 / 41.67 / 42.47 | 0.770 / 0.781 / 0.914 |
+| all off | 31.36 | 30.16 / 35.06 / 31.36 | 0.781 / 0.781 / 0.785 |
+| ROUTER_GEMV=0 | 35.78 | 34.33 / 40.96 / 35.78 | 0.781 / 0.781 / 0.785 |
+| MOE_BATCH=0 | 36.36 | 31.16 / 36.36 / 37.60 | 0.770 / 0.781 / 0.914 |
+| MOE_FUSED=0 | 40.72 | 34.23 / 40.72 / 41.59 | same as all on |
+| HC_FUSE=0 | 41.54 | 34.78 / 41.54 / 42.38 | same |
+| HC_NORM=0 | 41.53 | 34.87 / 41.53 / 42.47 | same |
+
+The router switch changes prompt 3's acceptance (0.785 -> 0.914), so its median is not a
+like-for-like speed number: per prompt it is worth ~2% (40.96 -> 41.67, 34.33 -> 35.03).
+The reason is a correctness improvement: **MTP greedy output is now token-identical to
+plain greedy decode** on all three prompts (128 tokens each; all on). With every switch off,
+MTP diverged from plain greedy at token 37 and 88 on two of them -- the verify step's
+router ran on hgemm, a different reduction than decode's routing_gemv (the dense multi-row
+GEMVs and the per-token MoE loop were already per-row identical), so near-tie expert picks
+could flip. Now every verify row takes the m == 1 arithmetic end to end: dense multi-row,
+batched MoE with the per-token wave rule, router rows, mHC.
+
+Qwen3.8-Flash-Next 4bpw `--pp 512 --tg 128`: all on 597.3 / **26.64**, all off 594.8 / 25.57
+(+4.2%); MOE_FUSED=0 25.81, ROUTER_GEMV=0 26.36. Gemma-4-31B (dense, no router / mHC):
+7.69 / 7.69, unchanged as expected (pp512 248.3 / 247.7).
+
+### Validation
+
+- decode_bitwise all-on vs all-off (reference saved in the same build): DS4, Qwen3.8,
+  Gemma PASS (48 steps, every logit bit-identical).
+- mgemv_bitwise DS4 + Qwen vs the 3cf11c5 references PASS (the weighted down now runs
+  on the multi-row path); multirow_check PASS; mgemv_check PASS (after the EXL3_MGEMV /
+  skipped-slot fixes above); negative-index weighted check vs the cooperative kernel PASS.
+- `bench/run_gates.sh` PASS (879 passed, 9 skipped).
+- PPL (wikitext2 100 x 2048): DS4 6.463333, Qwen3.8 4.748012, Gemma 18.633857 -- identical
+  to the c6c19ca references (PPL runs the prefill paths, which these changes do not touch).
+- `hipcc_probe --all` 123/123 on gfx1151, gfx1100, gfx1101, gfx1200, gfx1201.
+
+### Details worth keeping
+
+**Router.** Upstream's kernel is one warp per expert row (E / 8 = 32 blocks), 4-byte
+loads, lane l accumulating columns l, l + 32, ... in order. Loads-in-flight alone (RG_U = 16
+dword loads per lane before the chain consumes them, 2-wave blocks) took it from 37.8 to
+22.3 us and no further: 512 K dword load instructions for 2 MB is the limit (address/TA
+rate), not latency. The m == 1 kernel now loads 16 bytes per lane (4 adjacent half2
+columns of a 128-column block), writes the block to the wave's LDS slice and reads back
+its own columns l, l + 32, l + 64, l + 96 -- the chain is upstream's, column for column,
+bit-identical. U (blocks in flight per wave): U2 20.5, U4 19.7, **U8 13.2 us** (150 GB/s).
+The fused top-k (last-arriving block, release/acquire + self-resetting counter) is 17.7 us
+for both; in the e2e A/B it is within noise (the top-k body is serial either way).
+m = 2..8 (MTP verify): each row the m == 1 chain -- verify-row router scores are now
+bit-identical to plain decode's (they were hgemm's, a different reduction).
+
+**Weighted down on the multi-row path.** Same dot core, wave count and N-tiles per block
+as the LDS-prologue mgemv kernel; the epilogue is exl3_gemv_fused_epilogue verbatim, so the
+routed sum is bit-identical (mgemv_bitwise DS4 + Qwen vs the 3cf11c5 references PASS).
+Skipped slots (negative indices, the documented "skip" API) arrive as all-zero rows so the
+grouped reduce completes (adding +0 is exactly skipping); the path honors EXL3_MGEMV=0 like
+the mgemv path it stands in for (mgemv_check's coop-only masked case relies on that). A
+direct negative-index test against the cooperative kernel: fp32 max rel err 3e-5, no NaN.
+With the fused op on, nothing weighted reaches it at decode (its e2e A/B is flat); it stays
+for callers of exl3_mgemm with weights.
+
+**Fused MoE op** (`torch.ops.exl3_rocm.moe_decode`, registered from the sibling with
+TORCH_LIBRARY_FRAGMENT -- no upstream binding edits). The split-K wave count is sized from
+one token's slots per matrix (top_k), the rule the separate calls apply, so every slot keeps
+its reduction order; the same rule is what lets the batched MTP verify stay bit-identical
+per row (exl3_mgemm's num_tokens is passed to gate/up for this). The 2S-slot gate+up grid is
+also simply faster than two S-slot grids (131 vs 142 us).
+
+**mHC.** Every cross-lane op in hc_mix moves a value within a row of 16 lanes (or row 1 ->
+row 0 for shfl_down 16), so DPP row_shl / quad_perm / row_xmask / v_permlanex16 carry the
+same values and every add keeps its operands. The apply fold works because partials chunks
+never straddle a stream: a block of 4 x 64 threads owns chunk c of each of the 4 streams,
+i.e. the same columns of all 4, so it has every x value the apply needs (via LDS, before any
+store), updates x in place without racing other blocks, and gives each chunk the unfused
+kernel's exact per-thread sequence and 2-warp reduce. First version ran 16.0 us: at the
+256-thread launch bound the compiler capped VGPRs at 64 and serialized the 24 fn loads
+(load / wait x 24); issuing them into registers before the barrier and
+`__launch_bounds__(256, 1)` gave 7.8 us. The norm fold replays rms_norm_kernel's single-pass
+form (1024 virtual threads, sum_sq4, reduce_dyn's two xor butterflies, (x * w) * rmf, same
+half rounding); a last-arriving-block version cost 7.3 us (two passes over the row from
+global), one block per row with the row in LDS 6.7 us. The deferred apply is flushed before
+anything else can see the streams (any other HC call, HyperHead, a device change in
+prepare_for_device); nothing is deferred while exporting states or converting.
+
+### Tried / rejected / not done (with numbers)
+
+- **K = 5/6/8 funnel shift** (GEMV tiles open item): not done. DS4's only K6 GEMV is lm_head at
+  1757 us = 227 GB/s, above bench_membw's 206 GB/s -- memory-bound, so fewer VALU ops per tile
+  cannot move it; Gemma's K6 mcg shapes sit at 200-227 GB/s too (GEMV-tiles notes: 7.70 t/s
+  against a ~9.7 roofline set by bytes). Expected < 0.05 ms/token on DS4.
+- **Router, loads-in-flight only** (dword loads, U = 16, 2-wave blocks): 22.3 us -- address/TA
+  bound at 512 K load instructions; superseded by the 16-byte LDS-transpose kernel (13.2 us).
+- **Router + top-k fusion**: 17.7 us for both vs 13.2 + 4.2 us + a gap; e2e within noise
+  (tg128 30.02 off vs 29.99 on, one 3-run median each). Kept (bit-identical, 40 launches).
+- **HC apply fold, first version**: 16.0 us per site (vs 8.8 unfused) -- serialized fn loads
+  at a 64-VGPR budget; fixed as above.
+- **Norm fold via a last-arriving block** (counters, row re-read from global twice): 7.3 us
+  finalize; one block per row with the row in LDS: 6.7 us.
+- **DSA decode: fewer splits / no combine at short context**: not re-tried -- the DSA decode
+  sweep has 8 splits (split 15.5 us incl. combine) beating 2 (28.7) and 4 (18.1).
+- **Gate + up as one 12-slot exl3_mgemm from Python** (CODE_SCAN #7): needs a (1, 2S) index
+  tensor (one more launch) and, with 12 slots, the split-K rule picks 4 waves instead of 8
+  (numerics change); done inside moe_decode instead, where both problems disappear.
+
+### Open
+
+- Step boundary: ~0.47 ms/token of idle between the last kernel of a token and the first of
+  the next (sampling sync, generator turnaround; copyBuffer -> copyBuffer gaps). Host side.
+- hc_apply_partials runs 16 blocks (one per 4-chunk group); splitting each chunk's two warps
+  across blocks (finalize summing the pair, which is the unfused reduce's exact order) would
+  double the grid.
+- Attention small ops (copy2d, compress_store x1-2, ring_append, q_a rms_norm: ~5 launches
+  per layer) are in upstream dsv4_attn.cpp -- a sibling of that file is the next launch-count
+  lever (~0.5 ms/token).
+- Shared expert (5 launches + the routed + shared add): moe_decode could carry it, but its
+  gate/up intermediates are fp32 (act_mul_kernel_f), a second code path.
