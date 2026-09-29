@@ -333,6 +333,104 @@ def apply() -> list[str]:
             applied.append(f"!! FAILED DSA prefill kernel patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
+    # MLA LDS fit: unfold + MHA-form prefill tiles into 64 KB (GLM-5.3-Flash)
+    # ------------------------------------------------------------------
+    # _mla_unfold_kernel keeps a BLOCK_K x D_v W_UV tile plus a BLOCK_M x
+    # BLOCK_K o_lat tile in shared memory. Upstream's BLOCK_K = 128 needs
+    # (BLOCK_M + D_v) * 256 B: 69632 B at D_v = 256 (GLM-5.3-Flash) for a
+    # 16-row decode tile, over gfx1151's 64 KB. The BC builder raises
+    # BCKernelTooLarge from MLAAttention.autosplit_prepare, which does not
+    # catch it (load aborts), and the eager mla_unfold would fail at launch
+    # the same way. Both launch sites here halve BLOCK_K until the kernel
+    # fits; BLOCK_K is a loop tile only (grid and output unchanged; the fp32
+    # accumulation visits the same k in the same order, in smaller dot
+    # steps). A kernel that already fits (D_v <= 128: every other MLA model)
+    # is compiled exactly as before. EXL3_ROCM_MLA_LDS_FIT=0 restores
+    # upstream's launches (and GLM-5.3 then fails to load on 64 KB parts).
+    if _env_on("EXL3_ROCM_MLA_LDS_FIT", True):
+        try:
+            import triton as _triton
+            import torch as _torch
+            from ..modules.attention_fn import bc_attn as _bca_u
+            from ..modules.attention_fn import bc_mla as _bcm_u
+            from ..modules.attention_fn import mla_triton as _mlt_u
+            from ..modules.attention_fn.smem import pick_config as _pick, shared_bytes as _shb, \
+                halving_ladder as _halve
+            from ..modules import mla_attn as _mla_u
+
+            _prev_bcm_compile = _bcm_u._compile_kernel
+            _unfold_bk = {}
+
+            def _compile_kernel_unfold_fit(device, fn, signature, constexprs, num_warps, num_stages):
+                if fn.__name__ != "_mla_unfold_kernel":
+                    return _prev_bcm_compile(device, fn, signature, constexprs, num_warps, num_stages)
+                cx = dict(constexprs)
+                mkey = (getattr(device, "index", device), tuple(sorted(constexprs.items())))
+                cx["BLOCK_K"] = _unfold_bk.get(mkey, cx["BLOCK_K"])
+                while True:
+                    try:
+                        k = _prev_bcm_compile(device, fn, signature, cx, num_warps, num_stages)
+                        _unfold_bk[mkey] = cx["BLOCK_K"]
+                        return k
+                    except _bca_u.BCKernelTooLarge:
+                        if cx["BLOCK_K"] <= 16:
+                            raise
+                        cx["BLOCK_K"] //= 2
+
+            _bcm_u._compile_kernel = _compile_kernel_unfold_fit
+            _orig_unfold = _mla_u.mla_unfold
+
+            def _mla_unfold_fit(o_lat, w_uv_flat, v_head_dim):
+                H, R, D_c = o_lat.shape
+                block_m = min(64, _triton.next_power_of_2(max(R, 16)))
+                out = _torch.empty((R, H, v_head_dim), dtype = _torch.half, device = o_lat.device)
+                args = lambda bk: (o_lat, w_uv_flat, out, R, H, D_c, v_head_dim, block_m, bk)
+                with _torch.cuda.device(o_lat.device):
+                    bk = _pick(o_lat.device, "mla_unfold_rdna", (H, D_c, v_head_dim, block_m),
+                               _halve(128), lambda bk: _shb(_mlt_u._mla_unfold_kernel, args(bk),
+                                                            num_warps = 4, num_stages = 2))
+                    if bk == 128:
+                        return _orig_unfold(o_lat, w_uv_flat, v_head_dim)
+                    _mlt_u._mla_unfold_kernel[(_triton.cdiv(R, block_m), H)](
+                        *args(bk), num_warps = 4, num_stages = 2)
+                return out
+
+            _mla_u.mla_unfold = _mla_unfold_fit
+
+            # MHA-form prefill (mla_attn_triton_prefill_mha): upstream steps only the q tile
+            # down (128 -> 32) on OutOfResources, then asserts. At QK 256 / D_v 256 the K and
+            # V tiles alone (BLOCK_N 64 x 256 fp16 each, 2 stages) are over 64 KB, so no q
+            # tile fits. Walk (BLOCK_N, num_stages) as well; upstream's own q-tile loop runs
+            # inside each attempt. A failed attempt launched nothing (the OutOfResources is
+            # raised at the first tile's launch; the gather / up-projection it re-runs only
+            # write scratch), so retrying the whole call is safe. The pick is cached per dims
+            _orig_mha = _mla_u.mla_attn_triton_prefill_mha
+            _mha_pick = {}
+
+            def _mha_fit(q, *a, **kw):
+                key = (q.device.index, q.shape[-1], kw.get("block_n"), kw.get("num_stages"))
+                cfg = _mha_pick.get(key)
+                if cfg is not None:
+                    return _orig_mha(q, *a, **{**kw, **cfg})
+                ladder = [{}, {"block_n": 32}, {"block_n": 32, "num_stages": 1},
+                          {"block_n": 16, "num_stages": 1}]
+                for i, cfg in enumerate(ladder):
+                    try:
+                        out = _orig_mha(q, *a, **{**kw, **cfg})
+                    except AssertionError as e:
+                        if "does not fit in shared memory" not in str(e) or i == len(ladder) - 1:
+                            raise
+                        continue
+                    _mha_pick[key] = cfg
+                    return out
+
+            _mla_u.mla_attn_triton_prefill_mha = _mha_fit
+            applied.append("MLA LDS fit: unfold BLOCK_K and MHA-prefill kv tile / stages step down "
+                           "to 64 KB (QK / D_v 256, GLM-5.3)")
+        except Exception as e:
+            applied.append(f"!! FAILED MLA LDS fit patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
     # MultiLinear (mgemm) fusion
     # ------------------------------------------------------------------
     # attn.py fuses K/V (and Q/G) into one MultiLinear, and mlp.py fuses

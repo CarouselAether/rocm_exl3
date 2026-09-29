@@ -16,6 +16,14 @@ Workloads, all at bsz 1:
   mtp     with --mtp: natural prompts, greedy, 128 tokens; reports tok/s and acceptance
   tglong  with --long N: one N-token prompt, then 64 new tokens (exercises the DSA indexer /
           top-k regime that tg128 never reaches, see CODE_SCAN "Notes for Phase 0")
+  tg<M>@d<N>  with --tg_depth N [N ...]: decode at depth on NATURAL text (random ids ruin
+          MTP / DFlash acceptance). Prompt = exactly N tokens: the model's chat template
+          (user turn) around a wikitext-2 test slice + a short summarize instruction. Slices
+          are token windows at fixed offsets (run r: offset 1000 + r * 8192 of the whole
+          tokenized split, eval/ppl.py's loader), so models sharing a tokenizer see identical
+          text; M = --depth_new new tokens (default 128), no EOS stop. Sampler: greedy in
+          spec runs (--mtp / -dm), DefaultSampler with seed 1234 otherwise. Works in both
+          passes; each run uses a different slice, so there are no prefix-cache hits.
 
 Each workload: 1 discarded warmup + --runs timed runs, median reported. A sysfs sampler
 thread records GPU clock / power / busy during every timed run; amd-smi snapshots are
@@ -23,6 +31,10 @@ taken before and after. Results go to bench/results/<commit>_<timestamp>.json.
 
     bench/run_bench.py -m ~/models/DeepSeek-V4-Flash-0731-exl3-2.04bpw
     bench/run_bench.py -m ... --mtp -ndt 2          # MTP pass (separate process)
+    bench/run_bench.py -m ... --tg 0 --tg_depth 1024 2048            # decode at depth, plain
+    bench/run_bench.py -m ... --mtp -ndt 2 --tg 0 --tg_depth 1024 2048
+    bench/run_bench.py -m ~/models/Laguna-S-2.1-exl3-4.00bpw -dm ~/models/Laguna-S-2.1-DFlash -ndt 3 \
+        --tg 0 --tg_depth 1024 2048                 # external drafter (DFlash), same model_init args as the server
     bench/run_bench.py -m ... --repo ../rocm_exl3_10 # measure another checkout
 
 Exits via os._exit() (native teardown segfault after model load, see RDNA_NOTES).
@@ -49,7 +61,12 @@ ap.add_argument("--tg", type=int, default=128, help="0 skips the decode workload
 ap.add_argument("--tg_ctx", type=int, default=512)
 ap.add_argument("--runs", type=int, default=3)
 ap.add_argument("--mtp", action="store_true", help="MTP pass instead of plain")
+ap.add_argument("-dm", "--draft_model_dir", default=None,
+                help="spec pass with a separate draft model (e.g. a DFlash drafter), via model_init's -dm as the server")
 ap.add_argument("-ndt", "--num_draft_tokens", type=int, default=2)
+ap.add_argument("--tg_depth", type=int, nargs="*", default=[],
+                help="decode-at-depth workloads on natural text: prompt lengths (see the docstring)")
+ap.add_argument("--depth_new", type=int, default=128, help="new tokens per --tg_depth run")
 ap.add_argument("--long", type=int, default=0, help="also run tg64 after an N-token prompt")
 ap.add_argument("--gen_chunk", type=int, default=None,
                 help="Generator max_chunk_size (default: Generator's 2048, as the server uses). -chunk_size via --extra only sizes load-time buffers")
@@ -69,7 +86,7 @@ sys.path.insert(0, os.path.abspath(args.repo))
 
 import torch  # noqa: E402
 from exllamav3 import model_init, Generator, Job  # noqa: E402
-from exllamav3.generator.sampler import ArgmaxSampler  # noqa: E402
+from exllamav3.generator.sampler import ArgmaxSampler, DefaultSampler  # noqa: E402
 
 CARD = "/sys/class/drm/card0/device"
 PROMPTS = [
@@ -152,11 +169,14 @@ def env_info(repo):
 def run_job(generator, ids, n, sampler=None, seed=None):
     job = Job(input_ids=ids, max_new_tokens=n, sampler=sampler, seed=seed)
     generator.enqueue(job)
-    final = None
+    final, text = None, []
     while generator.num_remaining_jobs():
         for r in generator.iterate():
-            if r["stage"] == "streaming" and r.get("eos", False):
-                final = r
+            if r["stage"] == "streaming":
+                text.append(r.get("text", ""))
+                if r.get("eos", False):
+                    final = r
+    final["_text"] = "".join(text)
     return final
 
 
@@ -172,6 +192,44 @@ def pp_rate(f):
 
 def tg_rate(f):
     return f["new_tokens"] / f["time_generate"]
+
+
+_WIKI = {}
+
+
+def wiki_ids(tokenizer):
+    """The whole wikitext-2 test split tokenized once (eval/ppl.py's loader and disk cache)."""
+    if "ids" not in _WIKI:
+        sys.path.insert(0, os.path.join(os.path.abspath(args.repo), "eval"))
+        from ppl import get_dataset_text
+        _WIKI["ids"] = tokenizer.encode(get_dataset_text({"dataset": "wiki2"}))
+    return _WIKI["ids"]
+
+
+DEPTH_INSTR = "\n\nSummarize the text above in a few paragraphs."
+_MARK = "\u2063EXL3DEPTHMARK\u2063"
+
+
+def depth_ids(tokenizer, n, r):
+    """Exactly n tokens: chat-template head + wikitext slice (run r) + instruction + template tail."""
+    try:
+        text = tokenizer.hf_render_chat_template([{"role": "user", "content": _MARK}], add_generation_prompt=True)
+        head, tail = text.split(_MARK)
+    except Exception:
+        head, tail = None, ""
+    if head is not None:
+        h = tokenizer.encode(head, encode_special_tokens=True)
+    else:
+        h = tokenizer.encode("", add_bos=True)
+    t = tokenizer.encode(DEPTH_INSTR + tail, encode_special_tokens=True)
+    k = n - h.shape[-1] - t.shape[-1]
+    assert k > 0, f"depth {n} too short for the template ({h.shape[-1]} + {t.shape[-1]} tokens)"
+    off = 1000 + r * 8192
+    w = wiki_ids(tokenizer)[:, off:off + k]
+    assert w.shape[-1] == k, "wikitext split too short for this depth / run count"
+    ids = torch.cat((h, w, t), dim=-1)
+    assert ids.shape[-1] == n
+    return ids
 
 
 def regen_workload(n, runs, generator, tokenizer, rng):
@@ -211,6 +269,7 @@ def workload(name, make_ids, n_new, rate, runs, generator, sampler=None):
             rec["acceptance"] = a / max(a + rj, 1)
         if r == 0:
             out["warmup"] = rec
+            out["sample_text"] = f["_text"][:600]   # warmup run's output, for eyeballing
             continue
         out["runs"].append(rec)
     rates = [x["rate"] for x in out["runs"]]
@@ -229,8 +288,12 @@ def workload(name, make_ids, n_new, rate, runs, generator, sampler=None):
 @torch.inference_mode()   # as server.py main()
 def main():
     ia = ["-m", args.model_dir, "-cs", str(args.cache_size)]
+    assert not (args.mtp and args.draft_model_dir), "--mtp and -dm are exclusive"
+    spec = args.mtp or args.draft_model_dir is not None
     if args.mtp:
         ia += ["--mtp", "-ndt", str(args.num_draft_tokens)]
+    elif args.draft_model_dir:
+        ia += ["-dm", args.draft_model_dir, "-ndt", str(args.num_draft_tokens)]
     ia += args.extra
     parser = argparse.ArgumentParser()
     model_init.add_args(parser, cache=True, add_sampling_args=False, add_draft_model_args=True,
@@ -265,7 +328,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     tag = ("_" + args.label) if args.label else ""
-    path = os.path.join(args.out, f"{info['commit']}_{stamp}{'_mtp' if args.mtp else ''}{tag}.json")
+    kind = "_mtp" if args.mtp else ("_dm" if args.draft_model_dir else "")
+    path = os.path.join(args.out, f"{info['commit']}_{stamp}{kind}{tag}.json")
     info["results"] = res = []
 
     def save():   # after every workload, so a killed run keeps what it finished
@@ -275,7 +339,10 @@ def main():
             os.fsync(f.fileno())
 
     rng = torch.Generator().manual_seed(1234)
-    if not args.mtp:
+    info["depth_prompt"] = {"source": "wikitext-2-raw-v1 test (eval/ppl.py get_dataset_text)",
+                            "offsets": "1000 + run * 8192 tokens", "instruction": DEPTH_INSTR,
+                            "sampler": "greedy" if spec else "DefaultSampler seed 1234"}
+    if not spec:
         for n in args.pp:
             res.append(workload(f"pp{n}", lambda r, n=n: rand_ids(tokenizer, n, rng), 1, pp_rate, args.runs, gen))
             save()
@@ -294,8 +361,14 @@ def main():
         enc = lambda r: tokenizer.encode(PROMPTS[r % len(PROMPTS)], add_bos=True)
         # plain greedy on the same prompts (no draft) for a like-for-like MTP ratio is the
         # plain pass's job; here: MTP greedy, then MTP with the default (sampling) sampler
-        res.append(workload(f"mtp{args.num_draft_tokens}_greedy", enc, args.tg, tg_rate, args.runs, gen,
-                            sampler=ArgmaxSampler()))
+        if args.tg:
+            res.append(workload(f"mtp{args.num_draft_tokens}_greedy", enc, args.tg, tg_rate, args.runs, gen,
+                                sampler=ArgmaxSampler()))
+            save()
+    for n in args.tg_depth:
+        res.append(workload(f"tg{args.depth_new}@d{n}", lambda r, n=n: depth_ids(tokenizer, n, r),
+                            args.depth_new, tg_rate, args.runs, gen,
+                            sampler=ArgmaxSampler() if spec else DefaultSampler()))
         save()
 
     info["amd_smi_after"] = sh("amd-smi metric -c -p -t -l --json")
