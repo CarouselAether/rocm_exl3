@@ -1,5 +1,10 @@
 # ROCm requirements. Bring ROCm 7.2.x; this brings everything else.
 #
+# ROCm 10 (recommended; see README "Install"): install torch from
+# https://download.pytorch.org/whl/nightly/rocm10.0 and rocm[libraries,devel]==10.0.* first, then
+# `pip install -r requirements_rocm.txt` only adds the remaining dependencies -- pip keeps the installed
+# ROCm 10 torch because it already satisfies torch>=2.6.0 below.
+#
 #   pip install -r requirements_rocm.txt
 #   pip install --no-build-isolation .
 #

@@ -2,7 +2,7 @@
 # <img src="doc/cat.png" width="40"> ExLlamaV3 — ROCm / RDNA fork
 
 This is a **ROCm fork of [ExLlamaV3](https://github.com/turboderp-org/exllamav3)** by turboderp, tracking
-upstream v1.5.0. If you are on NVIDIA, you want [the upstream repo](https://github.com/turboderp-org/exllamav3) —
+upstream **v1.5.3**. If you are on NVIDIA, you want [the upstream repo](https://github.com/turboderp-org/exllamav3):
 this one builds for CUDA too, but adds nothing there.
 
 The Python package is still named `exllamav3`, so it is a drop-in replacement for code that imports it. For a
@@ -11,109 +11,178 @@ Only the repository is renamed.
 
 ### What this fork changes
 
-The CUDA kernels that cannot compile for RDNA are replaced with hand-written HIP/WMMA siblings under
-`exllamav3_ext/rocm/`, reached through a compat shim and include-path redirection. Python divergences live in
-`exllamav3/rocm_py/` and are applied as monkeypatches at import.
+The CUDA kernels that cannot compile for RDNA, or that run poorly on it, are replaced with hand-written
+HIP/WMMA siblings under `exllamav3_ext/rocm/`, reached through a compat shim and include-path redirection. The
+upstream originals are excluded from the ROCm build (`ROCM_EXCLUDE` in `setup.py`). Python divergences live in
+`exllamav3/rocm_py/` and are applied as monkeypatches at import. Every patch is listed in the startup report,
+and each has an `EXL3_ROCM_*` switch that restores upstream behaviour.
 
-**No upstream C++ or CUDA source is modified — not one.** Verify it yourself:
+**No upstream C++ or CUDA source is modified. Not one.** Verify it yourself:
 
 ```sh
-git diff --stat v1.5.0 -- '*.cu' '*.cuh' '*.cpp' '*.h' ':(exclude)exllamav3/exllamav3_ext/rocm'
+git diff --stat v1.5.3 -- '*.cu' '*.cuh' '*.cpp' '*.h' ':(exclude)exllamav3/exllamav3_ext/rocm'
 # (empty)
 ```
 
-Outside `rocm/`, `rocm_py/` and `rocm_tools/`, exactly four upstream files differ from v1.5.0, plus one added file
-(`requirements_rocm.txt`) and one ignore line in `.gitignore`:
+Outside `rocm/`, `rocm_py/` and `rocm_tools/` (and the fork's own `bench/`, `docs/` and notes), exactly three
+upstream files differ from v1.5.3. There is also one added file (`requirements_rocm.txt`) and one ignore line
+in `.gitignore`:
 
 | file | change |
 |---|---|
-| `setup.py` | ROCm backend selector and `hipcc` builder. All ROCm behaviour is inside `HIPBuildExtension`, so a CUDA build is untouched upstream code. |
-| `exllamav3/__init__.py` | Six lines calling `rocm_py.apply()` at the end of package init. Returns immediately when `torch.version.hip` is `None`, so it is inert on CUDA. |
-| `exllamav3/modules/attention_fn/triton_paged.py` | Selects the narrow-KV prefill tile explicitly on RDNA instead of relying on `get_device_capability()` accidentally reporting `(11, 5)`, plus measured notes on decode split counts. |
+| `setup.py` | ROCm backend selector, `hipcc` builder and `ROCM_EXCLUDE`. All ROCm behaviour is inside `HIPBuildExtension`, so a CUDA build is untouched upstream code. |
+| `exllamav3/__init__.py` | Six lines calling `rocm_py.apply()` at the end of package init. It returns immediately when `torch.version.hip` is `None`, so it is inert on CUDA. |
 | `README.md` | This section. |
 
 ```sh
-git diff --stat v1.5.0 -- . ':(exclude)exllamav3/exllamav3_ext/rocm' ':(exclude)exllamav3/rocm_py' ':(exclude)rocm_tools'
+git diff --stat v1.5.3 -- . ':(exclude)exllamav3/exllamav3_ext/rocm' ':(exclude)exllamav3/rocm_py' ':(exclude)rocm_tools' ':(exclude)bench' ':(exclude)docs' ':(exclude)rocm_patches' ':(exclude)*.md'
 ```
 
-That is the whole surface. Rebasing onto a new upstream means re-applying four files, none of them kernels.
+That is the whole surface. Rebasing onto a new upstream means re-applying three files, none of them kernels. The
+real work is re-syncing the siblings and hooks whose upstream originals changed. `rocm_patches/` and the
+maintainer's merge notes track that. See `RDNA_NOTES.md` → "Syncing to a new upstream release".
+
+### Performance (gfx1151, 2026-09-29)
+
+Ryzen AI Max+ 395, ROCm 10.0, bsz 1. Figures are tok/s, the median of 3 runs. Decode = 128 tokens after a
+1024-token natural-text prompt. MTP = the model's own draft head, `-ndt 2`.
+
+| Model | pp512 | pp2048 | decode | decode, MTP |
+|---|---|---|---|---|
+| DeepSeek-V4-Flash 2.04 bpw | 346 | 519 | 30.0 | 36.9 |
+| Qwen 3.8-Flash-Next 4 bpw (`-ngr`) | 621 | 863 | 29.0 | 40.2 |
+| GLM-5.3-Flash 2.05 bpw | 262 | 360 | 20.0 | 25.7 |
+| Laguna-S-2.1 4 bpw | 582 | 872 | 34.3 | 32.4 (DFlash drafter, ndt 3) |
+| MiMo-V2.6-Flash 2.27 bpw | 158 | 274 | 13.2 | 12.1 |
+| Gemma-4-31B ~6 bpw (dense) | 249 | 319 | 8.2 | n/a |
+
+Against the port as of v1.5.0 on the same machine, DeepSeek-V4-Flash went from 18.0 to 30.0 t/s decode, from
+19.8 to 41.7 t/s with MTP, and from 113 / 179 to 346 / 519 t/s prefill. What changed, with the numerics notes
+and per-change A/B, is in `RESULTS.md`; the method is in `PROFILE.md`.
 
 ### Requirements
 
 | | |
 |---|---|
-| ROCm | **7.2.4 or newer** — the build hard-fails below this |
-| GPU | RDNA3 / RDNA3.5: `gfx1100`, `gfx1101`, `gfx1102`, `gfx1150`, `gfx1151` — developed and validated on gfx1151. RDNA4 (`gfx1200`, `gfx1201`): builds and should run, but MoE models take a slower per-expert path (the fused MoE kernel's WMMA has no gfx12 encoding) and no RDNA4 hardware has validated the port — reports welcome. |
+| ROCm | **10.0 recommended; 7.2.4 minimum.** The build hard-fails below 7.2.4. |
+| GPU | RDNA3 / RDNA3.5: `gfx1100`, `gfx1101`, `gfx1102`, `gfx1150`, `gfx1151`. Developed and validated on gfx1151. RDNA4 (`gfx1200`, `gfx1201`): builds and should run, but MoE models take a slower per-expert path (the fused MoE kernel's WMMA has no gfx12 encoding) and no RDNA4 hardware has validated the port. Reports welcome. |
 | Python | 3.10+ (whatever the ROCm torch index publishes a wheel for) |
-| Torch | ROCm build, from `download.pytorch.org/whl/rocmX.Y` — see below |
+| Torch | A ROCm build matching your ROCm version. See Install. |
+
+**ROCm 7.2.4** (system install, torch 2.13.0+rocm7.2, triton-rocm 3.7.1) remains supported. It builds cleanly,
+passes the gate suite and matches ROCm 10 output (perplexity within 0.03%), but it is slower:
+- prefill is 3–8% lower;
+- DeepSeek-V4-Flash decode is about 10% lower (about 17% with MTP);
+- Qwen 3.8 decode is unchanged.
+
+HIP graphs stay off below ROCm 7.14, but graphs on vs off measures flat on ROCm 10, so the gap is the older
+compiler and runtime. The details are in `RDNA_NOTES.md`.
 
 You do **not** need FlashAttention. Upstream uses Triton paged attention, so the FA2 dependency that
 earlier ROCm forks required is gone.
 
 ### Install
 
+**ROCm 10 (recommended).** ROCm 10 ships as pip wheels, so no system ROCm install is needed. Everything goes in
+one venv:
+
 ```sh
 git clone https://github.com/CarouselAether/rocm_exl3
 cd rocm_exl3
+python -m venv .venv && . .venv/bin/activate
 
+# 1. torch for ROCm 10, plus the ROCm SDK (hipcc and headers) to build against
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm10.0
+pip install "rocm[libraries,devel]==10.0.*"
+pip install -r requirements_rocm.txt   # the other dependencies (the installed ROCm 10 torch already satisfies torch>=2.6)
+#    (or AMD's stable wheel: pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device-gfx1151]==2.13.0+rocm10.0.0")
+
+# 2. Build against that SDK. A login shell's /opt/rocm must not leak in.
+SDK=$(rocm-sdk path --root)
+env -u LD_LIBRARY_PATH PATH=$SDK/bin:$PATH ROCM_PATH=$SDK ROCM_HOME=$SDK \
+    pip install --no-build-isolation .
+```
+
+`ROCM_HOME` matters: torch's extension builder takes the runtime path from it. Without it the extension can end up
+linked against a system ROCm instead of the wheel's.
+
+**ROCm 7.2.4 (system install):**
+
+```sh
 # 1. ROCm torch + triton-rocm + everything else.
-#    Do NOT use requirements.txt on ROCm -- it resolves torch from PyPI, which is the CUDA build.
+#    Do NOT use requirements.txt on ROCm: it resolves torch from PyPI, which is the CUDA build.
 pip install -r requirements_rocm.txt
 
 # 2. Build and install the extension against that torch.
 pip install --no-build-isolation .
 ```
 
-`--no-build-isolation` is required, not optional: pip otherwise builds in an isolated environment with no
+`--no-build-isolation` is required, not optional. Otherwise pip builds in an isolated environment with no
 torch in it, and a torch C++ extension has to be compiled against the same torch it will run against.
 Building without it fails with an explanation rather than silently installing an empty package.
 
-The build compiles ~117 sources with `hipcc` in parallel (`MAX_JOBS` to limit it, e.g. on a low-memory
+The build compiles ~130 sources with `hipcc` in parallel (`MAX_JOBS` to limit it, e.g. on a low-memory
 machine).
 
 ### Tested
 
-Developed on a Ryzen AI Max 395+ (Strix Halo, **gfx1151**, 128 GB unified) — Ubuntu 24.04, ROCm 7.2.4,
-torch 2.13.0+rocm7.2, triton-rocm 3.7.1, Python 3.12. Verified end to end with GLM-4.6V (MoE, 3.55 bpw),
-Gemma-4-31B (dense), DeepSeek-V4-Flash (DSA sparse attention, 2.04 bpw) and Qwen 3.8-Flash-Next
-(QSA sparse attention + PLE n-gram embeddings + 512-expert MoE, 4 bpw). The other architectures in the
-supported list above should work but are untested — reports welcome.
+Developed on a Ryzen AI Max 395+ (Strix Halo, **gfx1151**, 128 GB unified): Ubuntu 24.04, ROCm 10.0 (pip SDK,
+HIP 7.15), torch 2.15.0.dev20260926+rocm10.0, triton-rocm 3.8.0, Python 3.12. Also verified on system ROCm 7.2.4
+with torch 2.13.0+rocm7.2.
 
-**v1.5.0 sync status (2026-09-20, validated on gfx1151):** the port was brought from v1.4.4 to v1.5.0 by
-source-level merge — upstream's own diffs applied to the RDNA siblings, two siblings regenerated, two new
-CUDA-only kernels stubbed. Validated end to end on gfx1151: full build, sibling drift audit, numeric ladder
-(`mgemv_check`, `test_reconstruct_had`, `test_dsa_kernels` all PASS, pytest suites 161/161), and coherent
-generation on the four models in the verified list — including Qwen 3.8-Flash-Next, the architecture this
-sync targets. `exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md` lists exactly what changed and what remains
-unexercised (the opt-in gates below).
+Verified end to end on the models in the performance table: DeepSeek-V4-Flash, Qwen 3.8-Flash-Next,
+GLM-5.3-Flash, Laguna-S-2.1 (with its DFlash drafter), MiMo-V2.6-Flash and Gemma-4-31B. GLM-4.6V was verified
+at v1.5.0. The other architectures in the supported list should work but are untested. Reports welcome.
+
+**v1.5.3 sync status (2026-09-29, validated on gfx1151):** merged from v1.5.0 (133 upstream commits). Upstream's
+changes were ported into every RDNA sibling and `rocm_py` hook whose original changed. Two new CUDA-only kernels
+(the int8 deterministic router GEMM and the tiled GatedResidual mix) are declined cleanly. Validation:
+- full build, compiling on gfx1151 / 1100 / 1101 / 1200 / 1201;
+- the numeric ladder plus a bit-exact WMMA gate;
+- pytest: 985 passed;
+- perplexity matching v1.5.0 (DS4 −0.02%, Qwen −0.26%, Gemma exact).
+
+**New in upstream v1.5.1–v1.5.3, on ROCm:**
+
+| Feature | Status |
+|---|---|
+| MiMo-V2 (text, MTP, DFlash drafter) | supported; the vision tower is untested |
+| Kimi-Linear | builds; untested (no model) |
+| Fractional bitrates (1.5 / 2.5 / 3.5 bpw) | supported (reconstruct, GEMM, mgemm, fused MoE, quantizer). There is no fast GEMV decode path for half rates yet, which is why MiMo-V2.6 at 2.27 bpw decodes slowly. |
+| DFlash rework, DFlash2 drafters, n-gram SAM corpus | supported |
+| Deterministic router math, GDN fp16 prefill, new paged-decode split | supported; ROCm follows upstream's numerics |
+| int8 GEMV, cooperative MoE decode (`exl3_moe_coop`), fp16-accumulate `hgemm` | not ported (CUDA-only); the RDNA kernels are used instead |
+| Tensor parallel | not available on ROCm (see below) |
 
 ### Known limitations on ROCm
 
 - **Tensor-parallel is not available.** The `parallel/` kernels are excluded from the ROCm build.
 - **Vision/multimodal is untested.** Text generation is what has been verified.
-- **MoE decode at bsz ≤ 8 runs the per-token `exl3_mgemm` route** (upstream's own v1.4.4 route, reinstated by
-  `rocm_py`), not upstream v1.5.0's cooperative decode kernel (`exl3_moe_coop`, inline-PTX GEMV based, not ported).
-  On RDNA each call lands on the mgemv fast path; Laguna-S-2.1 4bpw decodes at 21 t/s this way versus 10 through
-  the fused `exl3_moe` kernel (`EXL3_ROCM_MOE_MGEMM_ROUTE=0` selects that steer). `EXL3_ROCM_MOE_BSZN=1` restores
-  upstream dispatch and raises in the stub.
-- **The one-launch sliced Q/K/V bundle is off by default** (`EXL3_ROCM_QKV_SLICE=1` to enable): the sliced mgemm
-  mode is ported into the WMMA kernels but unvalidated on RDNA; the pairwise bundles from v1.4.4 are used.
-- **RDNA4 (gfx1200/gfx1201) runs MoE through the per-expert path**: the fused MoE kernel's WMMA uses gfx11
+- **MoE decode at bsz ≤ 8 uses the fork's own fused decode op** (`torch.ops.exl3_rocm.moe_decode`: gate+up in
+  one GEMV, activation folded into down), not upstream's cooperative decode kernel (`exl3_moe_coop`, inline-PTX
+  GEMV based, not ported). `EXL3_ROCM_MOE_FUSED=0` / `EXL3_ROCM_MOE_BATCH=0` fall back to the per-token
+  `exl3_mgemm` route.
+- **The one-launch sliced Q/K/V bundle is off by default** (`EXL3_ROCM_QKV_SLICE=1` to enable). The sliced mgemm
+  mode is ported into the WMMA kernels but unvalidated on RDNA; the pairwise bundles are used.
+- **RDNA4 (gfx1200/gfx1201) runs MoE through the per-expert path.** The fused MoE kernel's WMMA uses gfx11
   intrinsics that have no gfx12 encoding (LLVM cannot select them), so `rdna_wmma.hip.h` traps on gfx12 and
-  `rocm_py` steers MoE off the fused kernel there. Dense models are unaffected. Compile-verified for gfx1201
-  (`GPU_ARCH=gfx1201 rocm_tools/hipcc_probe.sh --all`); **never run on real RDNA4 hardware** — testers welcome.
-  `EXL3_ROCM_RDNA4_FUSED_MOE=1` re-enables the fused route for a future gfx12 WMMA port.
-- **MoE 32/64-row tiles fall back to the 16-row kernel** (same numerics; slower prefill on mul1 MoE models).
-- **The batched expert-reconstruct tier is off by default** (`EXL3_ROCM_BATCH_RECON=1` to enable): ported
-  mechanically, untested.
-- **fp16-accumulate `hgemm` and the sm_120 quantizer specialisations are CUDA-only.** hipBLAS and the original
-  quantizer kernels are used; nothing is lost on RDNA, which has no fp32-accumulate rate penalty.
-- **The int8-activation GEMV is not ported** (a disabled stub); every call uses the fp16 GEMV/GEMM kernels.
-- **HIP graph capture is gated on the HIP runtime**: capture/replay corrupts BC decode across generator jobs and
+  `rocm_py` steers MoE off the fused kernel there. Dense models are unaffected. It is compile-verified for gfx1201
+  (`GPU_ARCH=gfx1201 rocm_tools/hipcc_probe.sh --all`) but **has never run on real RDNA4 hardware**. Testers
+  welcome. `EXL3_ROCM_RDNA4_FUSED_MOE=1` re-enables the fused route for a future gfx12 WMMA port. The WMMA GEMM
+  backend also falls back to hipBLAS on gfx12.
+- **The batched expert-reconstruct tier is off by default** (`EXL3_ROCM_BATCH_RECON=1` to enable). It was ported
+  mechanically and is untested.
+- **fp16-accumulate `hgemm`, int8 GEMV and the sm_120 quantizer specialisations are CUDA-only.** On RDNA,
+  fp16-output and fp32-output GEMMs run on the fork's WMMA GEMM backend (tuned for gfx1151, with a gfx1100 table)
+  or on hipBLAS. The fp32 accumulator is free on RDNA.
+- **HIP graph capture is gated on the HIP runtime.** Capture/replay corrupts BC decode across generator jobs and
   can hang at capture on ROCm 7.2.x, so on runtimes older than 7.14 the BC step runs eagerly. On ROCm 7.14 / 10.x
-  (validated) graphs are on with no flag needed. `EXL3_ROCM_HIP_GRAPHS=1` / `=0` overrides the gate either way.
-- **Quantization (`convert.py`) is built but not yet exercised on RDNA.** Convert on CUDA if you can; reports welcome.
-- Kernel behaviour can be bisected at runtime with the `EXL3_ROCM_*` environment switches — see
+  graphs are on with no flag needed. `EXL3_ROCM_HIP_GRAPHS=1` / `=0` overrides the gate either way. On ROCm 10 the
+  speed difference is within noise.
+- **gfx11 WMMA fp32 accumulation is not IEEE-exact.** It is 8 sequential DOT2 steps with fixed-point accumulation,
+  inherent to the silicon. Results match CUDA within normal tolerance, but not bit for bit. See `docs/RDNA_WMMA.md`.
+- **Quantization (`convert.py`) is built but not yet exercised on RDNA.** Convert on CUDA if you can. Reports welcome.
+- Kernel behaviour can be bisected at runtime with the `EXL3_ROCM_*` environment switches. See
   `exllamav3/rocm_py/__init__.py`, whose module docstring lists each one and why it exists.
 
 ### Server
