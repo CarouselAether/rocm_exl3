@@ -105,6 +105,9 @@ Environment switches (all default to the safe value for this backend):
                            it would read 96 KB for a 64 KB part)
   (C++ side: EXL3_ROCM_ROUTER_DET=0 router activations on v1.5.0 fast math;
   EXL3_ROCM_GR_DOTS=0 now selects upstream v1.5.3's GatedResidual decode pair)
+  EXL3_ROCM_MLA_ABSORB_DIV16=0  on triton < 3.8 (the ROCm 7.2 stack), compile the
+                           MLA decode graph's absorb kernel without the 16-byte
+                           pointer hint (triton 3.7 then miscompiles it to NaN)
 
 These are bisect handles, not permanent policy -- turn one on, run a prompt, see
 whether the output degrades. Each one's justification is a measurement recorded
@@ -429,6 +432,43 @@ def apply() -> list[str]:
                            "to 64 KB (QK / D_v 256, GLM-5.3)")
         except Exception as e:
             applied.append(f"!! FAILED MLA LDS fit patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # MLA absorb kernel: 16-byte pointer hint on triton < 3.8 (ROCm 7.2 stack)
+    # ------------------------------------------------------------------
+    # The MLA decode graph (bc_mla.py) AOT-compiles _mla_absorb_kernel through
+    # bc_attn._compile_kernel with no tt.divisibility on its pointers. Triton
+    # 3.7.1 (torch 2.13+rocm7.2's) lowers that variant for gfx1151 into a 32 KB
+    # LDS layout that returns NaN / fp16-overflow q_lat, so every MLA model on
+    # the graph decode path (GLM-5.x, Kimi Linear, DeepSeek-V3 style) decodes
+    # garbage. Measured 2026-09-29 (ROCM724_CHECK.md): same inputs, JIT launch
+    # and AOT with the hint both match the fp32 reference to 7e-4, AOT without
+    # the hint is NaN; triton 3.8.0 (ROCm 10 stack) is correct either way, so
+    # the patch is inert there. The hint is valid at the only launch site
+    # (mla_attention.cpp): q_full and q_lat are offset-0 views of g_tensor_cache
+    # allocations and w_uk_flat is its own allocation. Found by
+    # test_mla.py::test_mla_nope_decode_matches_prefill.
+    # EXL3_ROCM_MLA_ABSORB_DIV16=0 compiles it as upstream does.
+    if _env_on("EXL3_ROCM_MLA_ABSORB_DIV16", True):
+        try:
+            import triton as _triton_a
+            _tv = tuple(int(p) for p in _triton_a.__version__.split("+")[0].split(".")[:2])
+            if _tv < (3, 8):
+                from ..modules.attention_fn import bc_mla as _bcm_a
+                _prev_bcm_compile_a = _bcm_a._compile_kernel
+
+                def _compile_kernel_absorb_div16(device, fn, signature, constexprs, num_warps, num_stages):
+                    if fn.__name__ == "_mla_absorb_kernel":
+                        signature = {n: (t + ":16" if isinstance(t, str) and t.startswith("*")
+                                         and not t.endswith(":16") else t)
+                                     for n, t in signature.items()}
+                    return _prev_bcm_compile_a(device, fn, signature, constexprs, num_warps, num_stages)
+
+                _bcm_a._compile_kernel = _compile_kernel_absorb_div16
+                applied.append(f"MLA absorb kernel: 16-byte pointer hint (triton {_triton_a.__version__} "
+                               "< 3.8 miscompiles the unhinted AOT kernel; EXL3_ROCM_MLA_ABSORB_DIV16)")
+        except Exception as e:
+            applied.append(f"!! FAILED MLA absorb div16 patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # MultiLinear (mgemm) fusion
