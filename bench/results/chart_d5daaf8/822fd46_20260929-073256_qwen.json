@@ -1,0 +1,427 @@
+{
+ "time": "2026-09-29T07:31:41",
+ "repo": "/home/carousel/Desktop/exlproject/rocm_exl3",
+ "commit": "822fd46",
+ "branch": "opt/chart-fixes",
+ "dirty": false,
+ "torch": "2.15.0.dev20260926+rocm10.0",
+ "hip_runtime": "7.15.26333",
+ "rocm_pip": "Version: 10.0.0",
+ "device": "AMD Radeon 8060S Graphics",
+ "perf_level": "auto",
+ "cpu_boost": "0",
+ "cpu_max_khz": "3000000",
+ "env": {},
+ "argv": [
+  "bench/run_bench.py",
+  "-m",
+  "/home/carousel/models/Qwen3.8-Flash-Next-Uncensored-exl3-4bpw",
+  "-cs",
+  "65536",
+  "--pp",
+  "512",
+  "2048",
+  "--tg",
+  "0",
+  "--tg_depth",
+  "1024",
+  "2048",
+  "--out",
+  "/home/carousel/Desktop/exlproject/rocm_exl3/bench/results/chart_d5daaf8",
+  "--label",
+  "qwen",
+  "--extra",
+  "-ngr"
+ ],
+ "amd_smi_before": "{\n    \"gpu_data\": [\n        {\n            \"gpu\": 0,\n            \"power\": {\n                \"socket_power\": \"N/A\",\n                \"gfx_voltage\": \"N/A\",\n                \"soc_voltage\": \"N/A\",\n                \"mem_voltage\": \"N/A\",\n                \"throttle_status\": \"N/A\",\n                \"power_management\": \"N/A\"\n            },\n            \"clock\": {\n                \"gfx_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_4\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_5\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_6\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_7\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"mem_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"fclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"socclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                }\n            },\n            \"temperature\": {\n                \"edge\": {\n                    \"value\": 48,\n                    \"unit\": \"C\"\n                },\n                \"hotspot\": \"N/A\",\n                \"mem\": \"N/A\"\n            },\n            \"perf_level\": \"AMDSMI_DEV_PERF_LEVEL_AUTO\"\n        }\n    ]\n}",
+ "init_args": [
+  "-m",
+  "/home/carousel/models/Qwen3.8-Flash-Next-Uncensored-exl3-4bpw",
+  "-cs",
+  "65536",
+  "-ngr"
+ ],
+ "load_s": 73.96901795099257,
+ "results": [
+  {
+   "name": "pp512",
+   "runs": [
+    {
+     "rate": 632.7016427387248,
+     "prompt_tokens": 512,
+     "new_tokens": 1,
+     "time_prefill": 0.8092281818389893,
+     "time_generate": 0.03472018241882324,
+     "gpu": {
+      "n": 4,
+      "n_busy": 4,
+      "sclk_mhz": {
+       "min": 2231.0,
+       "median": 2433.5,
+       "max": 2582.0
+      },
+      "power_w": {
+       "min": 87.001,
+       "median": 95.06,
+       "max": 101.072
+      }
+     }
+    },
+    {
+     "rate": 621.090469059192,
+     "prompt_tokens": 512,
+     "new_tokens": 1,
+     "time_prefill": 0.8243565559387207,
+     "time_generate": 0.03415179252624512,
+     "gpu": {
+      "n": 4,
+      "n_busy": 4,
+      "sclk_mhz": {
+       "min": 2325.0,
+       "median": 2499.0,
+       "max": 2627.0
+      },
+      "power_w": {
+       "min": 89.017,
+       "median": 96.532,
+       "max": 102.066
+      }
+     }
+    },
+    {
+     "rate": 617.1969325869242,
+     "prompt_tokens": 512,
+     "new_tokens": 1,
+     "time_prefill": 0.829556941986084,
+     "time_generate": 0.03685307502746582,
+     "gpu": {
+      "n": 4,
+      "n_busy": 4,
+      "sclk_mhz": {
+       "min": 2396.0,
+       "median": 2545.5,
+       "max": 2659.0
+      },
+      "power_w": {
+       "min": 91.091,
+       "median": 99.04050000000001,
+       "max": 104.049
+      }
+     }
+    }
+   ],
+   "cached_seen": 0,
+   "warmup": {
+    "rate": 606.7513783744533,
+    "prompt_tokens": 512,
+    "new_tokens": 1,
+    "time_prefill": 0.8438382148742676,
+    "time_generate": 0.03547787666320801,
+    "gpu": {
+     "n": 4,
+     "n_busy": 4,
+     "sclk_mhz": {
+      "min": 1828.0,
+      "median": 2133.5,
+      "max": 2373.0
+     },
+     "power_w": {
+      "min": 74.005,
+      "median": 84.5315,
+      "max": 95.024
+     }
+    }
+   },
+   "sample_text": " ",
+   "median": 621.090469059192,
+   "spread": 0.02496369035462203
+  },
+  {
+   "name": "pp2048",
+   "runs": [
+    {
+     "rate": 864.2996540662086,
+     "prompt_tokens": 2048,
+     "new_tokens": 1,
+     "time_prefill": 2.3695485591888428,
+     "time_generate": 0.034343719482421875,
+     "gpu": {
+      "n": 10,
+      "n_busy": 10,
+      "sclk_mhz": {
+       "min": 2640.0,
+       "median": 2799.5,
+       "max": 2862.0
+      },
+      "power_w": {
+       "min": 104.045,
+       "median": 113.58449999999999,
+       "max": 116.029
+      }
+     }
+    },
+    {
+     "rate": 862.4559611472177,
+     "prompt_tokens": 2048,
+     "new_tokens": 1,
+     "time_prefill": 2.3746140003204346,
+     "time_generate": 0.03479957580566406,
+     "gpu": {
+      "n": 10,
+      "n_busy": 10,
+      "sclk_mhz": {
+       "min": 2644.0,
+       "median": 2800.0,
+       "max": 2862.0
+      },
+      "power_w": {
+       "min": 105.01,
+       "median": 114.50200000000001,
+       "max": 116.023
+      }
+     }
+    },
+    {
+     "rate": 862.6910392633868,
+     "prompt_tokens": 2048,
+     "new_tokens": 1,
+     "time_prefill": 2.373966932296753,
+     "time_generate": 0.0348203182220459,
+     "gpu": {
+      "n": 10,
+      "n_busy": 10,
+      "sclk_mhz": {
+       "min": 2654.0,
+       "median": 2805.5,
+       "max": 2863.0
+      },
+      "power_w": {
+       "min": 105.047,
+       "median": 114.062,
+       "max": 116.081
+      }
+     }
+    }
+   ],
+   "cached_seen": 0,
+   "warmup": {
+    "rate": 772.8189665433416,
+    "prompt_tokens": 2048,
+    "new_tokens": 1,
+    "time_prefill": 2.650038480758667,
+    "time_generate": 0.03475451469421387,
+    "gpu": {
+     "n": 11,
+     "n_busy": 11,
+     "sclk_mhz": {
+      "min": 2080.0,
+      "median": 2548.0,
+      "max": 2793.0
+     },
+     "power_w": {
+      "min": 78.008,
+      "median": 102.085,
+      "max": 112.057
+     }
+    }
+   },
+   "sample_text": "orm",
+   "median": 862.6910392633868,
+   "spread": 0.0021371416127900543
+  },
+  {
+   "name": "tg128@d1024",
+   "runs": [
+    {
+     "rate": 28.92186971136522,
+     "prompt_tokens": 1024,
+     "new_tokens": 128,
+     "time_prefill": 1.47481369972229,
+     "time_generate": 4.4257166385650635,
+     "gpu": {
+      "n": 24,
+      "n_busy": 24,
+      "sclk_mhz": {
+       "min": 2625.0,
+       "median": 2883.5,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 73.067,
+       "median": 85.055,
+       "max": 109.016
+      }
+     }
+    },
+    {
+     "rate": 28.958035273434437,
+     "prompt_tokens": 1024,
+     "new_tokens": 128,
+     "time_prefill": 1.4608485698699951,
+     "time_generate": 4.420189380645752,
+     "gpu": {
+      "n": 24,
+      "n_busy": 24,
+      "sclk_mhz": {
+       "min": 2621.0,
+       "median": 2884.0,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 71.044,
+       "median": 84.5505,
+       "max": 107.062
+      }
+     }
+    },
+    {
+     "rate": 28.954313614803493,
+     "prompt_tokens": 1024,
+     "new_tokens": 128,
+     "time_prefill": 1.4687707424163818,
+     "time_generate": 4.420757532119751,
+     "gpu": {
+      "n": 24,
+      "n_busy": 24,
+      "sclk_mhz": {
+       "min": 2573.0,
+       "median": 2881.5,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 70.04,
+       "median": 84.535,
+       "max": 107.084
+      }
+     }
+    }
+   ],
+   "cached_seen": 0,
+   "warmup": {
+    "rate": 28.879561936407192,
+    "prompt_tokens": 1024,
+    "new_tokens": 128,
+    "time_prefill": 1.4736621379852295,
+    "time_generate": 4.432200193405151,
+    "gpu": {
+     "n": 24,
+     "n_busy": 21,
+     "sclk_mhz": {
+      "min": 1870.0,
+      "median": 2817.0,
+      "max": 2893.0
+     },
+     "power_w": {
+      "min": 73.054,
+      "median": 82.049,
+      "max": 96.081
+     }
+    }
+   },
+   "sample_text": "We need answer user's request: \"How to Curse directed by Josie Rourke . How to Curse was performed at Bush Theatre in the London Borough of Hammersmith and Fulham . In a review of the production for The Daily Telegraph , theatre critic Charles Spencer noted , \" Robert Boulter brings a touching vulnerability to the stage as William . \"  ... [long mixed text about Robert Boulter, Du Fu] Summarize the text above in a few paragraphs.\n\nWe need produce final summary in a few paragraphs. Need likely combine topics: first about Robert Boulter? The text starts with How to Curse, Robert Boulter",
+   "median": 28.954313614803493,
+   "spread": 0.0012490561009440712
+  },
+  {
+   "name": "tg128@d2048",
+   "runs": [
+    {
+     "rate": 28.7654794686719,
+     "prompt_tokens": 2048,
+     "new_tokens": 128,
+     "time_prefill": 1.696467638015747,
+     "time_generate": 4.449778079986572,
+     "gpu": {
+      "n": 25,
+      "n_busy": 25,
+      "sclk_mhz": {
+       "min": 2676.0,
+       "median": 2887.0,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 76.063,
+       "median": 86.074,
+       "max": 111.097
+      }
+     }
+    },
+    {
+     "rate": 28.753630590250452,
+     "prompt_tokens": 2048,
+     "new_tokens": 128,
+     "time_prefill": 1.6847398281097412,
+     "time_generate": 4.451611757278442,
+     "gpu": {
+      "n": 25,
+      "n_busy": 25,
+      "sclk_mhz": {
+       "min": 2629.0,
+       "median": 2885.0,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 72.09,
+       "median": 86.059,
+       "max": 110.068
+      }
+     }
+    },
+    {
+     "rate": 28.741679143572547,
+     "prompt_tokens": 2048,
+     "new_tokens": 128,
+     "time_prefill": 1.6826510429382324,
+     "time_generate": 4.453462839126587,
+     "gpu": {
+      "n": 25,
+      "n_busy": 25,
+      "sclk_mhz": {
+       "min": 2605.0,
+       "median": 2884.0,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 72.055,
+       "median": 86.083,
+       "max": 110.083
+      }
+     }
+    }
+   ],
+   "cached_seen": 768,
+   "warmup": {
+    "rate": 28.52204665405622,
+    "prompt_tokens": 2048,
+    "new_tokens": 128,
+    "time_prefill": 1.6845800876617432,
+    "time_generate": 4.4877564907073975,
+    "gpu": {
+     "n": 25,
+     "n_busy": 25,
+     "sclk_mhz": {
+      "min": 2589.0,
+      "median": 2877.0,
+      "max": 2899.0
+     },
+     "power_w": {
+      "min": 71.013,
+      "median": 89.023,
+      "max": 110.071
+     }
+    }
+   },
+   "sample_text": "We need answer user's request: \"How to Curse directed by Josie Rourke . How to Curse was performed at Bush Theatre in the London Borough of Hammersmith and Fulham . In a review ... [mixed text about Robert Boulter and Du Fu] ... Summarize the text above in a few paragraphs.\"\n\nWe need produce final summary in a few paragraphs. Need maybe identify two subjects: Robert Boulter (How to Curse, 2008-2011 works) and Du Fu (Tang poet). The text is odd: starts with How to Curse directed by Josie Rourke, performance",
+   "median": 28.753630590250452,
+   "spread": 0.0008277328674947053
+  }
+ ],
+ "depth_prompt": {
+  "source": "wikitext-2-raw-v1 test (eval/ppl.py get_dataset_text)",
+  "offsets": "1000 + run * 8192 tokens",
+  "instruction": "\n\nSummarize the text above in a few paragraphs.",
+  "sampler": "DefaultSampler seed 1234"
+ },
+ "amd_smi_after": "{\n    \"gpu_data\": [\n        {\n            \"gpu\": 0,\n            \"power\": {\n                \"socket_power\": \"N/A\",\n                \"gfx_voltage\": \"N/A\",\n                \"soc_voltage\": \"N/A\",\n                \"mem_voltage\": \"N/A\",\n                \"throttle_status\": \"N/A\",\n                \"power_management\": \"N/A\"\n            },\n            \"clock\": {\n                \"gfx_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_4\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_5\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_6\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_7\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"mem_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"fclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"socclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                }\n            },\n            \"temperature\": {\n                \"edge\": {\n                    \"value\": 49,\n                    \"unit\": \"C\"\n                },\n                \"hotspot\": \"N/A\",\n                \"mem\": \"N/A\"\n            },\n            \"perf_level\": \"AMDSMI_DEV_PERF_LEVEL_AUTO\"\n        }\n    ]\n}",
+ "complete": true
+}

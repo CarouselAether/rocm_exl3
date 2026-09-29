@@ -1,0 +1,253 @@
+{
+ "time": "2026-09-29T07:09:13",
+ "repo": "/home/carousel/Desktop/exlproject/rocm_exl3",
+ "commit": "822fd46",
+ "branch": "opt/chart-fixes",
+ "dirty": false,
+ "torch": "2.15.0.dev20260926+rocm10.0",
+ "hip_runtime": "7.15.26333",
+ "rocm_pip": "Version: 10.0.0",
+ "device": "AMD Radeon 8060S Graphics",
+ "perf_level": "auto",
+ "cpu_boost": "0",
+ "cpu_max_khz": "3000000",
+ "env": {},
+ "argv": [
+  "bench/run_bench.py",
+  "-m",
+  "/home/carousel/models/Laguna-S-2.1-exl3-4.00bpw",
+  "-cs",
+  "32768",
+  "-dm",
+  "/home/carousel/models/Laguna-S-2.1-DFlash",
+  "-ndt",
+  "3",
+  "--tg",
+  "0",
+  "--tg_depth",
+  "1024",
+  "2048",
+  "--out",
+  "/home/carousel/Desktop/exlproject/rocm_exl3/bench/results/chart_d5daaf8",
+  "--label",
+  "laguna_dflash3"
+ ],
+ "amd_smi_before": "{\n    \"gpu_data\": [\n        {\n            \"gpu\": 0,\n            \"power\": {\n                \"socket_power\": \"N/A\",\n                \"gfx_voltage\": \"N/A\",\n                \"soc_voltage\": \"N/A\",\n                \"mem_voltage\": \"N/A\",\n                \"throttle_status\": \"N/A\",\n                \"power_management\": \"N/A\"\n            },\n            \"clock\": {\n                \"gfx_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_4\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_5\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_6\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_7\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"mem_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"fclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"socclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                }\n            },\n            \"temperature\": {\n                \"edge\": {\n                    \"value\": 45,\n                    \"unit\": \"C\"\n                },\n                \"hotspot\": \"N/A\",\n                \"mem\": \"N/A\"\n            },\n            \"perf_level\": \"AMDSMI_DEV_PERF_LEVEL_AUTO\"\n        }\n    ]\n}",
+ "init_args": [
+  "-m",
+  "/home/carousel/models/Laguna-S-2.1-exl3-4.00bpw",
+  "-cs",
+  "32768",
+  "-dm",
+  "/home/carousel/models/Laguna-S-2.1-DFlash",
+  "-ndt",
+  "3"
+ ],
+ "load_s": 42.743751447997056,
+ "results": [
+  {
+   "name": "tg128@d1024",
+   "runs": [
+    {
+     "rate": 26.572232477511616,
+     "prompt_tokens": 1024,
+     "new_tokens": 128,
+     "time_prefill": 1.452314853668213,
+     "time_generate": 4.817058563232422,
+     "gpu": {
+      "n": 25,
+      "n_busy": 25,
+      "sclk_mhz": {
+       "min": 2721.0,
+       "median": 2887.0,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 103.012,
+       "median": 112.096,
+       "max": 123.06
+      }
+     },
+     "acceptance": 0.28502415458937197
+    },
+    {
+     "rate": 32.4187289563484,
+     "prompt_tokens": 1024,
+     "new_tokens": 128,
+     "time_prefill": 1.4564552307128906,
+     "time_generate": 3.9483349323272705,
+     "gpu": {
+      "n": 22,
+      "n_busy": 22,
+      "sclk_mhz": {
+       "min": 2870.0,
+       "median": 2891.0,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 111.018,
+       "median": 115.04150000000001,
+       "max": 125.098
+      }
+     },
+     "acceptance": 0.4152046783625731
+    },
+    {
+     "rate": 33.56400403440056,
+     "prompt_tokens": 1024,
+     "new_tokens": 128,
+     "time_prefill": 1.452476978302002,
+     "time_generate": 3.8136093616485596,
+     "gpu": {
+      "n": 21,
+      "n_busy": 21,
+      "sclk_mhz": {
+       "min": 2638.0,
+       "median": 2871.0,
+       "max": 2898.0
+      },
+      "power_w": {
+       "min": 100.071,
+       "median": 114.016,
+       "max": 123.058
+      }
+     },
+     "acceptance": 0.44242424242424244
+    }
+   ],
+   "cached_seen": 0,
+   "warmup": {
+    "rate": 26.509461437704402,
+    "prompt_tokens": 1024,
+    "new_tokens": 128,
+    "time_prefill": 1.759294033050537,
+    "time_generate": 4.82846474647522,
+    "gpu": {
+     "n": 25,
+     "n_busy": 21,
+     "sclk_mhz": {
+      "min": 1821.0,
+      "median": 2564.0,
+      "max": 2855.0
+     },
+     "power_w": {
+      "min": 79.045,
+      "median": 105.068,
+      "max": 114.089
+     }
+    },
+    "acceptance": 0.366120218579235
+   },
+   "sample_text": "Okay, let's tackle this summary. First, I need to read through the provided text carefully to understand the main points. The text has two main sections: one about Robert Boulter's career and another about Du Fu, the Chinese poet.\n\nStarting with Robert Boulter: The first part details his acting roles. He played Jason Tyler in a 2006 episode of \"Doctors,\" then William in a 2007 play \"How to Curse\" at the Bush Theatre. A critic praised his performance. In 2008, he was in two films, \"Daylight Robbery\" and",
+   "median": 32.4187289563484,
+   "spread": 0.2156707490384129,
+   "acceptance_median": 0.4152046783625731
+  },
+  {
+   "name": "tg128@d2048",
+   "runs": [
+    {
+     "rate": 30.66072280530945,
+     "prompt_tokens": 2048,
+     "new_tokens": 128,
+     "time_prefill": 1.6793677806854248,
+     "time_generate": 4.174722194671631,
+     "gpu": {
+      "n": 24,
+      "n_busy": 24,
+      "sclk_mhz": {
+       "min": 2751.0,
+       "median": 2881.0,
+       "max": 2899.0
+      },
+      "power_w": {
+       "min": 104.092,
+       "median": 115.038,
+       "max": 127.021
+      }
+     },
+     "acceptance": 0.3898305084745763
+    },
+    {
+     "rate": 28.689479806273262,
+     "prompt_tokens": 2048,
+     "new_tokens": 128,
+     "time_prefill": 1.6708295345306396,
+     "time_generate": 4.461565732955933,
+     "gpu": {
+      "n": 25,
+      "n_busy": 25,
+      "sclk_mhz": {
+       "min": 2538.0,
+       "median": 2873.0,
+       "max": 2895.0
+      },
+      "power_w": {
+       "min": 96.015,
+       "median": 114.029,
+       "max": 125.084
+      }
+     },
+     "acceptance": 0.3439153439153439
+    },
+    {
+     "rate": 32.599510829040334,
+     "prompt_tokens": 2048,
+     "new_tokens": 128,
+     "time_prefill": 1.6848623752593994,
+     "time_generate": 3.9264392852783203,
+     "gpu": {
+      "n": 23,
+      "n_busy": 23,
+      "sclk_mhz": {
+       "min": 2580.0,
+       "median": 2864.0,
+       "max": 2898.0
+      },
+      "power_w": {
+       "min": 98.078,
+       "median": 115.027,
+       "max": 126.081
+      }
+     },
+     "acceptance": 0.42857142857142855
+    }
+   ],
+   "cached_seen": 768,
+   "warmup": {
+    "rate": 28.227156111097674,
+    "prompt_tokens": 2048,
+    "new_tokens": 128,
+    "time_prefill": 1.6738612651824951,
+    "time_generate": 4.534640312194824,
+    "gpu": {
+     "n": 25,
+     "n_busy": 25,
+     "sclk_mhz": {
+      "min": 2846.0,
+      "median": 2888.0,
+      "max": 2899.0
+     },
+     "power_w": {
+      "min": 110.07,
+      "median": 115.06,
+      "max": 128.079
+     }
+    },
+    "acceptance": 0.3333333333333333
+   },
+   "sample_text": "</think>The text begins with a detailed account of Robert Boulter's acting career, highlighting his roles in television and film. He portrayed Jason Tyler in the 2006 episode of \"Doctors,\" starred as William in the 2007 stage production of \"How to Curse\" at the Bush Theatre, and appeared in films like \"Daylight Robbery\" and \"Donkey Punch\" in 2008. Boulter also had recurring television roles, including a guest appearance on \"Waking the Dead\" and a ten-episode arc on \"Casualty\" in 2010, where",
+   "median": 30.66072280530945,
+   "spread": 0.12752572884843993,
+   "acceptance_median": 0.3898305084745763
+  }
+ ],
+ "depth_prompt": {
+  "source": "wikitext-2-raw-v1 test (eval/ppl.py get_dataset_text)",
+  "offsets": "1000 + run * 8192 tokens",
+  "instruction": "\n\nSummarize the text above in a few paragraphs.",
+  "sampler": "greedy"
+ },
+ "amd_smi_after": "{\n    \"gpu_data\": [\n        {\n            \"gpu\": 0,\n            \"power\": {\n                \"socket_power\": \"N/A\",\n                \"gfx_voltage\": \"N/A\",\n                \"soc_voltage\": \"N/A\",\n                \"mem_voltage\": \"N/A\",\n                \"throttle_status\": \"N/A\",\n                \"power_management\": \"N/A\"\n            },\n            \"clock\": {\n                \"gfx_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_4\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_5\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_6\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_7\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"mem_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"fclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"socclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                }\n            },\n            \"temperature\": {\n                \"edge\": {\n                    \"value\": 52,\n                    \"unit\": \"C\"\n                },\n                \"hotspot\": \"N/A\",\n                \"mem\": \"N/A\"\n            },\n            \"perf_level\": \"AMDSMI_DEV_PERF_LEVEL_AUTO\"\n        }\n    ]\n}",
+ "complete": true
+}

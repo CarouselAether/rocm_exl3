@@ -19,7 +19,7 @@ Workloads, all at bsz 1:
   tg<M>@d<N>  with --tg_depth N [N ...]: decode at depth on NATURAL text (random ids ruin
           MTP / DFlash acceptance). Prompt = exactly N tokens: the model's chat template
           (user turn) around a wikitext-2 test slice + a short summarize instruction. Slices
-          are token windows at fixed offsets (run r: offset 1000 + r * 8192 of the whole
+          are token windows at fixed offsets (run r: offset 1000 + r * 8192 + N of the whole
           tokenized split, eval/ppl.py's loader), so models sharing a tokenizer see identical
           text; M = --depth_new new tokens (default 128), no EOS stop. Sampler: greedy in
           spec runs (--mtp / -dm), DefaultSampler with seed 1234 otherwise. Works in both
@@ -224,7 +224,7 @@ def depth_ids(tokenizer, n, r):
     t = tokenizer.encode(DEPTH_INSTR + tail, encode_special_tokens=True)
     k = n - h.shape[-1] - t.shape[-1]
     assert k > 0, f"depth {n} too short for the template ({h.shape[-1]} + {t.shape[-1]} tokens)"
-    off = 1000 + r * 8192
+    off = 1000 + r * 8192 + n   # depth in the offset: no shared prefix (prefix-cache hit) across depths
     w = wiki_ids(tokenizer)[:, off:off + k]
     assert w.shape[-1] == k, "wikitext split too short for this depth / run count"
     ids = torch.cat((h, w, t), dim=-1)
@@ -340,7 +340,7 @@ def main():
 
     rng = torch.Generator().manual_seed(1234)
     info["depth_prompt"] = {"source": "wikitext-2-raw-v1 test (eval/ppl.py get_dataset_text)",
-                            "offsets": "1000 + run * 8192 tokens", "instruction": DEPTH_INSTR,
+                            "offsets": "1000 + run * 8192 + depth tokens", "instruction": DEPTH_INSTR,
                             "sampler": "greedy" if spec else "DefaultSampler seed 1234"}
     if not spec:
         for n in args.pp:

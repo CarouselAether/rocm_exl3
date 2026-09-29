@@ -2724,3 +2724,31 @@ the rerun passed.
   would need an upstream-file edit or a hook on `BCAttn`'s split helper; not done (maintainer call).
 - `test_dflash2.py::test_topk_cuda_matches_torch` failed once in the full pytest run, never alone.
 - MiMo-V2 and Kimi-Linear build but are untested on ROCm (no models).
+
+## GLM-5.3-Flash and MiMo-V2.6-Flash bring-up + public chart (2026-09-29)
+
+**GLM-5.3-Flash 2.05 bpw** (glm5_next: 34 KDA + 11 MLA/DSA layers, kv_lora 512, QK / V head 256,
+288 experts top-8, 1 MTP layer). On perf/stack d5daaf8 it failed at load: `_mla_unfold_kernel`
+(BLOCK_K 128 x D_v 256 W_UV tile + 16-row o_lat tile) needs 69632 B of LDS (81920 B at the 64-row
+prefill tile), and `MLAAttention.autosplit_prepare` does not catch `BCKernelTooLarge` (the forward
+path does). With the unfold fitted, warmup then hit `mla_attn_triton_prefill_mha`'s assert: its
+q-tile loop (128 -> 32) cannot help when the 64 x 256 K and V tiles alone overflow at 2 stages.
+rocm_py `EXL3_ROCM_MLA_LDS_FIT` (default on): BC unfold compile retries at BLOCK_K 64 (memoised),
+eager `mla_unfold` picks BLOCK_K through smem.pick_config, MHA prefill walks (block_n 32, stages 2)
+-> (32, 1) -> (16, 1) around upstream's loop (a failed attempt launched nothing). Upstream bug on any
+64 KB part (Turing too). Result: coherent, PPL 4.405898 (20 x 2048), tg128@d1024 19.97, MTP ndt 2
+25.70 at 64% acceptance. Decode profile (ctx 1024, 16 steps): 51.2 ms/step, 1378 kernels/token; GEMV
+mr_dot + moe_dec_dot ~60%, `_mla_decode_split_kernel` 7.5% (326 us/call, **2420 B scratch**),
+`_mla_absorb_kernel` 4.7% (816 B scratch), KDA (gdn_ba_gemv, recurrent kernel, lowrank) ~11%. The two
+scratch users are the same queue-stall pattern the DS4 DSA split retune removed: first lead.
+
+**MiMo-V2.6-Flash-RL 2.27 bpw** (mimo_v2, GQA 64/4, QK 192 / V 128, SWA 128, 256 experts top-8, 3 MTP
+layers): runs out of the box (asymmetric V path, SWA ring, interm_div layer 47). Coherent, PPL
+5.379511 (20 rows; card: 5.40 @ 64 rows on GB10). First real half-integer model on ROCm: 17664 expert
+tensors at 2.5 bpw. Those layers have no GEMV fast path (RDNA cores decline half K; moe_decode is
+integer-K), so decode takes `exl3_mgemm_kernel` at m = 1: **65% of decode** (653-673 us/call, ~64 GB/s,
+256 VGPR + 60-64 B scratch) vs the 2.0 bpw layers' moe_dec_dot at ~186 GB/s. tg 13.2 t/s (GB10: ~31);
+MTP ndt 2 is a net loss (12.1, 64% acc). A half-K GEMV / moe_decode core at integer-K efficiency
+would save ~20 ms/token (est. ~18-19 t/s). Prefill also slow (pp512 158).
+
+Chart numbers, harness (`--tg_depth`, `-dm`) and caveats: exlproject/CHART.md.
