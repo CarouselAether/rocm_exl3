@@ -98,6 +98,7 @@ class ServerState:
     stop_token_ids: list[int] = []
     has_chat_template: bool = False
     default_template_kwargs: dict = {}
+    ngram_lock: dict | None = None          # -ngl report (exllamav3/rocm_py/ngram_lock.py)
     lock = None  # asyncio.Lock for load-time init
 
 state = ServerState()
@@ -564,6 +565,10 @@ async def props():
         "default_generation_settings": {"n_ctx": state.context_length},
         "stop_token_ids": state.stop_token_ids,
         "default_template_kwargs": state.default_template_kwargs,
+        # n-gram table mode (PLE models): "disk" (default), "ram" (-ngr), "ram_locked" (-ngl)
+        "ngram_table": ("ram_locked" if state.ngram_lock else
+                        "ram" if getattr(state.args, "ngram_ram", False) else "disk"),
+        "ngram_locked_bytes": state.ngram_lock["bytes_locked"] if state.ngram_lock else 0,
     }
 
 
@@ -1000,9 +1005,29 @@ def main(args):
     if args.prefill_chunk_size > args.chunk_size:
         args.chunk_size = args.prefill_chunk_size
 
+    # -ngl: n-gram table in RAM (implies -ngr) and mlock'ed there. Checked before the load
+    # (RLIMIT_MEMLOCK, free RAM) so a refusal is immediate; the lock itself is applied to the
+    # table NGramEmbedding holds after the load -- no second copy (exllamav3/rocm_py/ngram_lock.py)
+    if args.ngram_lock:
+        from exllamav3.rocm_py import ngram_lock
+        args.ngram_ram = True
+        try:
+            need = ngram_lock.preflight(args.model_dir, args.cache_size)
+        except ngram_lock.NGramLockError as e:
+            print(f" !! {e}", flush = True)
+            sys.exit(2)
+        print(f" -- -ngl: n-gram table {need / 2**30:.1f} GiB will be loaded to RAM and locked", flush = True)
+
     # Load model, cache, tokenizer, optional draft model (same as chat.py)
     (state.model, state.config, state.cache, state.tokenizer,
      state.draft_model, _draft_config, state.draft_cache) = model_init.init(args)
+    if args.ngram_lock:
+        try:
+            state.ngram_lock = ngram_lock.lock_model(state.model)
+        except ngram_lock.NGramLockError as e:
+            print(f" !! {e}", flush = True)
+            os._exit(2)          # skip interpreter teardown after a model load (RDNA_NOTES)
+        print(f" -- {ngram_lock.describe(state.ngram_lock)}", flush = True)
     state.context_length = state.cache.max_num_tokens
     if not args.no_warmup:
         warmup(args)
@@ -1073,6 +1098,7 @@ if __name__ == "__main__":
     parser.add_argument("-dryb", "--dry_base", type = float, default = 1.75, help = "DRY base, default = 1.75")
     parser.add_argument("-dryal", "--dry_allowed_length", type = int, default = 2, help = "DRY allowed repeat length, default = 2")
     parser.add_argument("-pcs", "--prefill_chunk_size", type = int, default = 2048, help = "Prompt tokens per prefill forward pass (Generator max_chunk_size), default: 2048. Larger chunks amortize weight streaming on MoE models; -chunk_size is raised to match if smaller")
+    parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "Load the n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) into RAM like -ngr AND lock it there (mlock): its pages are never swapped out or reclaimed. Needs RLIMIT_MEMLOCK >= the table size (ulimit -l / systemd LimitMEMLOCK / CAP_IPC_LOCK); checked before loading, with instructions if too low. Without -ngl/-ngr the table streams from disk")
     parser.add_argument("-nwu", "--no_warmup", action = "store_true", help = "Skip the startup warmup (two short jobs that absorb JIT/graph-capture cost before the first request)")
     parser.add_argument("-dryln", "--dry_penalty_last_n", type = int, default = -1, help = "DRY scan range in tokens, -1 = whole context (default), 0 disables")
     main(parser.parse_args())

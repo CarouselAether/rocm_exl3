@@ -86,6 +86,9 @@ Environment switches (all default to the safe value for this backend):
                            the next site's mix
   EXL3_ROCM_HC_NORM=0      the RMSNorm after each mHC mix runs as its own launch
   EXL3_ROCM_GR_PREFILL=0   GatedResidual (Qwen3.8) prefill gate-mean back on torch ops
+  EXL3_ROCM_ROUTER_STD_MR=0  "std" routing at 2..8 rows back on hgemm (upstream)
+  EXL3_ROCM_BC_BUFOPS=0    graphed GQA decode attention kernels compiled without the
+                           buffer-op / alignment attributes the Triton JIT would add
   (C++ side, same build: EXL3_ROCM_ROUTER_GEMV=0, EXL3_ROCM_ROUTER_FUSE=0,
   EXL3_ROCM_MR_WEIGHTED=0, EXL3_ROCM_HC_DPP=0 -- see RDNA_NOTES "Decode leftovers")
 
@@ -1032,6 +1035,134 @@ def apply() -> list[str]:
             applied.append(f"fused-MoE row cap {_bst2.TEMP_ROWS_FUSED} (pipelined mainloop; EXL3_ROCM_MOE_FUSED_ROWS / EXL3_MOE_FUSED_ROWS)")
     except Exception as e:
         applied.append(f"!! FAILED batch-recon/mtile patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # Graphed GQA decode attention: AMD buffer-op specialization for AOT kernels
+    # ------------------------------------------------------------------
+    # bc_attn._compile_kernel builds the graphed attention kernels ahead of time
+    # from a hand-written signature. The Triton JIT on AMD specializes every tensor
+    # argument whose storage is < 2 GB as tt.pointer_range = 32 (buffer loads with
+    # 32-bit offsets off an SGPR base) and every 16-byte-aligned pointer as
+    # tt.divisibility = 16; the AOT signature carries neither, so the graphed
+    # _paged_attn_decode_split_kernel compiles to 64-bit per-lane address math,
+    # 256 VGPRs + 660 B scratch: 91.5 us per call on Qwen3.8's full-attention
+    # layers at ctx 512 (24 q / 2 kv heads, hd 256), where the JIT-launched same
+    # kernel takes 13.5 us. Adding both attributes: 45 -> 14 us (q_len 1), 73 -> 23 us
+    # (q_len 3, MTP verify) in isolation (RDNA_NOTES "Qwen3.8"). With the attributes
+    # the kernels also compile scratch-free at 8 warps / 1 stage (4 / 2 still
+    # spilled): in-model ctx 512 91.5 -> 31.8 us, QSA sparse at 8K 117 -> 31.9 us,
+    # MTP verify (q_len 3) 163 -> 62 us. EXL3_ROCM_BC_ATTN_WARPS / _STAGES override.
+    # Scope: only the GQA decode split kernels below (paged split + QSA sparse
+    # split), only when this layer's K/V cache storages are < 2 GB (checked in
+    # BCAttn._configure); the pointers declared 16-byte aligned are the slot's
+    # static buffers (q / o / partials from g_tensor_cache, offset 0) and the
+    # per-layer caches. The attributes change addressing only; the warp count
+    # changes the dot layout (see RDNA_NOTES for the bitwise result). DS4's DSA /
+    # MLA kernels are not in the list.
+    # EXL3_ROCM_BC_BUFOPS=0 restores the plain AOT signature.
+    if _env_on("EXL3_ROCM_BC_BUFOPS", True):
+        try:
+            import torch
+            from ..modules.attention_fn import bc_attn as _bca
+            from ..ext import exllamav3_ext as _ext
+            _prev_ck = _bca._compile_kernel
+            _BUFOPS_ALIGNED = {
+                "_paged_attn_decode_split_kernel":
+                    ("q", "k_cache", "v_cache", "out", "partial_o", "partial_ml"),
+                "_qsa_sparse_split_kernel":
+                    ("q", "k_cache", "v_cache", "partial_o", "partial_ml"),
+            }
+            _bufops_state = {"ok": False}
+            _bufops_cache = {}
+
+            def _compile_kernel_bufops(device, fn, signature, constexprs, num_warps, num_stages):
+                name = getattr(fn, "__name__", None)
+                if name not in _BUFOPS_ALIGNED or not _bufops_state["ok"]:
+                    return _prev_ck(device, fn, signature, constexprs, num_warps, num_stages)
+                # 8 warps / 1 stage: 0 scratch for both kernels (4 / 2 kept 276-524 B);
+                # in-model sweep 4/2, 8/2, 8/1, 16/1, 4/1, 2/2 in RDNA_NOTES
+                num_warps = int(os.environ.get("EXL3_ROCM_BC_ATTN_WARPS", 8))
+                num_stages = int(os.environ.get("EXL3_ROCM_BC_ATTN_STAGES", 1))
+                key = (device.index, name, tuple(sorted(constexprs.items())), num_warps,
+                       num_stages, tuple(sorted(signature.items())))
+                k = _bufops_cache.get(key)
+                if k is None:
+                    import triton
+                    from triton.compiler import ASTSource
+                    attrs, sig = {}, {}
+                    for n, ty in signature.items():
+                        t = ty[:-3] if isinstance(ty, str) and ty.endswith(":16") else ty
+                        sig[n] = t
+                        a = []
+                        if t != ty or n in _BUFOPS_ALIGNED[name]:
+                            a.append(["tt.divisibility", 16])
+                        if isinstance(t, str) and t.startswith("*"):
+                            a.append(["tt.pointer_range", 32])
+                        if a:
+                            attrs[(fn.arg_names.index(n),)] = a
+                    with torch.cuda.device(device):
+                        src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
+                        ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
+                        k = _ext.TritonKernel(ck.asm["cubin"], ck.metadata.name,
+                                              ck.metadata.num_warps, ck.metadata.shared)
+                    _bufops_cache[key] = k
+                return k
+
+            _orig_bca_configure = _bca.BCAttn._configure
+
+            def _bca_configure_rdna(self, *a, **kw):
+                lim = 2**31 - 1
+                ts = [t for t in (self.cache_k, self.cache_v, getattr(self, "k_scales", None),
+                                  getattr(self, "v_scales", None)) if isinstance(t, torch.Tensor)]
+                _bufops_state["ok"] = all(t.untyped_storage().nbytes() <= lim for t in ts)
+                try:
+                    return _orig_bca_configure(self, *a, **kw)
+                finally:
+                    _bufops_state["ok"] = False
+
+            _bca._compile_kernel = _compile_kernel_bufops
+            _bca.BCAttn._configure = _bca_configure_rdna
+            applied.append("graphed GQA decode attention: buffer-op / alignment specialization (EXL3_ROCM_BC_BUFOPS)")
+        except Exception as e:
+            applied.append(f"!! FAILED BC bufops patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # "std" softmax routing (Qwen3.8 and kin) at 2..8 rows: the multi-row router GEMV
+    # ------------------------------------------------------------------
+    # routing_std passes the transposed gate only at bsz 1, so 2..8-row calls (MTP
+    # verify, small batches) send the router to hgemm: on Qwen3.8's (E = 512, k = 2560)
+    # gate a hipBLAS 128x128 tile per call, 105 us for 2.6 MB (48 calls per MTP step,
+    # 5.0 of 58.7 ms busy). rocm/routing_rdna.hip already has the m = 2..8 router GEMV
+    # (DS4's routing_ds3 path, RDNA_NOTES "Decode leftovers") -- it just needs gate_t.
+    # Each row is the m == 1 kernel's chain, so verify-row router logits become
+    # bit-identical to plain decode's (they were hgemm's reduction). Top-k and the
+    # weights are the same routing_std_topk kernel. DS4 (routing_ds3) is untouched.
+    # EXL3_ROCM_ROUTER_STD_MR=0 restores upstream (hgemm at bsz > 1).
+    if _env_on("EXL3_ROCM_ROUTER_STD_MR", True):
+        try:
+            import torch
+            from ..modules import block_sparse_mlp_routing as _bsr
+            from ..modules import block_sparse_mlp as _bsm
+            from ..ext import exllamav3_ext as _ext
+            _orig_routing_std = _bsr.routing_std
+
+            def _routing_std_rdna(bsz, cfg, y, params):
+                if 2 <= bsz <= 8 and not params.get("activate_all_experts") \
+                        and y.dtype == torch.half and y.is_contiguous() and y.shape[-1] % 2 == 0:
+                    if cfg.gate_tensor_t is None:
+                        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+                    router_logits, selected_experts, routing_weights = \
+                        _bsr._routing_buffers(cfg, bsz, y.device)
+                    _ext.routing_std(y, cfg.gate_tensor, router_logits, selected_experts,
+                                     routing_weights, cfg.per_expert_scale, cfg.gate_tensor_t, None)
+                    return selected_experts, routing_weights
+                return _orig_routing_std(bsz, cfg, y, params)
+
+            _bsr.routing_std = _routing_std_rdna
+            _bsm.routing_std = _routing_std_rdna
+            applied.append("std routing at 2..8 rows on the multi-row router GEMV (EXL3_ROCM_ROUTER_STD_MR)")
+        except Exception as e:
+            applied.append(f"!! FAILED std routing multi-row patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # GatedResidual (Qwen3.8) prefill mix: gate-mean in one kernel

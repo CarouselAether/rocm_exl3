@@ -57,6 +57,11 @@ ap.add_argument("--regen", type=int, nargs="*", default=[],
                 help="regeneration workloads: prompt lengths; each run primes a prompt, then re-sends it and times\n                the cached-prefix + tail prefill (latency ms), which is what a user feels on regenerate")
 ap.add_argument("--label", default="")
 ap.add_argument("--out", default=os.path.join(HERE, "results"))
+ap.add_argument("--ngram_lock", action="store_true",
+                help="as the server's -ngl: n-gram table in RAM (-ngr) and mlock'ed (exllamav3/rocm_py/ngram_lock.py)")
+ap.add_argument("--ngram_lock_max_gb", type=float, default=None,
+                help="test hook: lock only the first N GiB of the table (skips the preflight), for boxes whose "
+                     "RLIMIT_MEMLOCK cannot cover the whole table")
 ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra model_init args, e.g. --extra -cq 8")
 args = ap.parse_args()
 
@@ -231,6 +236,12 @@ def main():
     model_init.add_args(parser, cache=True, add_sampling_args=False, add_draft_model_args=True,
                         default_autosplit_max_batch_size=4)   # server.py's defaults
     iargs = parser.parse_args(ia)
+    lock_mod = None
+    if args.ngram_lock:
+        from exllamav3.rocm_py import ngram_lock as lock_mod
+        iargs.ngram_ram = True
+        if args.ngram_lock_max_gb is None:
+            lock_mod.preflight(args.model_dir, args.cache_size)
 
     info = env_info(args.repo)
     info["amd_smi_before"] = sh("amd-smi metric -c -p -t -l --json")
@@ -241,6 +252,10 @@ def main():
     t0 = time.perf_counter()
     model, config, cache, tokenizer, draft_model, _dc, draft_cache = model_init.init(iargs)
     info["load_s"] = time.perf_counter() - t0
+    if lock_mod is not None:
+        mx = None if args.ngram_lock_max_gb is None else int(args.ngram_lock_max_gb * 2**30)
+        info["ngram_lock"] = lock_mod.lock_model(model, max_bytes=mx)
+        print(f" -- {lock_mod.describe(info['ngram_lock'])}", flush=True)
     gen = Generator(model=model, cache=cache, tokenizer=tokenizer, draft_model=draft_model,
                     draft_cache=draft_cache, num_draft_tokens=iargs.num_draft_tokens,
                     **({"max_chunk_size": args.gen_chunk} if args.gen_chunk else {}))

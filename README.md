@@ -165,7 +165,34 @@ Every flag has a short and a long form; the short form is shown. Run `server.py 
 | `-mcl N` | run the routed experts of the first N block-sparse MoE layers on the CPU, weights in system RAM |
 | `-mcs N` | per-layer split: run the tail N routed experts of every eligible MoE layer on the CPU, overlapped with the GPU experts; dynamic hot/cold placement is on (`EXL3_MOE_CPU_SWAP=0` for static). Mutually exclusive with `-mcl` |
 | `-mct N` | worker threads for the two above (default `EXL3_MOE_CPU_THREADS`, else half the cores) |
-| `-ngr` | load a PLE model's n-gram embedding table fully into RAM (tens of GB) instead of streaming rows from disk per forward, e.g. Qwen3.8-Flash-Next |
+| `-ngr` | load a PLE model's n-gram embedding table fully into RAM (tens of GB) instead of streaming rows from disk per forward, e.g. Qwen3.8-Flash-Next. See "N-gram table: three modes" below |
+| `-ngl` | (server only) like `-ngr`, then lock the table's pages in RAM (`mlock`) so they are never swapped out or reclaimed. Needs `RLIMIT_MEMLOCK` >= the table size; see below |
+
+**N-gram table: three modes** (PLE models such as Qwen3.8-Flash-Next, whose table is ~36 GiB)
+
+| mode | flag | where the table lives | when to use it |
+|---|---|---|---|
+| disk streaming | *(default)* | stays on disk; each forward reads only the rows it needs (the page cache keeps hot rows) | the default; costs no RAM up front. On a quiet 128 GB box it measured the same speed as `-ngr` (Qwen3.8 tg128 26.7 vs 26.6 t/s, pp and regeneration within noise) because the page cache holds the hot rows |
+| RAM | `-ngr` | loaded whole into ordinary process memory | no disk reads at all. The pages are ordinary anonymous memory: with swap on, the kernel may swap parts of the table out under pressure, and a swapped row then costs a page-in inside a forward |
+| locked RAM | `-ngl` | loaded like `-ngr` (the same single copy), then `mlock`ed | guarantees the table stays resident: it is never swapped or reclaimed. Only the server has this flag |
+
+`-ngl` checks two things **before** it loads anything, so a refusal takes seconds:
+- **Lock limit.** The process's `RLIMIT_MEMLOCK` must cover the table (or the process needs `CAP_IPC_LOCK`). An
+  unprivileged process raises its soft limit to the hard limit on its own. If the hard limit is too low, the server
+  exits and prints how to raise it: `ulimit -l unlimited` in the launching shell (the hard limit comes from
+  `/etc/security/limits.conf`, e.g. `<user> - memlock unlimited`, then log in again); `LimitMEMLOCK=infinity` for a
+  systemd service (`DefaultLimitMEMLOCK=` for user sessions); `prlimit --pid <pid> --memlock=unlimited:unlimited` as
+  root; or `setcap cap_ipc_lock+ep` on the interpreter.
+- **Memory budget.** Model weights + table + KV-cache estimate + headroom must fit in `MemAvailable`. The headroom is
+  8 GiB by default (`EXL3_NGRAM_LOCK_HEADROOM_GB`). On Strix Halo the weights are system RAM too. A locked table can
+  never be reclaimed, so an over-committed box would end in the OOM killer; the server refuses instead. After the
+  load it checks the headroom once more, then locks.
+
+The lock goes onto the tensor the loader already holds, so there is no second copy. The server log prints
+`n-gram table locked in RAM: 36.4 GiB ...; VmLck ...`, and `GET /props` reports `ngram_table`
+(`disk` / `ram` / `ram_locked`) and `ngram_locked_bytes`. To verify from outside, check `VmLck` in
+`/proc/<server pid>/status`. Locking does not change speed: the table is read the same way in both RAM modes.
+Implementation: `exllamav3/rocm_py/ngram_lock.py`.
 
 **KV cache**
 

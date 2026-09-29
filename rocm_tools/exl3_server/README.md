@@ -58,6 +58,34 @@ Server flags:
 | `-lw` / `-lmr` | loop-detection stop (off by default) |
 | `-pcs N` | prefill chunk size (Generator `max_chunk_size`, default 2048) |
 | `-nwu` | skip the startup warmup |
+| `-ngl` | n-gram table (PLE models, e.g. Qwen3.8-Flash-Next) in RAM like `-ngr`, **and locked** there (`mlock`): never swapped out or reclaimed |
+
+### N-gram table: disk, RAM or locked RAM
+
+PLE models (Qwen3.8-Flash-Next) carry a ~36 GiB hashed n-gram embedding table. You choose where it lives:
+
+- **default: streamed from disk.** Each forward reads only the rows it needs; hot rows stay in the page cache.
+  Uses no RAM up front. On a quiet 128 GB box it measured the same speed as `-ngr`.
+- **`-ngr`: in RAM.** The table is loaded into ordinary process memory, so there are no disk reads. With swap on, the
+  kernel may still swap parts of it out under memory pressure.
+- **`-ngl`: in RAM, locked.** The table is loaded as with `-ngr` (one copy), then `mlock`ed, so it cannot be swapped
+  out or reclaimed while the server runs.
+
+`-ngl` needs a locked-memory limit (`RLIMIT_MEMLOCK`) at least as large as the table. Check it with `ulimit -l`
+(the value is in KiB; `unlimited` is fine). If it is too low, the server stops **before** loading the model and
+prints how to raise it:
+
+```sh
+ulimit -l unlimited && python rocm_tools/exl3_server/server.py -m ~/models/Qwen3.8-Flash-Next-... -cs 65536 -ngl
+# the hard limit must allow it: /etc/security/limits.conf ->   <user>  -  memlock  unlimited   (log in again)
+# systemd service:            LimitMEMLOCK=infinity
+# or, as root:                prlimit --pid <pid> --memlock=unlimited:unlimited
+```
+
+It also refuses when model weights + table + KV cache + 8 GiB headroom (`EXL3_NGRAM_LOCK_HEADROOM_GB`) do not fit
+in available RAM, because a locked table can never be given back. When the lock succeeds, the log shows
+`n-gram table locked in RAM: 36.4 GiB ... VmLck ...`, `/props` shows `"ngram_table": "ram_locked"`, and
+`grep VmLck /proc/<pid>/status` shows the locked amount.
 
 ## Endpoints
 
