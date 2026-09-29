@@ -249,7 +249,7 @@ Keep the penalty range bounded: unbounded frequency/presence penalties over a lo
 | `-ctk JSON` | default chat-template kwargs, e.g. `'{"enable_thinking": false}'` |
 | `-lw N`, `-lmr N` | loop detection: stop after a window of N tokens repeats `-lmr` times (default 3); `-lw 0` disables |
 | `-pcs N` | prompt tokens per prefill forward (Generator chunk size), default 2048. On MoE models every forward streams the whole expert set, so larger chunks prefill faster (DS4 pp2048: 137 / 163 / 181 t/s at 512 / 1024 / 2048). `-chunk_size` only sizes load-time buffers and is raised to match |
-| `-nwu` | skip the startup warmup (two short jobs that absorb Triton JIT / graph capture before the first request; without it the first requests decode at a fraction of the steady rate) |
+| `-nwu` (alias of model_init's `-nw`) | skip the startup warmups: v1.5.3 `model.warmup()` (post-load forward passes) and the server's own two short jobs that absorb Triton JIT / graph capture before the first request; without it the first requests decode at a fraction of the steady rate) |
 
 ---
 <p align="center">

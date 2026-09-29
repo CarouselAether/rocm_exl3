@@ -1,0 +1,13 @@
+ -- thermal_guard: kill at Tctl >= 99.5 C, log /home/carousel/Desktop/exlproject/logs/thermal/20260929-015648.csv
+ -- Loading /home/carousel/models/gemma-4-31b-it-exl3
+
+ -- Warming up...
+
+ -- Loading tokenizer...
+ -- Model: /home/carousel/models/gemma-4-31b-it-exl3
+ -- Bitrate: 6.00 bpw / 6.00 bpw (head)
+
+
+ -- Evaluated: 100 rows of 2069 tokens
+ -- Perplexity: 18.633857
+ -- thermal_guard: peak Tctl 95.0 C, rc 0

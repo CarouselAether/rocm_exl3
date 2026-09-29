@@ -57,7 +57,7 @@ Server flags:
 | `-ctk` | default chat-template kwargs as JSON, e.g. `'{"enable_thinking": false}'` |
 | `-lw` / `-lmr` | loop-detection stop (off by default) |
 | `-pcs N` | prefill chunk size (Generator `max_chunk_size`, default 2048) |
-| `-nwu` | skip the startup warmup |
+| `-nwu` (alias of model_init's `-nw`) | skip the startup warmups (v1.5.3 `model.warmup()` and the server's two-job Generator warmup) |
 | `-ngl` | n-gram table (PLE models, e.g. Qwen3.8-Flash-Next) in RAM like `-ngr`, **and locked** there (`mlock`): never swapped out or reclaimed |
 
 ### N-gram table: disk, RAM or locked RAM
