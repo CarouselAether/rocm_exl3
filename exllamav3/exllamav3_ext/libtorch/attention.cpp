@@ -19,6 +19,7 @@ BC_Attention::BC_Attention
     int _num_q_heads,
     int _num_kv_heads,
     int _head_dim,
+    int _v_head_dim,
     int _hidden_size,
     int _hidden_size_padded,
     int _page_size,
@@ -28,7 +29,7 @@ BC_Attention::BC_Attention
     c10::optional<at::Tensor> _kv_ptrs_trellis,
     c10::optional<at::Tensor> _kv_ptrs_suh,
     c10::optional<at::Tensor> _kv_ptrs_svh,
-    int _kv_K,
+    float _kv_K,
     bool _kv_mcg,
     bool _kv_mul1,
     std::shared_ptr<BC_LinearEXL3> _o_proj,
@@ -40,14 +41,14 @@ BC_Attention::BC_Attention
     c10::optional<at::Tensor> _qg_ptrs_trellis,
     c10::optional<at::Tensor> _qg_ptrs_suh,
     c10::optional<at::Tensor> _qg_ptrs_svh,
-    int _qg_K,
+    float _qg_K,
     bool _qg_mcg,
     bool _qg_mul1,
     c10::optional<at::Tensor> _qkv_ptrs_trellis,
     c10::optional<at::Tensor> _qkv_ptrs_suh,
     c10::optional<at::Tensor> _qkv_ptrs_svh,
     c10::optional<at::Tensor> _qkv_meta,
-    int _qkv_K,
+    float _qkv_K,
     bool _qkv_mcg,
     bool _qkv_mul1,
     c10::optional<at::Tensor> _q_norm,
@@ -77,6 +78,7 @@ BC_Attention::BC_Attention
     num_q_heads         (_num_q_heads),
     num_kv_heads        (_num_kv_heads),
     head_dim            (_head_dim),
+    v_head_dim          (_v_head_dim),
     hidden_size         (_hidden_size),
     hidden_size_padded  (_hidden_size_padded),
     page_size           (_page_size),
@@ -257,8 +259,11 @@ void BC_Attention::configure_slot
     s.q4 = s.q.view({bsz, q_len, num_q_heads, head_dim});
     s.k4 = s.kv.select(0, 0).view({bsz, q_len, num_kv_heads, head_dim});
     s.v4 = s.kv.select(0, 1).view({bsz, q_len, num_kv_heads, head_dim});
-    s.o2 = s.o.view({R, num_q_heads * head_dim});
-    s.o4 = s.o.view({bsz, q_len, num_q_heads, head_dim});
+    // The combine kernel writes v_head_dim lanes per head, so o is already the o_proj input
+    // layout (the gate stages assume the full head width and are declined python-side)
+    TORCH_CHECK(v_head_dim == head_dim || gate_mode == 0, "BC_Attention: gates require v_head_dim == head_dim");
+    s.o2 = s.o.view({R, num_q_heads * v_head_dim});
+    s.o4 = s.o.view({bsz, q_len, num_q_heads, v_head_dim});
 
     int n_q = num_q_heads * head_dim;
     if (gate_mode == 1)
@@ -385,11 +390,12 @@ void BC_Attention::configure_slot_qsa
 
 // Live split configuration from the current block-table bound (same formula as the python
 // dispatch path, so the two produce identical numerics)
+#define SPLIT_MIN_BLOCKS 1   // key blocks per split (was 4): short contexts get more CTAs
 static inline void split_config(int bt_width, int page_size, int q_len, int block_n, int splits_cap,
                                 int* num_splits, int* split_len)
 {
     int bound = bt_width * page_size + q_len;
-    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, 4 * block_n)));
+    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, SPLIT_MIN_BLOCKS * block_n)));
     *split_len = CEIL_DIVIDE(CEIL_DIVIDE(bound, *num_splits), block_n) * block_n;
 }
 
@@ -746,7 +752,7 @@ void BC_Attention::run_gr
                 (void*) (intptr_t) s.qsa_splits,
                 (void*) s.q.data_ptr(),  // sinks: dead arg, HAS_SINKS = false
             };
-            s.k_qsa_combine->launch(s.qsa_programs, 1, 1, args, stream);
+            s.k_qsa_combine->launch(s.qsa_programs, s.k_qsa_combine->grid_y, 1, args, stream);
         }
     }
     else
@@ -802,7 +808,7 @@ void BC_Attention::run_gr
             // HAS_SINKS), dead arg otherwise
             sinks ? (void*) sinks.value().data_ptr() : (void*) s.q.data_ptr(),
         };
-        s.k_combine->launch(s.programs, 1, 1, args, stream);
+        s.k_combine->launch(s.programs, s.k_combine->grid_y, 1, args, stream);
         if (graph)
         {
             graph->record_param(s.k_combine->handle(), GP_attn_num_splits, 4, 4);
@@ -831,7 +837,7 @@ void BC_Attention::run_gr
     at::Tensor c2 = y2;
     if (hs != hidden_size)
         c2 = s.yp.narrow(0, 0, R);
-    at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * head_dim).view({R, num_q_heads * head_dim});
+    at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * v_head_dim).view({R, num_q_heads * v_head_dim});
     exl3_gemm_gr(s.o2, o_proj->trellis, c2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
         add_gr(c2, o_proj->bias.value(), c2, graph);

@@ -252,10 +252,12 @@ class SlidingAttention(Module):
         num_q_heads: int,
         num_kv_heads: int,
         rope_settings: RopeSettings | None,
+        v_head_dim: int | None = None,
         sm_scale: float | None = None,
         key_q: str | None = None,
         key_k: str | None = None,
         key_v: str | None = None,
+        key_fused_qkv: str | None = None,
         key_o: str | None = None,
         key_g: str | None = None,
         key_sinks: str | None = None,
@@ -274,7 +276,9 @@ class SlidingAttention(Module):
         g_proj: Linear | Module | None = None,
         full_gate: bool = False,
         gate_softplus: bool = False,
+        transpose_qkv: bool = True,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits",
     ):
         super().__init__(config, key, None)
         assert sliding_window > 0
@@ -285,6 +289,12 @@ class SlidingAttention(Module):
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.head_dim = head_dim
+        # Asymmetric V head dim (MiMo-V2: QK 192, V 128), mirroring Attention. The window ring,
+        # the paged-attention kernels and the block tables all carry a single head dim, so V is
+        # stored at head_dim with its top head_dim - v_head_dim lanes zero-filled by the loader
+        # and trimmed back off in project_o, which keeps o_proj sized on v_head_dim.
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.v_head_dim <= head_dim, "SlidingAttention: v_head_dim > head_dim is not supported"
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.gqa = (num_q_heads != num_kv_heads)
@@ -332,13 +342,21 @@ class SlidingAttention(Module):
             return
 
         # Create q, k, v projections
-        fkey, frange_q, frange_k, frange_v = None, None, None, None
+        if key_fused_qkv:
+            assert not (q_proj is not None or k_proj is not None or v_proj is not None), \
+                "SlidingAttention: fused QKV tensor is not supported with pre-made projections"
+            fkey = f"{key}.{key_fused_qkv}"
+            frange_q = (0, num_q_heads * head_dim)
+            frange_k = (frange_q[1], frange_q[1] + num_kv_heads * head_dim)
+            frange_v = (frange_k[1], frange_k[1] + num_kv_heads * head_dim)
+        else:
+            fkey, frange_q, frange_k, frange_v = None, None, None, None
 
         if key_q or frange_q:
             f = 1
             self.q_proj = Linear(
                 config,
-                f"{key}.{key_q}",
+                f"{key}.{key_q}" if key_q else f"{key}.q_proj",
                 hidden_size,
                 num_q_heads * head_dim * f,
                 qmap = qmap + ".input" if qmap is not None else None,
@@ -346,7 +364,9 @@ class SlidingAttention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -357,7 +377,7 @@ class SlidingAttention(Module):
         if key_k or frange_k:
             self.k_proj = Linear(
                 config,
-                f"{key}.{key_k}",
+                f"{key}.{key_k}" if key_k else f"{key}.k_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -365,11 +385,13 @@ class SlidingAttention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.v_proj = Linear(
                 config,
-                f"{key}.{key_v}",
+                f"{key}.{key_v}" if key_v else f"{key}.v_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -377,7 +399,9 @@ class SlidingAttention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
                 trim_padded_out = True,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -393,7 +417,7 @@ class SlidingAttention(Module):
             self.o_proj = Linear(
                 config,
                 f"{key}.{key_o}",
-                num_q_heads * head_dim,
+                num_q_heads * self.v_head_dim,
                 hidden_size,
                 qmap =  qmap + ".o" if qmap is not None else None,
                 out_dtype = out_dtype,
@@ -649,7 +673,7 @@ class SlidingAttention(Module):
         if self.num_kv_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(x, False)
+                self.tp_collect(params["backend"], x, False)
         else:
             bsz, seqlen, _ = x.shape
             attn_mode = params.get("attn_mode", "flash_attn_nc")
@@ -661,7 +685,7 @@ class SlidingAttention(Module):
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
             if self.tp_reduce:
-                params["backend"].all_reduce(x)
+                self.tp_collect(params["backend"], x)
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -808,7 +832,12 @@ class SlidingAttention(Module):
 
 
     def project_o(self, o: torch.Tensor, bsz: int, seqlen: int, params: dict) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
+        if self.v_head_dim != self.head_dim:
+            # Drop the zero lanes V was padded into so o_proj sees num_q_heads * v_head_dim
+            o = o.view(bsz, seqlen, self.num_q_heads, self.head_dim)[..., : self.v_head_dim]
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.v_head_dim).contiguous()
+        else:
+            o = o.reshape(bsz, seqlen, self.num_q_heads * self.head_dim)
         x = self.o_proj.forward(o, params)
         return x
 
@@ -1113,7 +1142,9 @@ class SlidingAttention(Module):
         )
         channel_width = 1
         channels_to_split = self.num_kv_heads
-        while channel_width * self.head_dim < 128:
+        # EXL3 tensors split on 128-channel boundaries: widen the unit to as many K/V heads as
+        # it takes for the K/V slice width to be a multiple of 128 (e.g. head_dim 192 -> pairs)
+        while (channel_width * self.head_dim) % 128 != 0:
             assert channels_to_split % 2 == 0, \
                 "Model's K/V heads cannot divide into 128-channel tensors"
             channel_width *= 2
@@ -1151,6 +1182,7 @@ class SlidingAttention(Module):
                 "layer_idx": self.layer_idx,
                 "hidden_size": self.hidden_size,
                 "head_dim": self.head_dim,
+                "v_head_dim": self.v_head_dim,
                 "rope_settings": self.rope_settings,
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,
@@ -1197,7 +1229,8 @@ class SlidingAttention(Module):
             if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \
             if num_kv_heads else None
-        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+        v_head_dim = exported["kwargs"].get("v_head_dim") or head_dim
+        o_split = (False, first * v_head_dim * n_gqa, last * v_head_dim * n_gqa) \
             if num_kv_heads else None
         # Full gate spans head_dim channels per q head, headwise gate is one channel per q head
         if full_gate:
@@ -1252,6 +1285,7 @@ class SlidingAttention(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
 
         module.load_local(device)
         torch.cuda.synchronize()

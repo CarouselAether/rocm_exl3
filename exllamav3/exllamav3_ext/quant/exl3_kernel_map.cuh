@@ -2,10 +2,16 @@
 
 int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int bits, bool multi);
 int exl3_gemm_num_kernel_shapes();
-bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits);
+bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, int bits, bool half_k = false);
+// Dynamic shared memory (bytes) a (shape, bitrate) instantiation requests at launch
+int exl3_gemm_shape_smem(int shape_idx, int bits, bool half_k);
+// Throws if the shape does not fit the current device; for paths that bypass shape_compat
+void exl3_gemm_check_smem(int shape_idx, int bits, bool half_k, const char* who);
 
+// bits: integer part of the bitrate; half: bitrate is bits + 0.5 (mul1 codebook only, 16 * bits + 8 uint16 per tile)
 #define EXL3_GEMM_T_ARGS \
     const int bits, \
+    const bool half_k, \
     const bool c_fp32, \
     const int cb, \
     const int TILESIZE_M, \
@@ -67,19 +73,96 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 // Shape 1 not currently used anywhere
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
+    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
+    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
+    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+
+// Half-integer bitrates (bits + 0.5), mul1 codebook, single GEMM only (no mgemm bundles yet)
+#define EXL3_GEMM_KERNEL_INSTANCES_H(_bits, _c_fp32) \
+    nullptr, \
+    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_1>, \
+    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_2>, \
+    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_3>, \
+    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>
+
+#define EXL3_MGEMM_KERNEL_INSTANCES_H(_bits, _c_fp32) \
+    nullptr, \
+    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_1>, \
+    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_2>, \
+    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_3>, \
+    exl3_mgemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>
+
+#define EXL3_KERNEL_INSTANCES_H(K) \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_h##K[] = { EXL3_GEMM_KERNEL_INSTANCES_H(K, true) }; \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_h##K[] = { EXL3_GEMM_KERNEL_INSTANCES_H(K, false) }; \
+    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_h##K[] = { EXL3_MGEMM_KERNEL_INSTANCES_H(K, true) }; \
+    fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_h##K[] = { EXL3_MGEMM_KERNEL_INSTANCES_H(K, false) };
+
+#define EXL3_KERNEL_EXTERNS_H(K) \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_h##K[]; \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_h##K[]; \
+    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_h##K[]; \
+    extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_h##K[];
 
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
+    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
+    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
+    exl3_mgemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
 
 #define EXL3_GEMM_BASE_THREADS 256
+
+// Dynamic shared memory a (shape, bitrate) instantiation stages, as laid out by
+// exl3_gemm_kernel_inner: SH_STAGES deep double-buffered A and B tiles, then the fp32 sh_c
+// region. Single definition, used both by that kernel's static_assert and by the host-side
+// shape filter, so the two cannot disagree about what a shape costs.
+//
+// shmem_out_had is the GEMM's sh_c variant (it stages a full output tile for the fused output
+// Hadamard); the MoE kernel passes false and only needs the reduction scratch.
+// Parameters are ordered to match the EXL3_GEMM_SHAPE_n expansion (TILESIZE_M, TILESIZE_K,
+// TILESIZE_N, SH_STAGES, FRAG_STAGES) so the macro can be splatted in directly; frag_stages
+// is a register-pipelining depth and does not affect shared memory. half_k adds the extra
+// 8 uint16 per tile of a half-integer bitrate (mul1 codebook).
+__host__ __device__ constexpr int exl3_gemm_smem_bytes(
+    int tilesize_m, int tilesize_k, int tilesize_n, int sh_stages, int frag_stages,
+    int bits, bool half_k, bool shmem_out_had)
+{
+    (void) frag_stages;
+    int tileblocks_m = tilesize_m / 16;
+    int tileblocks_k = tilesize_k / 16;
+    int tileblocks_n = tilesize_n / 16;
+    int frags_n_per_warp = 2 * tileblocks_n / (EXL3_GEMM_BASE_THREADS / 32);
+    int tile_u16 = 16 * bits + (half_k ? 8 : 0);
+
+    int sh_a_stage_size = tilesize_m * tilesize_k;                             // halfs
+    int sh_b_stage_size = tileblocks_k * tileblocks_n * tile_u16;              // uint16s
+    int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp * tileblocks_m;   // floats
+    int sh_c_had = shmem_out_had ? tilesize_n * tilesize_m : 0;
+    if (sh_c_had > sh_c_size) sh_c_size = sh_c_had;
+
+    return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;
+}
+
+// Same, addressed by shape index: expands the EXL3_GEMM_SHAPE_n macro so the tile dims and
+// stage count come from the one place they are declared, rather than a parallel table that
+// has to be updated by hand whenever a shape changes.
+#define EXL3_GEMM_SMEM_FOR_SHAPE(_shape, _bits, _half, _had) \
+    exl3_gemm_smem_bytes(_shape, _bits, _half, _had)
+
+__host__ __device__ constexpr int exl3_gemm_smem_bytes_for_shape(
+    int shape_idx, int bits, bool half_k, bool shmem_out_had)
+{
+    switch (shape_idx)
+    {
+        case 1: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_1, bits, half_k, shmem_out_had);
+        case 2: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_2, bits, half_k, shmem_out_had);
+        case 3: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_3, bits, half_k, shmem_out_had);
+        case 4: return EXL3_GEMM_SMEM_FOR_SHAPE(EXL3_GEMM_SHAPE_4, bits, half_k, shmem_out_had);
+        default: return 0;
+    }
+}
 
 // Instance arrays are indexed by shape and defined per (K, cb) so each codebook compiles as a separate
 // translation unit (see comp_units/exl3_comp_unit_K_cbX.cu)
@@ -124,7 +207,8 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int* out_block_dim,
     int* out_shape_idx,
     int* out_num_sms,
-    const int cb
+    const int cb,
+    const bool half_k = false
 );
 
 fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
@@ -141,8 +225,9 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     int* out_num_sms,
     const int cb,
     const int bszm_in,
-    const int bszm_out
+    const int bszm_out,
+    const bool half_k = false
 );
 
-fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb);
-fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb);
+fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k = false);
+fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k = false);

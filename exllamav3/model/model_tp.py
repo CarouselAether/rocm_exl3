@@ -347,13 +347,15 @@ class Model_TPMixin:
         return r
 
 
-    def tp_dispatch_lm_head_argmax(self, args):
+    def tp_dispatch_lm_head_argmax(self, args, return_max: bool = False):
         """
         Compute argmax over a tensor-parallel sharded LM head.
 
         Each device that owns a non-empty LM-head slice computes local maximum values and vocabulary indices for
         its shard. The partial maxima are gathered to the output device, where the final winner is selected and the
-        global token index is returned.
+        global token index is returned. With return_max, the winning logit value comes back alongside (the same
+        value the layer-split path exports as draft confidence); it is already on the output device from the
+        gather, so this adds no transfer or synchronization.
 
         Dispatch follows self.active_devices order so the output-device pseudo-worker, if participating, runs after
         the spawned workers have been sent their local argmax command.
@@ -368,9 +370,9 @@ class Model_TPMixin:
             v, i = self.tp_worker_dispatch_single(
                 self.tp_output_device,
                 mp_model_forward_lm_head_argmax,
-                args + (ad[self.tp_output_device], None, None)
+                args + (ad[self.tp_output_device], None, None, self.config.vocab_size)
             )
-            return i
+            return (i, v) if return_max else i
 
         gd = sorted(set(ad.keys()) | {self.tp_output_device})
         ldims = [1 if d in ad else 0 for d in gd]
@@ -381,7 +383,7 @@ class Model_TPMixin:
                 self.tp_worker_dispatch(
                     device,
                     mp_model_forward_lm_head_argmax,
-                    args + (ad.get(device, -1), gd, ldims)
+                    args + (ad.get(device, -1), gd, ldims, self.config.vocab_size)
                 )
                 dispatched.append(device)
 
@@ -405,8 +407,10 @@ class Model_TPMixin:
             p += ldim
         vals = torch.stack(vals, dim = -1)
         inds = torch.stack(inds, dim = -1)
-        winner = vals.argmax(dim = -1)
-        argmax = inds.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+        winner = vals.argmax(dim = -1, keepdim = True)
+        argmax = inds.gather(-1, winner).squeeze(-1)
+        if return_max:
+            return argmax, vals.gather(-1, winner).squeeze(-1)
         return argmax
 
 
@@ -652,7 +656,11 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
-        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+        # Warmup passes run without collectives (see Model.warmup), so the CPU reduce helper
+        # stays out of it: it would sit waiting for reduce jobs nobody pushes
+        warmup = bool(params.get("tp_warmup"))
+        if not warmup:
+            self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
         # Keep the output-device pseudo-worker last for the same reason as prefill_tp(): its send() path executes
@@ -672,7 +680,8 @@ class Model_TPMixin:
         out = self.tp_worker_result(self.tp_output_device)
         assert out is not None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
-        self.tp_pending_acks.append(-1)
+        if not warmup:
+            self.tp_pending_acks.append(-1)
         # Pin the exported recurrent-state handles too: restore_tp_params swaps them out of the
         # params dict in place, so holding args alone would not keep their shared storages alive
         self.tp_pending_refs = (args, params.get("recurrent_states"))

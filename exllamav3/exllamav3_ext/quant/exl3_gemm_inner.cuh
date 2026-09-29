@@ -7,6 +7,8 @@
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
 
 #include "exl3_dq.cuh"
+// For exl3_gemm_smem_bytes(), the shared definition of this kernel's shared memory footprint
+#include "exl3_kernel_map.cuh"
 
 // On GA10x, HMMA with fp32 accumulation runs at half rate and dominates the m=1 (decode-bound) case.
 // Accumulate MMA results in fp16 instead and fold into the fp32 accumulators once per k-slice: ~14%
@@ -49,8 +51,9 @@ void exl3_gemm_kernel_inner
     // const int FRAGS_M = TILEBLOCKS_M;
     const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
 
+    constexpr int TILE_U16 = 16 * bits + (half_k ? 8 : 0);                        // uint16 per 16x16 tile
     const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                         // in halfs
-    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
+    const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * TILE_U16;   // in uint16s
     const int sh_c_size = MAX  // in floats
     (
         4 * EXL3_GEMM_BASE_THREADS * FRAGS_N_PER_WARP * TILEBLOCKS_M,
@@ -72,6 +75,16 @@ void exl3_gemm_kernel_inner
     (
         SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
         "Invalid kernel params (insufficient shared memory for shape)"
+    );
+    // The host filters shapes by asking exl3_gemm_smem_bytes() what this layout costs; if that
+    // function and the layout above ever diverge, the filter would vet a footprint the kernel
+    // does not actually have. Assert they agree, per instantiation, at compile time.
+    static_assert
+    (
+        exl3_gemm_smem_bytes(TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES,
+                             bits, half_k, shmem_out_had)
+            == SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
+        "exl3_gemm_smem_bytes() disagrees with the kernel's shared memory layout"
     );
 
     // Shared memory
@@ -134,9 +147,9 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = m < size_m;
     }
 
-    int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * 256 / 16 * bits;
-    const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
-    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;
+    int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * TILE_U16;
+    const int gl_b_stride_n = TILEBLOCKS_N * TILE_U16;
+    const int sh0_b_stride_k = TILEBLOCKS_K * TILEBLOCKS_N * TILE_U16;
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
     uint16_t* sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
 
@@ -147,7 +160,7 @@ void exl3_gemm_kernel_inner
     {
         int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
         int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n_full * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n_full * TILE_U16 / 8) + n;
         pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
     }
 
@@ -302,9 +315,9 @@ void exl3_gemm_kernel_inner
         for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2)
         {
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
-            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
+            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * TILE_U16);
 
-            dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
+            dq_dispatch<bits, cb, half_k>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 
         __syncthreads();

@@ -282,7 +282,7 @@ class MLP(Module):
             d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
             self.bc.run_bsz1(x, d)
             if self.tp_reduce:
-                params["backend"].all_reduce(d)
+                self.tp_collect(params["backend"], d)
             return to2(d, out_dtype, self.out_dtype)
 
         qs = params.get("q_mlp_slice")
@@ -304,7 +304,7 @@ class MLP(Module):
             del d_
 
         if self.tp_reduce:
-            params["backend"].all_reduce(d)
+            self.tp_collect(params["backend"], d)
 
         return to2(d, out_dtype, self.out_dtype)
 
@@ -429,6 +429,7 @@ class MLP(Module):
         module.alpha_n = consumer.recv(exported["alpha_n"], cuda = False)
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
         if module.num_slices == 1:
             module.load_local(device)
         torch.cuda.synchronize()
@@ -458,12 +459,19 @@ class GatedMLP(Module):
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
         select_hq_bits: int = 0,
-        qbits_key: str = "bits"
+        qbits_key: str = "bits",
+        interm_div: float = 1.0,
     ):
         super().__init__(config, key, None)
 
         self.out_dtype = out_dtype
         self.interm_dtype = interm_dtype
+        # Activations whose act(gate) * up exceeds the fp16 range: up is scaled down before the
+        # fp16 intermediate and the (fp32) output scaled back up. Needs interm_dtype and
+        # out_dtype float so nothing else rounds
+        self.interm_div = interm_div
+        assert interm_div == 1.0 or (interm_dtype == torch.float and out_dtype == torch.float), \
+            "GatedMLP: interm_div requires interm_dtype = out_dtype = torch.float"
         self.activation_fn = activation_fn
         self.intermediate_size = intermediate_size
         self.hidden_size = hidden_size
@@ -729,7 +737,7 @@ class GatedMLP(Module):
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(d, False)
+                self.tp_collect(params["backend"], d, False)
         else:
             qs = params.get("q_mlp_slice")
             r = [qs] if qs is not None else range(0, self.num_slices)
@@ -746,6 +754,8 @@ class GatedMLP(Module):
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    if self.interm_div != 1.0:
+                        u *= 1.0 / self.interm_div   # act(g) * u is linear in u
                     self.activation_fn_call(g, u, a, self.act_limit)
                     d_ = self.downs[s].forward(a, params)
 
@@ -778,6 +788,8 @@ class GatedMLP(Module):
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
 
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    if self.interm_div != 1.0:
+                        u *= 1.0 / self.interm_div   # act(g) * u is linear in u
                     self.activation_fn_call(g, u, a, self.act_limit)
                     d_ = self.downs[s].forward(a, params)
 
@@ -785,8 +797,11 @@ class GatedMLP(Module):
                     else: d += d_
                     del d_
 
+            if self.interm_div != 1.0:
+                d *= self.interm_div
+
             if self.tp_reduce:
-                params["backend"].all_reduce(d)
+                self.tp_collect(params["backend"], d)
 
         return to2(d, out_dtype, self.out_dtype)
 
@@ -839,6 +854,7 @@ class GatedMLP(Module):
                 "activation_fn": self.activation_fn,
                 "out_dtype": self.out_dtype,
                 "interm_dtype": self.interm_dtype,
+                "interm_div": self.interm_div,
                 "intermediate_split_size": self.intermediate_split_size,
                 "act_limit": self.act_limit
             },
@@ -904,6 +920,7 @@ class GatedMLP(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
         for i in range(module.num_slices):
             module.load_local(device, i)
         torch.cuda.synchronize()

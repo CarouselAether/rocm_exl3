@@ -3,14 +3,11 @@ import os
 
 import torch
 
-# ROCm/HIP backend. Read once at import: it never changes within a process, and the
-# prefill tile selection consults it per call.
-_is_rocm = getattr(torch.version, "hip", None) is not None
-
 import triton
 import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
+from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
 
 
 def _is_power_of_2(x: int) -> bool:
@@ -1014,12 +1011,23 @@ def _paged_attn_decode_combine_kernel(
     n_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     HD_PAD: tl.constexpr,
+    V_DIM: tl.constexpr,       # output lanes per head (< head_dim when V rides zero-padded in the cache)
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    ROWS_SUB: tl.constexpr,
+    D_SUB: tl.constexpr,
 ):
-    """Flash-decoding phase 2: reduce the per-split partial accumulators."""
+    """Flash-decoding phase 2: reduce the per-split partial accumulators. The output row is
+    written V_DIM wide per head: with an asymmetric V head dim the padded lanes are dropped
+    here, so the result feeds o_proj directly. Grid axis 1 splits
+    the program's (BLOCK_ROWS, HD_PAD) tile into (ROWS_SUB, D_SUB) sub-tiles so the serial
+    walk over the splits runs on many CTAs (decode launches only a few programs)."""
     pid = tl.program_id(0)
+    sub = tl.program_id(1)
+    D_CHUNKS: tl.constexpr = HD_PAD // D_SUB
+    r_c = sub // D_CHUNKS
+    d_c = sub - r_c * D_CHUNKS
 
     group_size = n_q_heads // n_kv_heads
     h_blocks = tl.cdiv(group_size, BLOCK_H)
@@ -1028,46 +1036,68 @@ def _paged_attn_decode_combine_kernel(
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
-    rows = tl.arange(0, BLOCK_ROWS)
+    rows = r_c * ROWS_SUB + tl.arange(0, ROWS_SUB)
     row_q = rows % BLOCK_M
     row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
     q_head = kv_head * group_size + row_h_local
     valid_row = (row_q < q_len) & (row_h_local < group_size)
 
-    offs_d = tl.arange(0, HD_PAD)
+    offs_d = d_c * D_SUB + tl.arange(0, D_SUB)
     d_mask = offs_d < head_dim
 
-    m_max = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
-    for s in range(num_splits):
-        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-        m_s = tl.load(partial_ml + ml_base + rows * 2)
-        m_max = tl.maximum(m_max, m_s)
+    # Splits are walked S_BLK at a time as one masked tile load per pass: a scalar loop with a
+    # runtime trip count and no pipelining serializes a full load latency per split (65 splits
+    # at a 2K sparse context cost 20 us), a tile load amortizes it
+    S_BLK: tl.constexpr = 16
+    offs_s = tl.arange(0, S_BLK)
+    m_max = tl.full((ROWS_SUB,), -float("inf"), tl.float32)
+    for s0 in range(0, num_splits, S_BLK):
+        sidx = s0 + offs_s
+        s_mask = sidx < num_splits
+        ml_idx = ((pid * num_splits + sidx)[:, None] * BLOCK_ROWS + rows[None, :]) * 2
+        m_s = tl.load(partial_ml + ml_idx, mask=s_mask[:, None], other=-float("inf"))
+        m_max = tl.maximum(m_max, tl.max(m_s, axis=0))
 
     if HAS_SINKS:
         # Learned per-head sink joins the softmax denominator at the final reduction
         sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
         m_max = tl.maximum(m_max, sink)
 
-    l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
-    acc = tl.zeros((BLOCK_ROWS, HD_PAD), tl.float32)
+    l_sum = tl.zeros((ROWS_SUB,), tl.float32)
+    acc = tl.zeros((ROWS_SUB, D_SUB), tl.float32)
     m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
-    for s in range(num_splits):
-        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-        m_s = tl.load(partial_ml + ml_base + rows * 2)
-        l_s = tl.load(partial_ml + ml_base + rows * 2 + 1)
-        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe))
-        po_base = (pid * num_splits + s) * BLOCK_ROWS * HD_PAD
-        o_s = tl.load(partial_o + po_base + rows[:, None] * HD_PAD + offs_d[None, :])
-        acc += o_s * w[:, None]
-        l_sum += l_s * w
+    for s0 in range(0, num_splits, S_BLK):
+        sidx = s0 + offs_s
+        s_mask = sidx < num_splits
+        ml_idx = ((pid * num_splits + sidx)[:, None] * BLOCK_ROWS + rows[None, :]) * 2
+        m_s = tl.load(partial_ml + ml_idx, mask=s_mask[:, None], other=-float("inf"))
+        l_s = tl.load(partial_ml + ml_idx + 1, mask=s_mask[:, None], other=0.0)
+        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe[None, :]))
+        po_idx = (pid * num_splits + sidx)[:, None, None] * (BLOCK_ROWS * HD_PAD) \
+            + rows[None, :, None] * HD_PAD + offs_d[None, None, :]
+        o_s = tl.load(partial_o + po_idx, mask=s_mask[:, None, None], other=0.0)
+        acc += tl.sum(o_s * w[:, :, None], axis=0)
+        l_sum += tl.sum(l_s * w, axis=0)
 
     if HAS_SINKS:
         l_sum += tl.exp(sink - m_safe)
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
-        out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, HD_PAD)
-    out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
-    tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & d_mask[None, :])
+        out_tile = _rot_h32(out_tile, h32, ROWS_SUB, D_SUB)   # 32-wide groups: D_SUB % 32 == 0
+    out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * V_DIM
+    tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & (offs_d < V_DIM)[None, :])
+
+
+def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
+    """(ROWS_SUB, D_SUB) for the combine kernel: the smallest sub-tile whose h32 rotation still
+    forms a >= 16-row tl.dot (ROWS_SUB * D_SUB >= 512), D_SUB a multiple of 32."""
+    d_sub = min(128, hd_pad)
+    rows_sub = min(block_rows, max(1, 512 // d_sub))
+    while rows_sub * d_sub < 512 and d_sub < hd_pad:
+        d_sub *= 2
+    if rows_sub * d_sub < 512:
+        rows_sub, d_sub = block_rows, hd_pad
+    return rows_sub, d_sub
 
 
 _decode_sm_count = {}
@@ -1153,8 +1183,8 @@ def paged_attn_triton_decode(
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
 
-    if block_n is None:
-        block_n = max(16, 8192 // hd_pad)   # K + V tiles in smem across num_stages
+    # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile
+    candidates = halving_ladder(max(16, 8192 // hd_pad)) if block_n is None else [block_n]
 
     group_size = n_q_heads // n_kv_heads
     block_m = triton.next_power_of_2(q_len)
@@ -1171,29 +1201,43 @@ def paged_attn_triton_decode(
         max_k_len = min(max_k_len, max_kv_len + kv_append_len)
 
     programs = bsz * n_kv_heads * h_blocks
-    if num_splits is None:
-        dev = q.device.index
-        if dev not in _decode_sm_count:
-            _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
-        # NOTE for RDNA: multi_processor_count reports work-group processors here, not
-        # compute units -- gfx1151 returns 20 for a 40-CU part -- so this target is half
-        # what the same code assumes on NVIDIA. Doubling it was tried and REVERTED: the
-        # apparent 6-7% gain at bsz=1 did not survive repeat measurement. The decode step
-        # has a ~4.7% run-to-run spread on this hardware (1.6% stdev), and split counts
-        # anywhere in 5..12 land within ~2% of each other at ctx 1024-4096. See
-        # rocm_tools/bench_decode_splits.py to re-check on other parts.
-        target = 2 * _decode_sm_count[dev]
-        num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
-    split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
+    dev = q.device.index
+    if dev not in _decode_sm_count:
+        _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
+    target = 2 * _decode_sm_count[dev]
 
-    if num_splits > 1:
-        partial_o = torch.empty(programs * num_splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
-        partial_ml = torch.empty(programs * num_splits * block_rows * 2, dtype = torch.float32, device = q.device)
-    else:
-        partial_o = q   # unused
-        partial_ml = q  # unused
+    def prepare(block_n):
+        """Split count, partial buffers and the split kernel's argument list for one kv tile."""
+        splits = num_splits
+        if splits is None:
+            splits = max(1, min(target // programs, triton.cdiv(max_k_len, 1 * block_n), 128))
+        split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
+        if splits > 1:
+            partial_o = torch.empty(programs * splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
+            partial_ml = torch.empty(programs * splits * block_rows * 2, dtype = torch.float32, device = q.device)
+        else:
+            partial_o = q   # unused
+            partial_ml = q  # unused
+        args = (
+            q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
+            k_scales, v_scales, h32,
+            split_len, num_pages_per_seq, splits, sinks,
+            qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
+            page_size, head_dim, hd_pad, float(softmax_scale),
+            bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
+            splits == 1, has_sinks, block_m, block_h, block_rows, block_n,
+        )
+        return args, splits, partial_o, partial_ml
 
     with torch.cuda.device(q.device):
+        pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_h, bool(causal), window_left >= 0,
+                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
+        block_n = pick_config(
+            q.device, "paged_attn_decode", pick_key, candidates,
+            lambda bn: shared_bytes(_paged_attn_decode_split_kernel, prepare(bn)[0],
+                                    num_warps = num_warps, num_stages = num_stages))
+        args, num_splits, partial_o, partial_ml = prepare(block_n)
+
         if k is not None and kv_append_len:
             update_block_d = triton.next_power_of_2(head_dim)
             _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
@@ -1203,21 +1247,15 @@ def paged_attn_triton_decode(
             )
 
         _paged_attn_decode_split_kernel[(programs, num_splits)](
-            q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
-            k_scales, v_scales, h32,
-            split_len, num_pages_per_seq, num_splits, sinks,
-            qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
-            page_size, head_dim, hd_pad, float(softmax_scale),
-            bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            num_splits == 1, has_sinks, block_m, block_h, block_rows, block_n,
-            num_warps=num_warps, num_stages=num_stages,
+            *args, num_warps = num_warps, num_stages = num_stages,
         )
 
         if num_splits > 1:
-            _paged_attn_decode_combine_kernel[(programs,)](
+            rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
+            _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                 partial_o, partial_ml, out, h32,
-                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad,
-                block_m, block_h, block_rows,
+                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
+                block_m, block_h, block_rows, rows_sub, d_sub,
                 num_warps=4, num_stages=1,
             )
     return out
@@ -1800,9 +1838,11 @@ def paged_attn_triton_prefill(
         # (a job's pages, not the cache pool), narrowed further when the caller bounds the past
         # length (QSA's dense regime never sees more than its sparse threshold, so a 512k-token
         # pool needs a 2k-token scratch there), and rounded up to a power of two in pages so
-        # the allocator sees a handful of distinct sizes. Context-shaped workspaces are not
-        # kept as statics: the old pool-sized static held a full fp16 copy of the cache
-        # (1 GiB per 512k tokens on Qwen3.8) for the life of the process
+        # the allocator sees a handful of distinct sizes, but never past the pool itself: the
+        # rounding alone would double a 513-page window to 1024 pages. Context-shaped workspaces
+        # are not kept as statics: the old pool-sized static held a full fp16 copy of the cache
+        # for the life of the process. The loader's autosplit budgets for the worst case (a window
+        # spanning the pool) through Attention.autosplit_extra_measure
         if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
@@ -1811,7 +1851,8 @@ def paged_attn_triton_prefill(
                 npps_w = min(npps_w, -(-(max_kv_len + kv_append_len) // page_size))
                 block_table = block_table[:, :npps_w].contiguous()
             n_kvh = n_kv_heads_override
-            pages_alloc = max(1, 1 << (bsz * npps_w - 1).bit_length())
+            pages = bsz * npps_w
+            pages_alloc = min(max(1, 1 << (pages - 1).bit_length()), max(pages, k_cache.shape[0]))
             kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
             ext.dequant_cache_paged_window(
@@ -1827,81 +1868,116 @@ def paged_attn_triton_prefill(
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
 
-    # Tile configs by head_dim, sized for ~100 KB of smem with two pipeline stages. Blackwell
-    # prefers narrower kv tiles (measured: 167 vs 153 TFLOPS on RTX 5090 at BN 32 vs 64)
-    #
-    # RDNA also wants the narrow tile, for an unrelated reason: the ~100 KB smem budget above
-    # is a Hopper/Blackwell assumption, while RDNA 3.5 has 64 KB of LDS per workgroup, so the
-    # wide kv tile costs occupancy. gfx1151 measures 13.06 vs 11.67 TFLOP/s (q_len 2048) and
-    # 16.86 vs 13.62 (q_len 2048 + 2048 ctx) in favour of BN 32 -- see
-    # rocm_tools/bench_prefill_tiles.py.
-    #
-    # Selected explicitly rather than via get_device_capability(), which on ROCm returns the
-    # gfx major (gfx1151 -> (11, 5)) and so trips the >= 10 test by accident. Relying on that
-    # would let an upstream change to the Blackwell heuristic silently regress RDNA.
-    #
-    # If retuning these for RDNA, hold block_m / num_warps == 16 (one WMMA 16x16 fragment row
-    # per warp). Off-ratio configs measured up to 4x slower.
-    narrow_kv = _is_rocm or torch.cuda.get_device_capability(q.device)[0] >= 10
+    # Tile configs by head_dim, sized for ~100 KB of smem. Four warps over a 64-row tile keep
+    # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity
+    # and stall the dots (issue #384). Blackwell prefers narrower kv tiles and a third stage
+    blackwell = torch.cuda.get_device_capability(q.device)[0] >= 10
     if hd_pad <= 128:
-        cfg = (128, 32, 8, 2) if narrow_kv else (128, 64, 8, 2)
+        cfg = (128, 32, 4, 3) if blackwell else (128, 32, 4, 2)
     elif hd_pad <= 256:
-        cfg = (64, 32, 8, 2)
+        cfg = (64, 32, 4, 2)
     else:
         cfg = (32, 16, 4, 2)
-    num_stages_forced = num_stages is not None
-    block_m = block_m or cfg[0]
-    block_n = block_n or cfg[1]
-    num_warps = num_warps or cfg[2]
-    num_stages = num_stages or cfg[3]
-    if qc is not None:
+    # Pre-Ampere (Turing/Volta, 64 KB per-block smem; the C++ EXL3_SM75 gate is
+    # __CUDA_ARCH__ < 800, the same class): the stock tiles overcommit the device's budget,
+    # and the ladder's first fit starves the mma pipeline -- at hd_pad 256 it is
+    # (32, 32, 2, 2), which fits exactly but runs at 2 warps per block. Measured on a 2080 Ti
+    # (hd 256, GQA 16/4, q_len 1792): (16, 32, 8, 2) is ~6x faster (17.6 vs 118.3 ms): the
+    # narrower q tile doubles the program count and the 8 warps keep the dots fed, the kv tile
+    # stays intact. The other hd_pad ranges halve the q tile only (unmeasured: no pre-Ampere
+    # model at those dims).
+    if torch.cuda.get_device_capability(q.device)[0] < 8:
+        cfg = (16, 32, 8, 2) if hd_pad == 256 else (max(16, cfg[0] // 2), cfg[1], cfg[2], cfg[3])
+    forced = (block_m, block_n, num_warps, num_stages)
+    if qc is not None and block_n is None:
         # compact plane tiles stage fewer smem bytes than fp16: wider kv tiles pay off. Wide
         # bit widths at large head_dim overstep the ~99 KB smem budget with the non-causal loop
         # structure (measured boundary: head_dim >= 256 with k_bits + v_bits >= 13), so halve
         # the kv tile there. num_stages is picked per family below
-        block_n = max(16, min(128, 16384 // hd_pad))
-        if hd_pad >= 256 and qck + qcv >= 13 and block_n > 16:
-            block_n //= 2
+        bn = max(16, min(128, 16384 // hd_pad))
+        if hd_pad >= 256 and qck + qcv >= 13 and bn > 16:
+            bn //= 2
+        cfg = (cfg[0], bn, cfg[2], cfg[3])
+    stock = tuple(f if f is not None else c for f, c in zip(forced, cfg))
+    # Caller-forced values pin the config; otherwise the ladder is walked against the device's
+    # shared memory budget (smem.py), which only steps below the stock tiles on small devices
+    candidates = [stock] if any(f is not None for f in forced) else tile_ladder(*stock)
+    num_stages_forced = forced[3] is not None
 
     num_pages_per_seq = block_table.shape[1]
-    q_blocks = triton.cdiv(q_len, block_m)
-    programs = q_blocks * bsz * n_q_heads
+    dev = q.device.index
+    if dev not in _decode_sm_count:
+        _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
+    sms = _decode_sm_count[dev]
 
-    # Split the kv range when the grid would quantize badly against the SM count (uniform
-    # full-length programs at 1 block/SM leave a mostly idle trailing wave). Pick the split
-    # count minimizing ceil-waves per unit of work, with a small penalty per extra split
-    if num_splits is None:
-        bound_kv = num_pages_per_seq * page_size + kv_append_len
-        if max_kv_len is not None:
-            bound_kv = min(bound_kv, max_kv_len + kv_append_len)
-        dev = q.device.index
-        if dev not in _decode_sm_count:
-            _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
-        sms = _decode_sm_count[dev]
-        num_splits = 1
-        if bound_kv >= 8192 and programs:
-            best = None
-            for cand in (1, 2, 3, 4, 5, 6, 8):
-                cost = math.ceil(programs * cand / sms) / cand + 0.03 * (cand - 1)
-                if best is None or cost < best[0]:
-                    best = (cost, cand)
-            num_splits = best[1]
-            # Splitting fixes grid quantization when programs are few; at large program counts
-            # the ceil-noise in the cost model can still pick a high split count whose fp32
-            # partial buffer is enormous (64k q_len x 32 heads: ~2 GB per split). The gain there
-            # is negligible by construction, so bound the buffer rather than trust the penalty
-            max_partial_bytes = 128 * 1024 * 1024
-            max_splits = max(1, max_partial_bytes // (programs * block_m * hd_pad * 4))
-            num_splits = min(num_splits, max_splits)
+    def prepare(cfg):
+        """Launch geometry for one tile config: grid, kv split count, partial buffers and the
+        kernel argument list (the probe compiles with exactly the launch's arguments)."""
+        block_m, block_n, num_warps, num_stages = cfg
+        q_blocks = triton.cdiv(q_len, block_m)
+        programs = q_blocks * bsz * n_q_heads
 
-    if num_splits > 1:
-        partial_o = torch.empty(programs * num_splits * block_m * hd_pad, dtype = torch.float32, device = q.device)
-        partial_ml = torch.empty(programs * num_splits * block_m * 2, dtype = torch.float32, device = q.device)
-    else:
-        partial_o = q   # unused
-        partial_ml = q  # unused
+        # Split the kv range when the grid would quantize badly against the SM count (uniform
+        # full-length programs at 1 block/SM leave a mostly idle trailing wave). Pick the split
+        # count minimizing ceil-waves per unit of work, with a small penalty per extra split
+        splits = num_splits
+        if splits is None:
+            bound_kv = num_pages_per_seq * page_size + kv_append_len
+            if max_kv_len is not None:
+                bound_kv = min(bound_kv, max_kv_len + kv_append_len)
+            splits = 1
+            if bound_kv >= 8192 and programs:
+                best = None
+                for cand in (1, 2, 3, 4, 5, 6, 8):
+                    cost = math.ceil(programs * cand / sms) / cand + 0.03 * (cand - 1)
+                    if best is None or cost < best[0]:
+                        best = (cost, cand)
+                splits = best[1]
+                # Splitting fixes grid quantization when programs are few; at large program counts
+                # the ceil-noise in the cost model can still pick a high split count whose fp32
+                # partial buffer is enormous (64k q_len x 32 heads: ~2 GB per split). The gain there
+                # is negligible by construction, so bound the buffer rather than trust the penalty
+                max_partial_bytes = 128 * 1024 * 1024
+                max_splits = max(1, max_partial_bytes // (programs * block_m * hd_pad * 4))
+                splits = min(splits, max_splits)
+
+        if splits > 1:
+            partial_o = torch.empty(programs * splits * block_m * hd_pad, dtype = torch.float32, device = q.device)
+            partial_ml = torch.empty(programs * splits * block_m * 2, dtype = torch.float32, device = q.device)
+        else:
+            partial_o = q   # unused
+            partial_ml = q  # unused
+
+        grid = (q_blocks, bsz * n_q_heads, splits)
+        # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
+        # fp32 partial buffer); common geometries keep pure int32 codegen
+        wide_index = max(
+            bsz * q_len * n_q_heads * head_dim,
+            q_blocks * bsz * n_q_heads * splits * block_m * hd_pad,
+        ) >= 1 << 31
+        args = (
+            q, k_cache, v_cache, block_table, cache_seqlens, out,
+            partial_o, partial_ml, k_scales, v_scales, h32,
+            k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
+            splits, splits > 1, new_kv_mode, qck, qcv,
+            q_len, kv_append_len, n_q_heads, n_kv_heads,
+            num_pages_per_seq, page_size, head_dim, hd_pad, float(softmax_scale),
+            bool(causal), int(window_left), int(window_right),
+            window_left >= 0, window_right >= 0, float(softcap or 0.0),
+            has_sinks, wide_index, block_m, block_n,
+        )
+        return grid, args, num_warps, num_stages, q_blocks, splits, partial_o, partial_ml, block_m, wide_index
 
     with torch.cuda.device(q.device):
+        pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
+                    window_right >= 0, has_sinks, stock)
+        def probe(cfg):
+            _, args, nw, ns, *_ = prepare(cfg)
+            return shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns)
+        cfg = pick_config(q.device, "paged_attn_prefill", pick_key, candidates, probe)
+        grid, args, num_warps, num_stages, q_blocks, num_splits, partial_o, partial_ml, block_m, wide_index = prepare(cfg)
+        block_n = cfg[1]
+
         if k is not None and kv_append_len:
             update_block_d = triton.next_power_of_2(head_dim)
             _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
@@ -1910,26 +1986,8 @@ def paged_attn_triton_prefill(
                 num_warps=2, num_stages=3,
             )
 
-        grid = (q_blocks, bsz * n_q_heads, num_splits)
-        # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
-        # fp32 partial buffer); common geometries keep pure int32 codegen
-        wide_index = max(
-            bsz * q_len * n_q_heads * head_dim,
-            q_blocks * bsz * n_q_heads * num_splits * block_m * hd_pad,
-        ) >= 1 << 31
         def launch(ns):
-            _paged_attn_prefill_kernel[grid](
-                q, k_cache, v_cache, block_table, cache_seqlens, out,
-                partial_o, partial_ml, k_scales, v_scales, h32,
-                k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
-                num_splits, num_splits > 1, new_kv_mode, qck, qcv,
-                q_len, kv_append_len, n_q_heads, n_kv_heads,
-                num_pages_per_seq, page_size, head_dim, hd_pad, float(softmax_scale),
-                bool(causal), int(window_left), int(window_right),
-                window_left >= 0, window_right >= 0, float(softcap or 0.0),
-                has_sinks, wide_index, block_m, block_n,
-                num_warps=num_warps, num_stages=ns,
-            )
+            _paged_attn_prefill_kernel[grid](*args, num_warps = num_warps, num_stages = ns)
 
         if qc is not None and not num_stages_forced:
             if _qc_prefill_ns_env:
@@ -2030,12 +2088,18 @@ def _varlen_attn_kernel(
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    SINK_KEY0: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """Packed varlen self-attention (no cache): each segment of the packed sequence attends
     within itself. Grid: (q blocks of the longest segment, segments, q heads); programs beyond
-    a segment's length exit early. head_dim need not be a power of two (padded loads)."""
+    a segment's length exit early. head_dim need not be a power of two (padded loads).
+
+    Sinks come in two forms: HAS_SINKS is the gpt-oss extra logit that joins the softmax
+    denominator without a value; SINK_KEY0 adds the per-head sink to the logit of each
+    segment's first key instead (MiMo-ViT), so the mass lands on that key's value and the
+    window still decides whether the key is visible at all."""
     pid_m = tl.program_id(0)
     seg = tl.program_id(1)
     q_head = tl.program_id(2)
@@ -2056,6 +2120,8 @@ def _varlen_attn_kernel(
     q_ptrs = q + ((q0 + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :]
     q_tile = tl.load(q_ptrs, mask = valid_row[:, None] & d_mask[None, :], other = 0.0)
     qk_scale_log2e = scale * 1.4426950408889634
+    if SINK_KEY0:
+        sink_l2 = tl.load(sinks + q_head).to(tl.float32) * 1.4426950408889634
 
     m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_M,), 0.0, tl.float32)
@@ -2090,6 +2156,8 @@ def _varlen_attn_kernel(
             scores = s_nat * 1.4426950408889634
         else:
             scores = scores * qk_scale_log2e
+        if SINK_KEY0:
+            scores = tl.where(offs_n[None, :] == 0, scores + sink_l2, scores)
 
         m_new = tl.maximum(m, tl.max(scores, axis = 1))
         p = tl.exp2(scores - m_new[:, None])
@@ -2112,6 +2180,8 @@ def _varlen_attn_kernel(
             scores = s_nat * 1.4426950408889634
         else:
             scores = scores * qk_scale_log2e
+        if SINK_KEY0:
+            scores = tl.where(offs_n[None, :] == 0, scores + sink_l2, scores)
 
         valid = valid_row[:, None] & (offs_n[None, :] < n_hi)
         if CAUSAL:
@@ -2157,6 +2227,7 @@ def varlen_attn_triton(
     window_size: int | tuple[int, int] | None = None,
     softcap: float = 0.0,
     sinks: torch.Tensor | None = None,
+    sink_key0: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed varlen self-attention over (total, heads, head_dim) tensors, segments given by
@@ -2188,13 +2259,25 @@ def varlen_attn_triton(
         if num_warps > 4:
             num_warps //= 2
 
-    with torch.cuda.device(q.device):
-        grid = (triton.cdiv(max_seqlen, block_m), num_segs, n_q_heads)
-        _varlen_attn_kernel[grid](
+    def args_for(cfg):
+        block_m, block_n, num_warps, num_stages = cfg
+        return (
             q, k, v, cu_seqlens, out, sinks,
             n_q_heads, n_kv_heads, head_dim, hd_p2, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            has_sinks, block_m, block_n,
+            has_sinks and not sink_key0, has_sinks and sink_key0, block_m, block_n,
+        )
+
+    with torch.cuda.device(q.device):
+        stock = (block_m, block_n, num_warps, num_stages)
+        pick_key = (head_dim, hd_p2, bool(causal), window_left >= 0, window_right >= 0,
+                    has_sinks, sink_key0, stock)
+        block_m, block_n, num_warps, num_stages = pick_config(
+            q.device, "varlen_attn", pick_key, tile_ladder(*stock),
+            lambda cfg: shared_bytes(_varlen_attn_kernel, args_for(cfg), num_warps = cfg[2], num_stages = cfg[3]))
+        grid = (triton.cdiv(max_seqlen, block_m), num_segs, n_q_heads)
+        _varlen_attn_kernel[grid](
+            *args_for((block_m, block_n, num_warps, num_stages)),
             num_warps=num_warps, num_stages=num_stages,
         )
     return out.unsqueeze(0) if squeeze else out
@@ -2222,6 +2305,7 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
         window_size=args.get_window_size(),
         softcap=args.softcap,
         sinks=args.sinks,
+        sink_key0=args.sink_key0,
     )
 
 
