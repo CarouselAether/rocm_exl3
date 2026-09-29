@@ -2459,3 +2459,115 @@ prepare_for_device); nothing is deferred while exporting states or converting.
   lever (~0.5 ms/token).
 - Shared expert (5 launches + the routed + shared add): moe_decode could carry it, but its
   gate/up intermediates are fp32 (act_mul_kernel_f), a second code path.
+
+## Qwen3.8 (2026-09-28): tg128 26.6 -> 29.0 t/s, MTP ndt=2 39.3 -> 43.9, pp2048 750 -> 848; n-gram table lock
+
+Branch `opt/qwen` (base b22b243). Profile: `bench/results/qwen_profile_b22b243.txt`. Four changes, each behind
+its own switch (default on), plus the `-ngl` n-gram lock mode in the server.
+
+**Why Qwen was "a weirdo".** About a quarter of its ~5.0 GB/token decode stream is the fp16 GatedResidual
+("low-rank hyper-connection") matrices: 97 sites x (324 x 10240 + 10240 x 320) halves. They run on their own two
+kernels (gr_dots / gr_finalize), not on the EXL3 GEMV, so GEMV-tiles never touched them. The EXL3 GEMVs (K4 experts,
+K5/K6 dense) were already at 168-228 GB/s. And the 12 full-attention layers ran a graphed Triton kernel compiled
+without AMD's buffer-op specialization, at 91.5 us per call instead of ~14.
+
+### What changed
+
+| switch (default on) | change | where | kernels changed | numerics |
+|---|---|---|---|---|
+| `EXL3_ROCM_GR_DOTS` (`_GR_RB` 2/4/8, default 4) | gr_dots_rows_kernel: 4 fn rows per block, stream stack loaded once into registers, a whole row's loads in flight. 60.8 -> 36.3 us per site | `rocm/hc_mix_rdna.hip` | GatedResidual decode mix (R <= 32), Qwen only | bit-identical (same per-thread fmaf chain, same shuffle/DPP tree, same 4-warp sum) |
+| `EXL3_ROCM_GR_PREFILL` | `torch.ops.exl3_rocm.gr_gate_mean`: the prefill gate-mean tail (2 fp32 upcasts, sigmoid, mul, mean) in one pass. 3.6 ms -> 0.4 ms per site at R = 2048 | same + `rocm_py` | GatedResidual prefill mix (R > 32) | bit-identical to torch's expression (under `#pragma clang fp contract(off)`; torch rounds the product before the sum) |
+| `EXL3_ROCM_BC_BUFOPS` (`_BC_ATTN_WARPS` / `_STAGES`, default 8 / 1) | bc_attn's AOT GQA decode split kernels (paged split + QSA sparse split) compiled with the `tt.pointer_range = 32` / `tt.divisibility = 16` attributes that the Triton JIT adds on AMD, at 8 warps / 1 stage (scratch-free). In-model: ctx 512 91.5 -> 31.8 us, QSA sparse at 8K 117 -> 31.9 us, MTP verify 163 -> 62 us | `rocm_py` (wraps `bc_attn._compile_kernel`, gated per layer on K/V storage < 2 GB) | graphed GQA decode attention (Qwen; any BCAttn model with an fp16 cache) | bit-identical (decode_bitwise PASS, 21- and 4001-token prompts) |
+| `EXL3_ROCM_ROUTER_STD_MR` | `routing_std` at 2..8 rows passes the transposed gate, so rows go to the existing multi-row router GEMV (DS4's) instead of hgemm: 105 -> 40 us per MTP verify call | `rocm_py` | std softmax routing at bsz 2..8 (Qwen MTP verify) | each verify row now uses the m == 1 chain: MTP greedy output is token-identical to plain greedy on 3/3 prompts (1/3 diverged at token 34 before) |
+| `EXL3_ROCM_PREFILL_HD256` | paged prefill attention at head_dim 256: 1 stage, 128-row tile (64 below 128 query rows), still 16 rows per warp. Upstream's tile spilled (256 VGPR + 772 B). Kernel: q 1792 fresh 5770 -> 2917 us, q 2048 after 16K 121.7 -> 39.8 ms | `rocm_py` (wraps `paged_attn_triton_prefill`) | Qwen full-attention prefill, Gemma's 256-dim layers | different tiling: Qwen PPL +0.074% (4.748012 -> 4.751540; that is the whole PPL delta of the branch); error vs an fp32 reference unchanged (1.15e-3 / 4.2e-5) |
+
+### End to end (bench/run_bench.py, one build, median of 3, `-ngr`; `=0` rows turn one switch off)
+
+| config | pp512 | pp2048 | tg128 | regen3000 ms | regen8000 ms | tg64 @ 8K | MTP ndt2 |
+|---|---|---|---|---|---|---|---|
+| b22b243 (before) | 596.0 | 749.6 | 26.61 | 377.8 | 305.4 | | 39.32 |
+| **all on** | 622.0 | **848.5** | **29.05** | 363.6 | 300.7 | 28.54 | **43.92** |
+| GR_DOTS=0 + GR_PREFILL=0 (d365a4f A/B) | 593.4 | 747.8 | 26.64 | 376.2 | 305.5 | | |
+| BC_BUFOPS=0 | 615.2 | 829.9 | 28.34 | 362.6 | 300.4 | 27.60 | 43.31 |
+| ROUTER_STD_MR=0 | | | | | | | 41.42 |
+| PREFILL_HD256=0 | 618.3 | 833.1 | 29.02 | 363.4 | 299.5 | 28.58 | |
+
+Long prompts, PREFILL_HD256 on/off: pp8192 775.8 / 767.1, pp16384 761.8 / 755.1. Past the 2048-token indexer
+budget the QSA layers switch to sparse prefill, so the dense kernel matters less there. Gemma-4-31B pp2048
+332.9 / 319.3 (+4%); tg unchanged at 8.34.
+
+DS4 (the hard rule: no regression). Full set on vs off for each commit, same build:
+
+| DS4 | pp512 | pp2048 | tg128 | regen3000 ms | regen8000 ms | MTP ndt2 |
+|---|---|---|---|---|---|---|
+| b22b243 reference | ~354 | ~518 | ~30.1 | ~681 | ~572 | ~41.7 |
+| GR on / off (d365a4f) | 351.7 / 347.2 | 521.9 / 512.3 | 30.12 / 30.12 | 679.4 / 685.9 | 572.6 / 577.6 | 41.45 / 41.53 |
+| BUFOPS + ROUTER_STD_MR on / off (6684d1d) | 353.0 / 351.2 | 524.0 / 519.3 | 30.15 / 30.12 | 681.1 / 675.4 | 572.7 / 572.6 | 41.57 / 41.81 |
+| PREFILL_HD256 on / off | 349.0 / 350.3 | 522.0 / 516.9 | 30.16 / 30.12 | 679.1 / 671.6 | 571.5 / 573.3 | 41.56 / 41.56 |
+
+DS4 does not execute any of the new paths: its hc sites are mHC (hc_mix), its router is routing_ds3, and its
+attention is DSA/MLA. DS4 decode_bitwise PASS against a reference saved with every switch off.
+
+### Validation
+
+- decode_bitwise Qwen, all on vs every switch off: PASS for 21-token, 801-token (prefill R > 32, the gate-mean path)
+  and 4001-token prompts (with PREFILL_HD256 off, since that one changes prefill tiling). DS4 PASS.
+- `rocm_tools/gr_mix_bench.py`: gr_mix bit-identical to the one-row kernel (RB 2/4/8, R 1 and 3, site and
+  final-mixer forms); `--prefill` gr_gate_mean bit-identical to the torch expression at R 33 / 256 / 1792 / 2048.
+- MTP greedy vs plain greedy (3 prompts x 128 tokens): all identical (switch off: one diverges).
+- `bench/run_gates.sh` PASS (879 passed, 9 skipped; mgemv_check, reconstruct_had, dsa_kernels, WMMA gate).
+- PPL (wikitext2 100 x 2048): Qwen 4.751540 (+0.074% vs 4.748012; 4.748012 exactly with PREFILL_HD256=0),
+  DS4 6.463333 (=), Gemma 18.633857 (=).
+- `hipcc_probe --all`: 123/123 on gfx1151, gfx1100, gfx1101, gfx1200, gfx1201 (no hardcoded CU counts; the new
+  kernels size grids from the shapes, RB is a runtime switch).
+
+### N-gram table lock (`-ngl`)
+
+The maintainer asked for three modes: disk streaming (the default, unchanged), `-ngr` RAM (unchanged), and a new
+locked-RAM mode. `exllamav3/rocm_py/ngram_lock.py` provides it; `server.py -ngl` and `run_bench.py --ngram_lock` use it.
+There are no upstream edits: model_init / ngram_embedding are untouched.
+- `-ngl` sets `ngram_ram`, so the table loads exactly as with `-ngr` (one contiguous CPU slab).
+- After the load, `mlock(2)` is applied to that tensor's address range. There is no second copy and no change to
+  the read path.
+- Preflight, before anything loads:
+  - `RLIMIT_MEMLOCK` must cover the table. An unprivileged process raises its soft limit to the hard limit itself;
+    `CAP_IPC_LOCK` bypasses the check. If neither works, it exits with the `ulimit -l` / limits.conf /
+    `LimitMEMLOCK` / `prlimit` / `setcap` recipes.
+  - Weights + table + KV estimate + headroom (8 GiB, `EXL3_NGRAM_LOCK_HEADROOM_GB`) must be <= MemAvailable.
+    A locked table can never be reclaimed, so the server refuses rather than end in the OOM killer.
+- Postflight re-checks the headroom before locking. `/props` reports `ngram_table` (disk / ram / ram_locked).
+- Measured:
+  - This box's hard limit is 16375860 KiB (15.6 GiB), so a full 36.4 GiB lock is refused with the instructions
+    (verified: `server.py -ngl` exits in 4 s, before loading).
+  - `run_bench.py --ngram_lock --ngram_lock_max_gb 15` locked 15.0 GiB of the real table. `/proc/<pid>/status` of
+    the bench process showed `VmLck: 15728644 kB` (external check).
+  - Decode with the lock vs plain `-ngr`, two alternating rounds: tg128 28.96 / 29.03 vs 29.04 / 29.01, pp512
+    622.5 / 626.2 vs 623.5 / 623.8. The lock costs nothing, as expected: the read path is identical.
+  - A synthetic 12 GiB lock: VmLck 0 -> 12288 MiB; a second lock past the limit fails with ENOMEM and leaves the
+    first intact.
+- A full-table lock needs the maintainer to raise the limit (root). Budget at `-cs 65536`: 65.1 + 36.4 + 1.5 + 8 =
+  111 GiB of ~115 GiB available.
+
+### Tried / rejected / not done (with numbers)
+
+- **gr_finalize with the up-gate loads hoisted above the prologue + DPP butterflies**: 36.5 -> 42.4 us (the hoisted
+  loads made the prologue wait on them: vmcnt retires in order); with the prologue loads issued first, 37.9 us.
+  Still slower than the upstream form (already ~180 GB/s). Removed.
+- **Decode attention via the python JIT path**: that path was never the problem. The JIT launch of the same
+  kernel was already 13.5 us. The graphed AOT compile lost the specialization.
+- **BC attention warps/stages** (in-model, ctx 512 / 8K QSA, us per call): 4/2 38.9 / 51.9 (scratch 276 / 524), 8/2
+  33.8 / 48.6, **8/1 31.8 / 31.9 (0 scratch)**, 16/1 33.4 / 77.1, 4/1 38.0 / 44.3, 2/2 63.9 / 88.9.
+- **Prefill tiles at hd 256** (q 1792 fresh, us): 64x32 w8 s2 (upstream) 5770, 128x32 w8 s1 2917, 64x64 w4 s1 3271,
+  64x32 w8 s1 3520, 64x16 w8 s1 3570. At q 33 all within noise; at q 64 after 4096 the 64-row tile wins (612 vs 857).
+- **GR prefill matmuls on the WMMA backend** (hipBLAS runs them at 17-25 TF, ~54 ms per 1792-row forward): the
+  backend needs a row-major B, which means transposed copies of proj/up, +1.3 GB. The `-ngr` / `-ngl` memory budget
+  does not have that. Not done.
+- **PLE / n-gram host path**: no action needed. Disk vs RAM decode are equal (39.08 vs 38.81 ms/step profiled); per
+  token there is one event sync on staging-set reuse and 3 small pinned uploads.
+
+### Open
+
+- hc_apply folded into the next GatedResidual site's gr_dots (96 launches per token, ~0.45 ms, the DS4 HC_FUSE pattern).
+- Decode gaps 4.1 ms/token over 1498 launches. GDN in_proj / ba / conv / recurrent fusion is the launch-count lever.
+- Vendored fla GDN chunked prefill: `recompute_w_u_fwd_kernel` spills 1608 B (autotuned; vendored upstream code).
+- The GatedResidual mix is still ~180 GB/s against ~210-227 achievable: ~1 ms/token left.

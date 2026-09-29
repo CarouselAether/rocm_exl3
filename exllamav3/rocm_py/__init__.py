@@ -87,6 +87,7 @@ Environment switches (all default to the safe value for this backend):
   EXL3_ROCM_HC_NORM=0      the RMSNorm after each mHC mix runs as its own launch
   EXL3_ROCM_GR_PREFILL=0   GatedResidual (Qwen3.8) prefill gate-mean back on torch ops
   EXL3_ROCM_ROUTER_STD_MR=0  "std" routing at 2..8 rows back on hgemm (upstream)
+  EXL3_ROCM_PREFILL_HD256=0  paged prefill attention at head_dim 256 on upstream's tile
   EXL3_ROCM_BC_BUFOPS=0    graphed GQA decode attention kernels compiled without the
                            buffer-op / alignment attributes the Triton JIT would add
   (C++ side, same build: EXL3_ROCM_ROUTER_GEMV=0, EXL3_ROCM_ROUTER_FUSE=0,
@@ -1163,6 +1164,44 @@ def apply() -> list[str]:
             applied.append("std routing at 2..8 rows on the multi-row router GEMV (EXL3_ROCM_ROUTER_STD_MR)")
         except Exception as e:
             applied.append(f"!! FAILED std routing multi-row patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # Paged prefill attention at head_dim 256: RDNA tile
+    # ------------------------------------------------------------------
+    # paged_attn_triton_prefill's head_dim-256 tile (block_m 64, block_n 32, 8 warps,
+    # 2 stages) spills on gfx1151 (256 VGPR + 772 B scratch). One stage frees the
+    # registers; at q_len >= 128 a 128-row tile (still 16 rows per warp, the
+    # rule noted at the config) halves the K/V re-reads. Qwen3.8 shapes (24 q / 2 kv
+    # heads, fp16 cache), us: q 1792 fresh 5770 -> 2917; q 255 after 1792 1621 -> 884;
+    # q 2048 after 2048 20017 -> 8043; q 2048 after 16384 121711 -> 39755;
+    # q 64 after 4096 1098 -> 612 (64-row tile). Error vs an fp32 reference unchanged
+    # (1.15e-3 / 4.2e-5). Scope: head_dim 129..256, fp16 cache (qc None), no explicit
+    # tile from the caller. DS4 (DSA prefill, D 512) never reaches this; Gemma's
+    # 256-dim layers do (PPL gate). EXL3_ROCM_PREFILL_HD256=0 restores upstream.
+    if _env_on("EXL3_ROCM_PREFILL_HD256", True):
+        try:
+            import triton
+            from ..modules.attention_fn import triton_paged as _tpm
+            from ..modules import sliding_attn as _swm
+            _orig_prefill = _tpm.paged_attn_triton_prefill
+
+            def _prefill_rdna(*a, **kw):
+                q = kw.get("q", a[0] if a else None)
+                if q is not None and kw.get("qc") is None and kw.get("block_m") is None \
+                        and kw.get("block_n") is None and kw.get("num_warps") is None \
+                        and kw.get("num_stages") is None and q.dim() == 4 \
+                        and 128 < triton.next_power_of_2(q.shape[-1]) <= 256:
+                    kw["block_m"] = 128 if q.shape[1] >= 128 else 64
+                    kw["block_n"] = 32
+                    kw["num_warps"] = 8
+                    kw["num_stages"] = 1
+                return _orig_prefill(*a, **kw)
+
+            _tpm.paged_attn_triton_prefill = _prefill_rdna
+            _swm.paged_attn_triton_prefill = _prefill_rdna
+            applied.append("paged prefill attention, head_dim 256: 128/64 x 32 tile, 1 stage (EXL3_ROCM_PREFILL_HD256)")
+        except Exception as e:
+            applied.append(f"!! FAILED prefill hd256 patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # GatedResidual (Qwen3.8) prefill mix: gate-mean in one kernel

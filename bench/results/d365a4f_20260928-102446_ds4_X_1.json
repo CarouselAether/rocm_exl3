@@ -1,0 +1,486 @@
+{
+ "time": "2026-09-28T10:24:11",
+ "repo": "/home/carousel/Desktop/exlproject/rocm_exl3",
+ "commit": "d365a4f",
+ "branch": "opt/qwen",
+ "dirty": true,
+ "torch": "2.15.0.dev20260926+rocm10.0",
+ "hip_runtime": "7.15.26333",
+ "rocm_pip": "Version: 10.0.0",
+ "device": "AMD Radeon 8060S Graphics",
+ "perf_level": "auto",
+ "cpu_boost": "0",
+ "cpu_max_khz": "3000000",
+ "env": {},
+ "argv": [
+  "bench/run_bench.py",
+  "-m",
+  "/home/carousel/models/DeepSeek-V4-Flash-0731-exl3-2.04bpw",
+  "--pp",
+  "512",
+  "2048",
+  "--tg",
+  "128",
+  "--regen",
+  "3000",
+  "8000",
+  "--label",
+  "ds4_X_1"
+ ],
+ "amd_smi_before": "{\n    \"gpu_data\": [\n        {\n            \"gpu\": 0,\n            \"power\": {\n                \"socket_power\": \"N/A\",\n                \"gfx_voltage\": \"N/A\",\n                \"soc_voltage\": \"N/A\",\n                \"mem_voltage\": \"N/A\",\n                \"throttle_status\": \"N/A\",\n                \"power_management\": \"N/A\"\n            },\n            \"clock\": {\n                \"gfx_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_4\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_5\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_6\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_7\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"mem_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"fclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"socclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                }\n            },\n            \"temperature\": {\n                \"edge\": {\n                    \"value\": 46,\n                    \"unit\": \"C\"\n                },\n                \"hotspot\": \"N/A\",\n                \"mem\": \"N/A\"\n            },\n            \"perf_level\": \"AMDSMI_DEV_PERF_LEVEL_AUTO\"\n        }\n    ]\n}",
+ "init_args": [
+  "-m",
+  "/home/carousel/models/DeepSeek-V4-Flash-0731-exl3-2.04bpw",
+  "-cs",
+  "65536"
+ ],
+ "load_s": 35.20059667900205,
+ "results": [
+  {
+   "name": "pp512",
+   "runs": [
+    {
+     "rate": 351.6988367236977,
+     "prompt_tokens": 512,
+     "new_tokens": 1,
+     "time_prefill": 1.4557909965515137,
+     "time_generate": 0.26925063133239746,
+     "gpu": {
+      "n": 7,
+      "n_busy": 7,
+      "sclk_mhz": {
+       "min": 2194.0,
+       "median": 2522.0,
+       "max": 2662.0
+      },
+      "power_w": {
+       "min": 90.082,
+       "median": 111.059,
+       "max": 120.017
+      }
+     }
+    },
+    {
+     "rate": 346.2511075685828,
+     "prompt_tokens": 512,
+     "new_tokens": 1,
+     "time_prefill": 1.4786956310272217,
+     "time_generate": 0.03496956825256348,
+     "gpu": {
+      "n": 7,
+      "n_busy": 7,
+      "sclk_mhz": {
+       "min": 2568.0,
+       "median": 2654.0,
+       "max": 2747.0
+      },
+      "power_w": {
+       "min": 97.083,
+       "median": 118.005,
+       "max": 124.088
+      }
+     }
+    },
+    {
+     "rate": 353.18839829363066,
+     "prompt_tokens": 512,
+     "new_tokens": 1,
+     "time_prefill": 1.4496512413024902,
+     "time_generate": 0.035146474838256836,
+     "gpu": {
+      "n": 6,
+      "n_busy": 6,
+      "sclk_mhz": {
+       "min": 2292.0,
+       "median": 2535.0,
+       "max": 2669.0
+      },
+      "power_w": {
+       "min": 100.078,
+       "median": 114.537,
+       "max": 123.022
+      }
+     }
+    }
+   ],
+   "cached_seen": 0,
+   "warmup": {
+    "rate": 294.747450363671,
+    "prompt_tokens": 512,
+    "new_tokens": 1,
+    "time_prefill": 1.7370803356170654,
+    "time_generate": 0.07659435272216797,
+    "gpu": {
+     "n": 8,
+     "n_busy": 5,
+     "sclk_mhz": {
+      "min": 2129.0,
+      "median": 2380.0,
+      "max": 2523.0
+     },
+     "power_w": {
+      "min": 74.079,
+      "median": 97.06,
+      "max": 109.002
+     }
+    }
+   },
+   "median": 351.6988367236977,
+   "spread": 0.019725088628876866
+  },
+  {
+   "name": "pp2048",
+   "runs": [
+    {
+     "rate": 521.8785164490799,
+     "prompt_tokens": 2048,
+     "new_tokens": 1,
+     "time_prefill": 3.9242849349975586,
+     "time_generate": 0.035306692123413086,
+     "gpu": {
+      "n": 16,
+      "n_busy": 16,
+      "sclk_mhz": {
+       "min": 2582.0,
+       "median": 2763.5,
+       "max": 2797.0
+      },
+      "power_w": {
+       "min": 119.025,
+       "median": 125.0615,
+       "max": 128.016
+      }
+     }
+    },
+    {
+     "rate": 522.5770259154551,
+     "prompt_tokens": 2048,
+     "new_tokens": 1,
+     "time_prefill": 3.919039487838745,
+     "time_generate": 0.0352632999420166,
+     "gpu": {
+      "n": 16,
+      "n_busy": 16,
+      "sclk_mhz": {
+       "min": 2624.0,
+       "median": 2744.5,
+       "max": 2767.0
+      },
+      "power_w": {
+       "min": 114.011,
+       "median": 120.0355,
+       "max": 121.097
+      }
+     }
+    },
+    {
+     "rate": 520.9471845289031,
+     "prompt_tokens": 2048,
+     "new_tokens": 1,
+     "time_prefill": 3.931300640106201,
+     "time_generate": 0.035793304443359375,
+     "gpu": {
+      "n": 16,
+      "n_busy": 16,
+      "sclk_mhz": {
+       "min": 2624.0,
+       "median": 2740.0,
+       "max": 2759.0
+      },
+      "power_w": {
+       "min": 113.035,
+       "median": 120.02600000000001,
+       "max": 121.042
+      }
+     }
+    }
+   ],
+   "cached_seen": 0,
+   "warmup": {
+    "rate": 527.020277182873,
+    "prompt_tokens": 2048,
+    "new_tokens": 1,
+    "time_prefill": 3.885998487472534,
+    "time_generate": 0.03520345687866211,
+    "gpu": {
+     "n": 16,
+     "n_busy": 16,
+     "sclk_mhz": {
+      "min": 2654.0,
+      "median": 2781.5,
+      "max": 2807.0
+     },
+     "power_w": {
+      "min": 121.054,
+      "median": 128.064,
+      "max": 131.049
+     }
+    }
+   },
+   "median": 521.8785164490799,
+   "spread": 0.0031230283201570358
+  },
+  {
+   "name": "tg128",
+   "runs": [
+    {
+     "rate": 30.078800305723394,
+     "prompt_tokens": 512,
+     "new_tokens": 128,
+     "time_prefill": 1.4647338390350342,
+     "time_generate": 4.255488872528076,
+     "gpu": {
+      "n": 23,
+      "n_busy": 23,
+      "sclk_mhz": {
+       "min": 2814.0,
+       "median": 2876.0,
+       "max": 2898.0
+      },
+      "power_w": {
+       "min": 100.035,
+       "median": 107.073,
+       "max": 125.086
+      }
+     }
+    },
+    {
+     "rate": 30.131184783202265,
+     "prompt_tokens": 512,
+     "new_tokens": 128,
+     "time_prefill": 1.4795525074005127,
+     "time_generate": 4.248090505599976,
+     "gpu": {
+      "n": 23,
+      "n_busy": 23,
+      "sclk_mhz": {
+       "min": 2773.0,
+       "median": 2870.0,
+       "max": 2898.0
+      },
+      "power_w": {
+       "min": 97.022,
+       "median": 107.015,
+       "max": 125.06
+      }
+     }
+    },
+    {
+     "rate": 30.11760144092117,
+     "prompt_tokens": 512,
+     "new_tokens": 128,
+     "time_prefill": 1.4740452766418457,
+     "time_generate": 4.250006437301636,
+     "gpu": {
+      "n": 23,
+      "n_busy": 23,
+      "sclk_mhz": {
+       "min": 2780.0,
+       "median": 2870.0,
+       "max": 2898.0
+      },
+      "power_w": {
+       "min": 97.05,
+       "median": 107.033,
+       "max": 125.071
+      }
+     }
+    }
+   ],
+   "cached_seen": 0,
+   "warmup": {
+    "rate": 30.094381294888617,
+    "prompt_tokens": 512,
+    "new_tokens": 128,
+    "time_prefill": 1.5081305503845215,
+    "time_generate": 4.253285646438599,
+    "gpu": {
+     "n": 23,
+     "n_busy": 23,
+     "sclk_mhz": {
+      "min": 2626.0,
+      "median": 2848.0,
+      "max": 2897.0
+     },
+     "power_w": {
+      "min": 102.053,
+      "median": 107.095,
+      "max": 121.046
+     }
+    }
+   },
+   "median": 30.11760144092117,
+   "spread": 0.0017393309882803346
+  },
+  {
+   "name": "regen3000",
+   "runs": [
+    {
+     "rate": 679.4333457946777,
+     "cached_tokens": 2816,
+     "prompt_tokens": 3000,
+     "gpu": {
+      "n": 3,
+      "n_busy": 3,
+      "sclk_mhz": {
+       "min": 2727.0,
+       "median": 2746.0,
+       "max": 2775.0
+      },
+      "power_w": {
+       "min": 119.072,
+       "median": 120.004,
+       "max": 120.047
+      }
+     }
+    },
+    {
+     "rate": 675.692081451416,
+     "cached_tokens": 2816,
+     "prompt_tokens": 3000,
+     "gpu": {
+      "n": 3,
+      "n_busy": 3,
+      "sclk_mhz": {
+       "min": 2741.0,
+       "median": 2751.0,
+       "max": 2765.0
+      },
+      "power_w": {
+       "min": 119.069,
+       "median": 120.006,
+       "max": 120.041
+      }
+     }
+    },
+    {
+     "rate": 688.6715888977051,
+     "cached_tokens": 2816,
+     "prompt_tokens": 3000,
+     "gpu": {
+      "n": 3,
+      "n_busy": 3,
+      "sclk_mhz": {
+       "min": 2713.0,
+       "median": 2736.0,
+       "max": 2767.0
+      },
+      "power_w": {
+       "min": 119.052,
+       "median": 120.018,
+       "max": 120.044
+      }
+     }
+    }
+   ],
+   "warmup": {
+    "rate": 688.0762577056885,
+    "cached_tokens": 2816,
+    "prompt_tokens": 3000,
+    "gpu": {
+     "n": 4,
+     "n_busy": 4,
+     "sclk_mhz": {
+      "min": 2667.0,
+      "median": 2720.5,
+      "max": 2752.0
+     },
+     "power_w": {
+      "min": 116.055,
+      "median": 120.547,
+      "max": 122.064
+     }
+    }
+   },
+   "median": 679.4333457946777,
+   "spread": 0.0191034301254496,
+   "unit": "ms"
+  },
+  {
+   "name": "regen8000",
+   "runs": [
+    {
+     "rate": 555.023193359375,
+     "cached_tokens": 7936,
+     "prompt_tokens": 8000,
+     "gpu": {
+      "n": 3,
+      "n_busy": 3,
+      "sclk_mhz": {
+       "min": 2797.0,
+       "median": 2807.0,
+       "max": 2818.0
+      },
+      "power_w": {
+       "min": 117.005,
+       "median": 117.02,
+       "max": 117.052
+      }
+     }
+    },
+    {
+     "rate": 574.0842819213867,
+     "cached_tokens": 7936,
+     "prompt_tokens": 8000,
+     "gpu": {
+      "n": 3,
+      "n_busy": 3,
+      "sclk_mhz": {
+       "min": 2792.0,
+       "median": 2803.0,
+       "max": 2814.0
+      },
+      "power_w": {
+       "min": 117.068,
+       "median": 117.08,
+       "max": 117.091
+      }
+     }
+    },
+    {
+     "rate": 572.5829601287842,
+     "cached_tokens": 7936,
+     "prompt_tokens": 8000,
+     "gpu": {
+      "n": 3,
+      "n_busy": 3,
+      "sclk_mhz": {
+       "min": 2787.0,
+       "median": 2797.0,
+       "max": 2809.0
+      },
+      "power_w": {
+       "min": 117.067,
+       "median": 118.005,
+       "max": 118.009
+      }
+     }
+    }
+   ],
+   "warmup": {
+    "rate": 566.7827129364014,
+    "cached_tokens": 7936,
+    "prompt_tokens": 8000,
+    "gpu": {
+     "n": 3,
+     "n_busy": 3,
+     "sclk_mhz": {
+      "min": 2677.0,
+      "median": 2712.0,
+      "max": 2745.0
+     },
+     "power_w": {
+      "min": 114.011,
+      "median": 114.082,
+      "max": 115.029
+     }
+    }
+   },
+   "median": 572.5829601287842,
+   "spread": 0.03328965388303651,
+   "unit": "ms"
+  }
+ ],
+ "amd_smi_after": "{\n    \"gpu_data\": [\n        {\n            \"gpu\": 0,\n            \"power\": {\n                \"socket_power\": \"N/A\",\n                \"gfx_voltage\": \"N/A\",\n                \"soc_voltage\": \"N/A\",\n                \"mem_voltage\": \"N/A\",\n                \"throttle_status\": \"N/A\",\n                \"power_management\": \"N/A\"\n            },\n            \"clock\": {\n                \"gfx_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_4\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_5\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_6\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"gfx_7\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"mem_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"vclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_1\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_2\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"dclk_3\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"fclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                },\n                \"socclk_0\": {\n                    \"clk\": \"N/A\",\n                    \"min_clk\": \"N/A\",\n                    \"max_clk\": \"N/A\",\n                    \"clk_locked\": \"N/A\",\n                    \"deep_sleep\": \"N/A\"\n                }\n            },\n            \"temperature\": {\n                \"edge\": {\n                    \"value\": 61,\n                    \"unit\": \"C\"\n                },\n                \"hotspot\": \"N/A\",\n                \"mem\": \"N/A\"\n            },\n            \"perf_level\": \"AMDSMI_DEV_PERF_LEVEL_AUTO\"\n        }\n    ]\n}",
+ "complete": true
+}

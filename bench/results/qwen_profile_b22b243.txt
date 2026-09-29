@@ -1,0 +1,130 @@
+Qwen3.8-Flash-Next-Uncensored-exl3-4bpw profile, gfx1151, .venv10 (torch 2.15.0.dev20260926+rocm10.0, HIP 7.15), base b22b243 (perf/stack)
+============================================================================================================================
+
+Harness: bench/run_bench.py (server args, -cs 65536, median of 3); rocprofv3 --selected-regions via bench/profile_region.py
+(now takes --extra for model_init flags) + bench/analyze_trace.py. Raw traces and analyses: exlproject/logs/prof/qwen_*.
+The b22b243 -ngr traces were taken with --hip-trace; after an OOM kill (rocprofv3 + 37 GB table in RAM, 2026-09-28 11:08)
+every later trace is disk-streaming mode without --hip-trace, <= 16-32 steps (see "Memory" below).
+
+1. Model shape (why it is not DS4)
+----------------------------------
+hidden 2560, 48 layers = 36 GatedDeltaNet (linear attention) + 12 QSA full attention (24 q / 2 kv heads, head_dim 256,
+indexer-selected 4-token blocks past 2048 tokens), 512 experts top-10 (intermediate 640), 1 shared expert,
+4 fp32 residual streams mixed by GatedResidual "low-rank hyper-connections" at 97 sites per token
+(2 per layer + final mixer), PLE layer at layer 2 fed by a 36.4 GiB hashed n-gram table (16 rows x 160 dims per token).
+
+Weight bytes per decoded token (from quantization_config.json):
+  GatedResidual mix, fp16 (97 x (324 x 10240 + 10240 x 320) x 2 B)      1.28 GB   <- not quantized, untouched by every EXL3 GEMV change
+  dense EXL3 GEMV: GDN qkv/z/out K5 (1.31 GB), attn q/k/v/o/indexer K6
+    (0.46 GB), shared expert K5 (0.15 GB)                               1.92 GB
+  routed experts, 10 x 3 x ~0.82 MB x 48 (K4)                            1.17 GB
+  lm_head K6                                                            0.48 GB
+  router fp16 (48 x 512 x 2560)                                         0.13 GB
+  total                                                                 ~4.98 GB  -> ~23.7 ms/token at ~210 GB/s
+
+Why Qwen is "a weirdo" (+4% from GEMV-tiles vs DS4's +26%): a quarter of its decode bytes are the fp16 GatedResidual
+hyper-connection matrices, which run on their own two hc kernels (gr_dots / gr_finalize), not the EXL3 GEMV; its
+EXL3 GEMVs are K5/K6 (dense) and K4 (experts), already near the bandwidth roof before GEMV-tiles; and its 12 attention
+layers run a graphed Triton split kernel that was compiled without the AMD buffer-op specialization (91.5 us/call
+instead of ~14). GEMV-tiles sped up the part that was already fast; the slow parts were elsewhere.
+
+2. Baselines (b22b243, bench/run_bench.py, median of 3)
+-------------------------------------------------------
+                    -ngr (RAM)     disk streaming
+  pp512 t/s           596.0          596.7
+  pp2048 t/s          749.6          733.1
+  tg128 t/s           26.61          26.67
+  regen3000 ms        377.8          373.1
+  regen8000 ms        305.4          300.4
+  MTP -ndt 2 t/s      39.32 (acc 75%) 39.70 (acc 75%)
+Disk vs RAM: equal within noise on this quiet 124 GB box (the page cache holds the hot rows).
+
+3. Decode trace, ctx 512 (-ngr, 32 steps, b22b243)
+--------------------------------------------------
+  wall 38.81 ms/step, busy 34.77 (89.6%), 1498 kernels/step, gaps 4.02 ms (mean 2.69 us)
+  host: 1 hipDeviceSynchronize (sampling) + 1 hipEventSynchronize (n-gram staging-set reuse) per token; no D2H copies.
+  n-gram path per token: hash + 16-row gather on the CPU (index_select in RAM mode, preads in disk mode, page-cache warm),
+  3 small pinned H2D uploads (run as rocclr copyBuffer kernels) + ngram_dequant; no disk wait visible: disk mode
+  39.08 ms/step vs 38.81 (-ngr), same kernel list. The PLE layer is not a bottleneck.
+
+  by class (ms/token)          b22b243   after (6684d1d, disk mode trace)   GB/s before -> after
+  GatedResidual mix             9.53        7.14                              134 -> 179
+  dense EXL3 GEMV              10.55       10.57                              182
+  routed MoE (moe_dec_*)        6.98        6.95                              168
+  lm_head                       2.09        2.10                              228 (roofline)
+  GDN recurrent/conv/ba         1.93        1.93
+  GQA/QSA attention split       1.11        0.47   (8K: 1.40 -> 0.62; per call 91.5 -> 31.8 us)
+  router + top-k                0.97        0.96
+  hc_apply                      0.18        0.19
+  hipBLAS (PLE projections)     0.24        0.24
+  other                         1.19        1.15
+  gaps                          4.02        4.11
+  busy / wall                  34.77/38.81 31.69/35.83
+
+  top-15 kernels, b22b243 (us/step, calls, avg us, VGPR, scratch):
+   6182  102  60.6  56    0  exl3_gemv_mr_dot_single<5,true,2,8,1>   (GDN qkv/z/out, shared)
+   5900   97  60.8  32    0  gr_dots_kernel<4>                        <- item 1
+   4191   47  89.2  40    0  exl3_moe_dec_dot<4,false,2,8>            (routed gate+up)
+   3633   97  37.5  56    0  gr_finalize_kernel<4,true>
+   2346   47  49.9  40    0  exl3_moe_dec_dot<4,true,2,4>             (routed down, weighted)
+   2090    1  2090  72    0  exl3_gemv_dot_kernel<6>                  (lm_head)
+   1342   12 111.9  56    0  exl3_gemv_mr_dot_single<6,false,2,8,1>   (q_proj)
+   1284   36  35.7  80    0  cuda_recurrent_gated_delta_rule_kernel_128
+   1107   12  92.3 256  660  _paged_attn_decode_split_kernel          <- item 2 (spills; JIT-launched twin: 13.5 us)
+   1091   18  60.6  56    0  exl3_gemv_mr_dot_single<6,true,2,8,1>
+    763   48  15.9  56    0  routing_gemv_rdna_w16_kernel<8>
+    731   47  15.6  56    0  exl3_gemv_mr_dot_multi<5,false,2,16,1>
+    500   36  13.9  16    0  gdn_ba_gemv_kernel
+    402  192   2.1  16    0  exl3_gemv_mr_had_in_single
+    398   46   8.6  56    0  exl3_gemv_mr_dot_single<5,true,2,4,1>
+
+4. Decode trace, ctx 8192 (-ngr, 32 steps, b22b243)
+---------------------------------------------------
+  wall 40.21, busy 35.11 ms/step; 1546 kernels. Same classes; QSA sparse split kernel 117 us x 12 (256 VGPR, 784 B scratch).
+  2.3 D2H hipMemcpyWithStream per step (indexer / generator side).
+
+5. MTP -ndt 2 (disk mode, 16 steps, after d365a4f)
+--------------------------------------------------
+  wall 61.7 ms/step for ~1.94 tokens, busy 54.0. Routed gate+up at m=3 214 us x 47 (distinct experts per row: inherent),
+  router at m=3 on hgemm 105 us x 48 = 5.0 ms/step <- item 3 (the multi-row router GEMV existed but routing_std only
+  passed the transposed gate at bsz 1); graphed attention split 163 us/call at q_len 3 <- item 2.
+
+6. Prefill trace, pp2048 (-ngr, b22b243; 2 forwards per prompt: 1792 + 255 rows, recurrent last-page split = Q-12, kept)
+--------------------------------------------------------------------------------------------------------------------
+  wall 1405 ms/forward avg, busy 1344 (95.7%), gaps 59 ms. Host: 133 hipMemcpyWithStream + 47 hipStreamSynchronize per
+  forward (36.5 D2H copies: MoE expert-count readbacks, ~1 per layer) -- present, < 5%.
+  by class (ms per forward):   b22b243    after
+   fused MoE exl3_moe_kernel     256.7     255.6
+   WMMA GEMM (recon linears)     255.3     272.8  (same kernels; profiler variance)
+   torch elementwise+mean        157.1       0    <- item 1b: GatedResidual gate-mean (2 fp32 upcasts, sigmoid, mul, mean)
+   GR gate-mean kernel             -        22.6
+   GDN chunked (fla)             133.4     149.4  (recompute_w_u spills 1608 B; vendored, untouched)
+   Hadamard                       63.5      78.4
+   hipBLAS (GR matmuls)           54.0      54.1
+   paged attention prefill        45.3      46.9  (256 VGPR + 772 B scratch) <- item 4
+   index/gather (torch)           41.8      59.0
+   hc_apply                       37.6      38.5
+   rms_norm                       28.7      29.3
+
+7. Ranked list (measured ms saved / effort)
+------------------------------------------
+  1. GatedResidual decode mix: one fn row per block, each block re-reads the 40 KB stream stack; 325 blocks with ~2.5
+     dependent trips per stream. 4 rows per block, streams in registers: 60.8 -> 36.3 us/site, -2.4 ms/token.
+     Prefill: the torch gate-mean tail 3.6 ms/site at R=2048 -> 0.4 ms. DONE (d365a4f), bit-identical.
+  2. Graphed GQA decode attention compiled without tt.pointer_range / tt.divisibility: 91.5 -> 31.8 us/call
+     (-0.7 ms/token at 512, -0.8 at 8K, -1.2 ms per MTP step). DONE (6684d1d), bit-identical.
+  3. MTP verify router on hgemm (105 us x 48): multi-row router GEMV, 40 us; -3.1 ms/step. DONE (6684d1d); MTP greedy
+     now token-identical to plain greedy.
+  4. Paged prefill attention at head_dim 256 spills: 1-stage 128-row tile, kernel 2-3x (up to 3x at 16K past); e2e
+     pp2048 +1.8%, Gemma pp2048 +4%. DONE (this branch, EXL3_ROCM_PREFILL_HD256).
+  5. (not done) GR hc_apply folded into the next site's gr_dots (as DS4's HC_FUSE): 96 launches, ~0.45 ms/token.
+  6. (not done) GR prefill matmuls on hipBLAS at 17-25 TF (54 ms/forward): the WMMA backend needs a row-major B, i.e.
+     transposed copies of proj/up (+1.3 GB) -- memory the -ngr/-ngl budget does not have.
+  7. (not done) Decode gaps 4.1 ms/token (1498 launches); GDN in_proj / ba / conv / recurrent fusion is the lever.
+  8. (not done) GDN chunked prefill (vendored fla recompute_w_u spills 1608 B): autotuned; upstream-vendored code.
+
+8. Memory
+---------
+  -ngr: model 65 GB (UMA, GTT) + table 36.4 GiB + cache: ~105 GB resident of 124. rocprofv3 with --hip-trace on top of
+  that was OOM-killed (40.8 GB anon of the tracer process). Qwen traces after that: disk mode (equal speed), no hip-trace,
+  jobs under systemd-run --user --scope -p MemoryMax=112G -p MemorySwapMax=0.
