@@ -527,6 +527,7 @@ async def lifespan(app: FastAPI):
         draft_cache = state.draft_cache,
         num_draft_tokens = a.num_draft_tokens,
         ngram_match_min = a.ngram_match_min,
+        ngram_corpus = getattr(a, "ngram_corpus", None),   # v1.5.3 model_init -ngram_corpus
         dynamic_draft_tokens = a.dynamic_draft,
         draft_confidence = a.draft_confidence,
         max_chunk_size = a.prefill_chunk_size,
@@ -1099,6 +1100,9 @@ if __name__ == "__main__":
     parser.add_argument("-dryal", "--dry_allowed_length", type = int, default = 2, help = "DRY allowed repeat length, default = 2")
     parser.add_argument("-pcs", "--prefill_chunk_size", type = int, default = 2048, help = "Prompt tokens per prefill forward pass (Generator max_chunk_size), default: 2048. Larger chunks amortize weight streaming on MoE models; -chunk_size is raised to match if smaller")
     parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "Load the n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) into RAM like -ngr AND lock it there (mlock): its pages are never swapped out or reclaimed. Needs RLIMIT_MEMLOCK >= the table size (ulimit -l / systemd LimitMEMLOCK / CAP_IPC_LOCK); checked before loading, with instructions if too low. Without -ngl/-ngr the table streams from disk")
-    parser.add_argument("-nwu", "--no_warmup", action = "store_true", help = "Skip the startup warmup (two short jobs that absorb JIT/graph-capture cost before the first request)")
+    # v1.5.3: model_init now owns -nw/--no_warmup (it skips model.warmup(), upstream's post-load
+    # forward-pass schedule that init() runs by default). -nwu stays as an alias of the same flag, and
+    # skips both that and the server's own two-job Generator warmup below
+    parser.add_argument("-nwu", dest = "no_warmup", action = "store_true", help = "Alias of -nw: skip model_init's post-load warmup and the server's startup warmup (two short jobs that absorb JIT/graph-capture cost before the first request)")
     parser.add_argument("-dryln", "--dry_penalty_last_n", type = int, default = -1, help = "DRY scan range in tokens, -1 = whole context (default), 0 disables")
     main(parser.parse_args())

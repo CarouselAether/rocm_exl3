@@ -93,7 +93,7 @@ __global__ __launch_bounds__(256)
 void gemm_launch(const half* A, const uint16_t* B, void* C,
                  int m, int k, int n, int* locks)
 {
-    exl3_gemm_kernel_inner<bits, c_fp32, cb, TM, TK, TN, SH, FR, false>
+    exl3_gemm_kernel_inner<bits, false, c_fp32, cb, TM, TK, TN, SH, FR, false>
         (A, B, C, m, k, n, locks, nullptr);
 }
 

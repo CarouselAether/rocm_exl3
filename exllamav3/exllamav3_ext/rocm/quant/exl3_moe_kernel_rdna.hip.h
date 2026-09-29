@@ -152,18 +152,23 @@ void moe_gemm_tile
     constexpr int FS = (MT >= 64) ? 2 : MOE_FRAG_STAGES;
     #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr
     #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
+    // v1.5.3: runtime K arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd =
+    // the half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, the host checks). Same mapping as upstream
     if constexpr (t_bits)
-        exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+        exl3_gemm_kernel_inner<t_bits, false, false, cb, SHAPE_ARGS, false>(ARGS);
     else switch(K)
     {
-        case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 2:  exl3_gemm_kernel_inner<1, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 4:  exl3_gemm_kernel_inner<2, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 6:  exl3_gemm_kernel_inner<3, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 8:  exl3_gemm_kernel_inner<4, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 10: exl3_gemm_kernel_inner<5, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 12: exl3_gemm_kernel_inner<6, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 14: exl3_gemm_kernel_inner<7, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 16: exl3_gemm_kernel_inner<8, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 3:  if constexpr (cb == 2) exl3_gemm_kernel_inner<1, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 5:  if constexpr (cb == 2) exl3_gemm_kernel_inner<2, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 7:  if constexpr (cb == 2) exl3_gemm_kernel_inner<3, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
     };
     #undef ARGS
     #undef SHAPE_ARGS
@@ -208,16 +213,19 @@ void moe_gemm_rows_pipe
         }
         else
         {
+            // Half-bit units as above (v1.5.3). The pipelined mainloop decodes integer K only: the host
+            // (exl3_moe_rdna.hip) routes any half-integer rate to the non-pipelined kernel, so odd codes
+            // never reach this switch
             switch (K)
             {
-                case 1: moe_pipe::moe_gemm_pipe<1, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
-                case 2: moe_pipe::moe_gemm_pipe<2, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
-                case 3: moe_pipe::moe_gemm_pipe<3, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
-                case 4: moe_pipe::moe_gemm_pipe<4, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
-                case 5: moe_pipe::moe_gemm_pipe<5, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
-                case 6: moe_pipe::moe_gemm_pipe<6, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
-                case 7: moe_pipe::moe_gemm_pipe<7, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
-                case 8: moe_pipe::moe_gemm_pipe<8, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 2:  moe_pipe::moe_gemm_pipe<1, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 4:  moe_pipe::moe_gemm_pipe<2, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 6:  moe_pipe::moe_gemm_pipe<3, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 8:  moe_pipe::moe_gemm_pipe<4, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 10: moe_pipe::moe_gemm_pipe<5, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 12: moe_pipe::moe_gemm_pipe<6, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 14: moe_pipe::moe_gemm_pipe<7, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
+                case 16: moe_pipe::moe_gemm_pipe<8, cb, 1, MOE_TILESIZE_K, N_TILE>(PIPE_ARGS(16)); break;
             }
             tm = 16;
         }

@@ -113,7 +113,9 @@ void exl3_gemm_kernel_inner
     constexpr int SH_A_STRIDE = TILESIZE_K + 8;
 
     constexpr int sh_a_stage_size = TILESIZE_M * SH_A_STRIDE;                    // halfs
-    constexpr int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;  // uint16s
+    // v1.5.3: uint16 per 16x16 trellis tile; a half-integer rate (bits + 0.5, mul1) carries 16 * bits + 8
+    constexpr int TILE_U16 = 16 * bits + (half_k ? 8 : 0);
+    constexpr int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * TILE_U16;  // uint16s
     // 18, not 17 -- see EXL3_GEMM_SH_B_DQ_STRIDE in exl3_kernel_map_rdna.hip.h
     // for the measurement and for why this must not be retyped as a literal
     // here (the host-side LDS accounting drifted from it once already).
@@ -225,8 +227,8 @@ void exl3_gemm_kernel_inner
         pred_a_gl[i] = (idx < TILESIZE_M * A_VEC_PER_ROW) && (m < size_m);
     }
 
-    const int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * 256 / 16 * bits;
-    const int gl_b_stride_n = TILEBLOCKS_N * 256 / 16 * bits;
+    const int gl_b_stride_k = blocks_n_full * TILEBLOCKS_K * TILE_U16;
+    const int gl_b_stride_n = TILEBLOCKS_N * TILE_U16;
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
     uint16_t* sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
 
@@ -239,7 +241,7 @@ void exl3_gemm_kernel_inner
         int idx = i * EXL3_GEMM_BASE_THREADS + t;
         int n = idx % (gl_b_stride_n / 8);
         int k = idx / (gl_b_stride_n / 8);
-        load_b_gl[i] = k * (blocks_n_full * 256 / 16 * bits / 8) + n;
+        load_b_gl[i] = k * (blocks_n_full * TILE_U16 / 8) + n;
         pred_b_gl[i] = idx < sh_b_stage_size / 8;
     }
 
@@ -374,10 +376,10 @@ void exl3_gemm_kernel_inner
             // Identical to warp_id whenever TILEBLOCKS_K == 1.
             half* B_lds = sh_b_dq + (warp_id + sub_k * NUM_WARPS) * 16 * SH_B_DQ_STRIDE;
             const uint32_t* b_quant =
-                (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + n_idx) * 256 / 16 * bits);
+                (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + n_idx) * TILE_U16);
 
             FragB frag0, frag1;
-            dq_dispatch<bits, cb>(b_quant, lane_id << 3, frag0, frag1);
+            dq_dispatch<bits, cb, half_k>(b_quant, lane_id << 3, frag0, frag1);
 
             // Same shuffle pattern as reconstruct.cu: lanes with bit 2 clear
             // combine their own values with those of lane+4 and write the

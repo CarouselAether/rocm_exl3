@@ -402,17 +402,33 @@ class _SplitProxy:
         self.orig = orig
         self.__name__ = orig.__name__
 
+    @staticmethod
+    def _mqa_kw(kw, t):
+        kw = dict(kw)
+        kw.update(HP = t[0], BD = t[1], KC = CFG["kc"], KSTAGES = CFG["kstages"],
+                  BLOCK_N = CFG["block_n"], BLOCK_W = CFG["block_w"],
+                  num_warps = CFG["num_warps"], num_stages = CFG["num_stages"])
+        return kw
+
     def __getitem__(self, grid):
         def launch(*args, **kw):
             t = eligible(kw)
             if t is None:
                 return self.orig[grid](*args, **kw)
-            kw = dict(kw)
-            kw.update(HP = t[0], BD = t[1], KC = CFG["kc"], KSTAGES = CFG["kstages"],
-                      BLOCK_N = CFG["block_n"], BLOCK_W = CFG["block_w"],
-                      num_warps = CFG["num_warps"], num_stages = CFG["num_stages"])
-            return _dsa_decode_mqa_kernel[grid](*args, **kw)
+            return _dsa_decode_mqa_kernel[grid](*args, **self._mqa_kw(kw, t))
         return launch
+
+    def run(self, *args, grid, warmup, **kw):
+        """v1.5.3: dsa_attn walks a (BLOCK_H, BLOCK_N, stages) ladder against the device's shared
+        memory, probing each candidate with a compile-only kernel.run(warmup = True)
+        (attention_fn/smem.py shared_bytes). Answer for the kernel that will actually launch:
+        the MQA kernel's footprint for eligible calls (it ignores the ladder's BLOCK_N / stages,
+        so the stock candidate fits and the pick is the pre-ladder BLOCK_H), the upstream
+        kernel's otherwise."""
+        t = eligible(kw)
+        if t is None:
+            return self.orig.run(*args, grid = grid, warmup = warmup, **kw)
+        return _dsa_decode_mqa_kernel.run(*args, grid = grid, warmup = warmup, **self._mqa_kw(kw, t))
 
     def __getattr__(self, name):
         return getattr(self.orig, name)

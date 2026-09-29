@@ -63,7 +63,7 @@ __global__ __launch_bounds__(512) MIB_WPE void mib_kernel
             int tm;
             if constexpr (MODE == 0)
             {
-                exl3_gemm_kernel_inner<BITS, false, CB, 16, 32, NT, MOE_SH_STAGES, MOE_FRAG_STAGES, false>
+                exl3_gemm_kernel_inner<BITS, false, false, CB, 16, 32, NT, MOE_SH_STAGES, MOE_FRAG_STAGES, false>
                     (in, B[e], out, MIN(size_m, 16), size_k, size_n, locks, nullptr);
                 tm = 16;
             }

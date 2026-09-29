@@ -10,11 +10,22 @@
 // regenerated mechanically on rebase and audited by diff. Same exported
 // symbols. Why: see the comment above routing_gemv_rdna_kernel.
 // EXL3_ROCM_ROUTER_GEMV=0 restores upstream behaviour in the same build.
+//
+// v1.5.3 sync (three-way merge, base v1.5.0): upstream's deterministic router
+// math (exp_det / softplus_det / __fdiv_rn / __fsqrt_rn from det_gemm.cuh, for
+// cross-architecture TP agreement) and the gate_i8 / gate_sb arguments that
+// select the int8 routing_gemm_det path at bsz > 1. That path declines on ROCm
+// (rocm/routing_gemm_rdna.hip), so bsz 2..8 keeps the RDNA router GEMV and
+// larger calls hgemm, as before. EXL3_ROCM_ROUTER_DET=0 puts the score
+// activations and top-k softmax back on the v1.5.0 fast-math forms
+// (__expf, log1pf, sqrtf, IEEE-default division) -- a bisect handle for the
+// only v1.5.3 numerics change on DS4's decode path; see RDNA_NOTES.
 // =============================================================================
 
 #include <cstdlib>
 #include <cuda_fp16.h>
 #include "routing.cuh"
+#include "det_gemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -27,11 +38,46 @@
 
 using bfloat16 = __nv_bfloat16;
 
+// ROCm sibling: EXL3_ROCM_ROUTER_DET (default 1 = v1.5.3 upstream math). A device global rather
+// than a template argument so the dozen top-k kernels keep one instance each; written once per
+// device by routing_det_sync() only when the switch is 0 (the default needs no write).
+__device__ int g_routing_det_rdna = 1;
+
+static void routing_det_sync(cudaStream_t stream)
+{
+    static const int det = []
+    {
+        const char* env = std::getenv("EXL3_ROCM_ROUTER_DET");
+        return (!env || atoi(env) != 0) ? 1 : 0;
+    }();
+    if (det) return;
+    static bool done[64] = {};
+    int device;
+    cudaGetDevice(&device);
+    if (done[device]) return;
+    static const int zero = 0;
+    cuda_check(hipMemcpyToSymbolAsync(HIP_SYMBOL(g_routing_det_rdna), &zero, sizeof(int), 0, cudaMemcpyHostToDevice, stream));
+    done[device] = true;
+}
+
+__device__ __forceinline__ float routing_exp(float x)
+{
+    return g_routing_det_rdna ? exp_det(x) : expf(x);
+}
+
+// Deterministic (FMA-only exp, correctly rounded division): the selection scores must agree
+// bit for bit across tensor-parallel ranks of different architectures
 __device__ __forceinline__
 float sigmoid_stable_hf(float xf)
 {
-    float ez = __expf(-fabsf(xf));
-    float base = ez / (1.0f + ez);
+    if (!g_routing_det_rdna)
+    {
+        float ez = __expf(-fabsf(xf));
+        float base = ez / (1.0f + ez);
+        return (xf >= 0.0f) ? 1.0f - base : base;
+    }
+    float ez = exp_det(-fabsf(xf));
+    float base = __fdiv_rn(ez, __fadd_rn(1.0f, ez));
     return (xf >= 0.0f) ? 1.0f - base : base;
 }
 
@@ -47,8 +93,12 @@ float routing_act(float xf)
     if constexpr (ACT == ROUTING_ACT_SQRTSP)
     {
         // sqrt(softplus(x)), matching torch F.softplus(beta = 1, threshold = 20)
-        float sp = xf > 20.0f ? xf : log1pf(__expf(xf));
-        return sqrtf(sp);
+        if (!g_routing_det_rdna)
+        {
+            float sp = xf > 20.0f ? xf : log1pf(__expf(xf));
+            return sqrtf(sp);
+        }
+        return __fsqrt_rn(softplus_det(xf));
     }
     else
         return sigmoid_stable_hf(xf);
@@ -487,10 +537,18 @@ void routing_gemv
     const at::Tensor& hidden,
     const at::Tensor& gate,
     const c10::optional<at::Tensor>& gate_t,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb,
     at::Tensor& scores,
     cudaStream_t stream
 )
 {
+    // Single rows take the fixed-order FMA GEMV (exact on every architecture, and the fastest);
+    // with the int8 gate available every other row count takes the deterministic int8
+    // tensor-core projection (routing_gemm.cu), so tensor-parallel ranks of any sm_80+
+    // architecture routing on identical streams select identical experts (the int8 kernels
+    // need cp.async and mma.m16n8k32, both sm_80+). Pre-Ampere devices fall back to cuBLAS,
+    // which is device-dependent — uniform per-arch fleets still agree with each other
     int k = hidden.size(-1);
     int E = scores.size(-1);
     bool bsz1 = hidden.numel() == k;
@@ -526,7 +584,11 @@ void routing_gemv
         }
     }
 
-    if (bsz1 && gate_t.has_value() && !(k & 1))
+    if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
+    {
+        routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
+    }
+    else if (bsz1 && gate_t.has_value() && !(k & 1))
     {
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
         (
@@ -772,7 +834,7 @@ __global__ void routing_std_topk_kernel
         float e;
         int out_idx;
         warp_topk_shared(sh_key, nullptr, num_experts, K, e, out_idx);
-        e = lane_id < K ? expf(e - max_logit) : 0.0f;
+        e = lane_id < K ? routing_exp(e - max_logit) : 0.0f;
         float sum = warp_reduce_sum_first_k(e, K) + 1e-20f;
         e /= sum;
 
@@ -879,7 +941,7 @@ __global__ void routing_std_kernel
     if (warp_id == 0)
     {
 
-        float e = expf(__half2float(v));
+        float e = routing_exp(__half2float(v));
         float sum = warp_reduce_sum_first_k(e, K) + 1e-20;
         e /= sum;
 
@@ -1078,18 +1140,21 @@ void routing_ds3_nogroup
     at::Tensor topk_weights,
     const float scaling_factor,
     const c10::optional<at::Tensor>& gate_t,
-    const int act_fn
+    const int act_fn,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    routing_det_sync(stream);
 
     // RDNA: bsz 1 router GEMV + top-k in one launch (see above)
     if (routing_ds3_nogroup_fused_try(hidden, gate_t, scores, bias, topk_indices, topk_weights,
                                       scaling_factor, act_fn, stream))
         return;
 
-    routing_gemv(hidden, gate, gate_t, scores, stream);
+    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);
@@ -1148,6 +1213,7 @@ void routing_ds3_nogroup_logits
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    routing_det_sync(stream);
 
     TORCH_CHECK_SHAPES_OPT(bias, 0, scores, 1, 1);
     TORCH_CHECK_SHAPES(scores, 0, topk_indices, 0, 1);
@@ -1265,6 +1331,7 @@ void moe_split_map
 {
     const at::cuda::OptionalCUDAGuard device_guard(sel.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    routing_det_sync(stream);
     TORCH_CHECK_DTYPE(sel, kLong);
     TORCH_CHECK_DTYPE(map, kLong);
     TORCH_CHECK_DTYPE(hist, kFloat);
@@ -1390,6 +1457,7 @@ void moe_split_issue
 {
     const at::cuda::OptionalCUDAGuard device_guard(sel.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    routing_det_sync(stream);
     TORCH_CHECK_DTYPE(sel, kLong);
     TORCH_CHECK_DTYPE(y, kHalf);
     TORCH_CHECK_DTYPE(w, kHalf);
@@ -1451,6 +1519,7 @@ void moe_split_collect_add
 {
     const at::cuda::OptionalCUDAGuard device_guard(final_out.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    routing_det_sync(stream);
     TORCH_CHECK_DTYPE(final_out, kFloat);
     TORCH_CHECK_DTYPE(dev_count, kInt);
     TORCH_CHECK(final_out.is_contiguous(), "moe_split_collect_add: output must be contiguous");
@@ -1507,13 +1576,16 @@ void routing_sel_norm
     at::Tensor weights,
     const float scaling_factor,
     const c10::optional<at::Tensor>& gate_t,
-    const int act_fn
+    const int act_fn,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    routing_det_sync(stream);
 
-    routing_gemv(hidden, gate, gate_t, scores, stream);
+    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);
@@ -1563,13 +1635,16 @@ void routing_std
     at::Tensor topk_weights,
     const c10::optional<at::Tensor>& per_expert_scale,
     const c10::optional<at::Tensor>& gate_t,
-    const c10::optional<at::Tensor>& bias
+    const c10::optional<at::Tensor>& bias,
+    const c10::optional<at::Tensor>& gate_i8,
+    const c10::optional<at::Tensor>& gate_sb
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    routing_det_sync(stream);
 
-    routing_gemv(hidden, gate, gate_t, scores, stream);
+    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);
@@ -1623,6 +1698,7 @@ void routing_std_logits
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    routing_det_sync(stream);
 
     TORCH_CHECK_SHAPES(scores, 0, topk_indices, 0, 1);
     TORCH_CHECK_SHAPES(scores, 0, topk_weights, 0, 1);

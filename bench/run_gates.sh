@@ -23,7 +23,12 @@ T=$TT/tests
 mkdir -p "$T"
 cp -r "$REPO/tests/." "$T/"
 ln -s "$REPO/exllamav3" "$TT/exllamav3"
+ln -s "$REPO/util" "$TT/util"      # v1.5.3 test_build_sam.py loads ../util/build_sam.py
 sed -i -E 's/"cuda:[1-9]"/"cuda:0"/g' "$T"/*.py
+# v1.5.3: upstream's test_mla.py FakeSTC (also used by test_mla_dsa.py) predates the loader's new
+# get_tensor(..., arena=) keyword that linear.py now passes, so all of test_mla fails on CUDA too.
+# Accept the keyword in the scratch copy rather than lose the MLA coverage
+sed -i -E 's/^(\s+fidx = None)\):$/\1, arena = True):/' "$T/test_mla.py"
 
 fail=0
 step() {   # name, command...
@@ -48,7 +53,10 @@ step wmma_gate          env LD_LIBRARY_PATH="$ROOT/.venv10/lib/python3.12/site-p
 # kernels the port rejects by design with a RuntimeError: hgemm_f16acc (inline PTX; hipBLAS is
 # used instead) and exl3_moe_coop (PTX GEMV; disabled on ROCm). Baseline 97063b3 + torch nightly
 # 2.15.0.dev20260926: 879 passed, 11 skipped.
-IGNORE="test_hgemm_f16acc.py test_moe_coop.py test_device_copy_.py test_qgemm.py test_quant_fn.py test_ngram_prefetch_.py test_dsv4_cached.py test_dsv4_state.py"
+# v1.5.3 adds two more CUDA-only-by-design exclusions: test_routing_gemm_det.py (int8 mma.sync
+# router GEMM; rocm/routing_gemm_rdna.hip declines it) and test_gr_mix_tiled.py (tiled int8
+# GatedResidual mix; upstream's own GatedResidual gates it off under torch.version.hip).
+IGNORE="test_routing_gemm_det.py test_gr_mix_tiled.py test_hgemm_f16acc.py test_moe_coop.py test_device_copy_.py test_qgemm.py test_quant_fn.py test_ngram_prefetch_.py test_dsv4_cached.py test_dsv4_state.py"
 step pytest             "$PY" -m pytest -q -p no:cacheprovider $(for f in $IGNORE; do echo --ignore="$T/$f"; done) "$T"
 rm -rf "$TT"
 echo " -- gates $([ $fail -eq 0 ] && echo PASS || echo FAIL)"

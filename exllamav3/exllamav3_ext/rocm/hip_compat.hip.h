@@ -155,6 +155,21 @@ using cudaDeviceAttr = hipDeviceAttribute_t;
         hipDeviceAttributeSharedMemPerBlockOptin
 #define cudaDevAttrMaxThreadsPerBlock       hipDeviceAttributeMaxThreadsPerBlock
 #define cudaDevAttrWarpSize                 hipDeviceAttributeWarpSize
+// v1.5.3 (routing_gemm.cu / hc_mix_tiled.cu arch gates; the RDNA siblings keep the query and
+// decline on ROCm regardless of its value -- see routing_gemm_rdna.hip)
+#define cudaDevAttrComputeCapabilityMajor   hipDeviceAttributeComputeCapabilityMajor
+#define cudaDevAttrComputeCapabilityMinor   hipDeviceAttributeComputeCapabilityMinor
+
+// v1.5.3: det_gemm.cuh's det_smem_u32 takes a shared-window address for its cp.async / ldmatrix
+// PTX. HIP has no __cvta_generic_to_shared; this is the same conversion on AMDGPU (generic ->
+// LDS address space 3, whose pointers are the 32-bit LDS offsets). Only reachable from
+// det_gemm.cuh's PTX helpers, which the device pass compiles out (__CUDA_ARCH__ 1 < 800).
+#if defined(__HIPCC__) && !defined(__cvta_generic_to_shared)
+__device__ __forceinline__ size_t __cvta_generic_to_shared(const void* p)
+{
+    return (size_t) (__attribute__((address_space(3))) const char*) p;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Driver API

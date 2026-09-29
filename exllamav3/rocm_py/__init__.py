@@ -86,12 +86,25 @@ Environment switches (all default to the safe value for this backend):
                            the next site's mix
   EXL3_ROCM_HC_NORM=0      the RMSNorm after each mHC mix runs as its own launch
   EXL3_ROCM_GR_PREFILL=0   GatedResidual (Qwen3.8) prefill gate-mean back on torch ops
-  EXL3_ROCM_ROUTER_STD_MR=0  "std" routing at 2..8 rows back on hgemm (upstream)
   EXL3_ROCM_PREFILL_HD256=0  paged prefill attention at head_dim 256 on upstream's tile
   EXL3_ROCM_BC_BUFOPS=0    graphed GQA decode attention kernels compiled without the
                            buffer-op / alignment attributes the Triton JIT would add
   (C++ side, same build: EXL3_ROCM_ROUTER_GEMV=0, EXL3_ROCM_ROUTER_FUSE=0,
   EXL3_ROCM_MR_WEIGHTED=0, EXL3_ROCM_HC_DPP=0 -- see RDNA_NOTES "Decode leftovers")
+
+  Added at the v1.5.3 sync (2026-09-29):
+
+  EXL3_ROCM_PREFILL_HD128=0  paged prefill attention at head_dim <= 128 on v1.5.3's
+                           4-warp tile instead of the RDNA 8-warp one
+  EXL3_ROCM_ROUTER_I8=1    build upstream's int8 router tables (unused on ROCm)
+  EXL3_ROCM_GR_FUSED_R=N   GatedResidual fused-decode row bound (default 32, the
+                           v1.5.0 value; upstream lowered it to 8 for a tiled int8
+                           path that does not exist on ROCm)
+  EXL3_ROCM_SMEM_LIMIT=0   leave attention_fn/smem.py's per-device budget on its
+                           CUDA default (torch on ROCm has no opt-in property, so
+                           it would read 96 KB for a 64 KB part)
+  (C++ side: EXL3_ROCM_ROUTER_DET=0 router activations on v1.5.0 fast math;
+  EXL3_ROCM_GR_DOTS=0 now selects upstream v1.5.3's GatedResidual decode pair)
 
 These are bisect handles, not permanent policy -- turn one on, run a prompt, see
 whether the output degrades. Each one's justification is a measurement recorded
@@ -196,6 +209,38 @@ def apply() -> list[str]:
         applied.append("triton not installed -- hsaco alias skipped")
     except Exception as e:
         applied.append(f"!! FAILED triton hsaco alias: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # v1.5.3 attention_fn/smem.py: the per-device shared-memory budget
+    # ------------------------------------------------------------------
+    # smem.smem_limit() reads torch's shared_memory_per_block_optin and, when it is missing,
+    # guesses 64 KB below compute capability 8 and 96 KB above. torch on ROCm has no opt-in
+    # property and reports gfx major 11, so every RDNA part would read 96 KB -- over the 64 KB
+    # an RDNA workgroup can allocate -- and the config ladders (paged prefill / decode, DSA,
+    # MLA) and bc_attn's BCKernelTooLarge gate would vet footprints the device cannot launch.
+    # shared_memory_per_block (hipDeviceProp.sharedMemPerBlock, 64 KB on gfx1151) is the real
+    # limit; seed smem._limit with it for every device (EXL3_TRITON_SMEM_LIMIT still caps it).
+    # Before v1.5.3 there were no ladders, so the stock tiles ran as-is; they fit 64 KB, so the
+    # ladders keep picking them and nothing changes unless a tile does not fit.
+    # EXL3_ROCM_SMEM_LIMIT=0 leaves upstream's guess.
+    if _env_on("EXL3_ROCM_SMEM_LIMIT", True):
+        try:
+            import torch as _tsm
+            from ..modules.attention_fn import smem as _smm
+            _seeded = []
+            if _tsm.cuda.is_available():
+                for _i in range(_tsm.cuda.device_count()):
+                    _p = _tsm.cuda.get_device_properties(_i)
+                    _lim = getattr(_p, "shared_memory_per_block_optin", 0) or getattr(_p, "shared_memory_per_block", 0)
+                    if _lim:
+                        if _smm._env_limit:
+                            _lim = min(_lim, _smm._env_limit)
+                        _smm._limit[_i] = _lim
+                        _seeded.append(_lim)
+            applied.append("attention smem budget from sharedMemPerBlock: "
+                           + (", ".join(f"{v // 1024} KB" for v in _seeded) or "no devices"))
+        except Exception as e:
+            applied.append(f"!! FAILED smem budget patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # DSA split kernel: RDNA tile/wave retune (spill + queue-stall fix)
@@ -603,7 +648,7 @@ def apply() -> list[str]:
                     top_k = selected_experts.shape[-1]
                     S = bsz * top_k
                     fz = mod._rocm_fused
-                    if fz is not None and 2 * S <= fz["rows"] and y.is_contiguous():
+                    if fz is not None and S <= fz["max_s"] and y.is_contiguous():
                         torch.ops.exl3_rocm.moe_decode(
                             y, selected_experts, routing_weights,
                             fz["gu_trellis"], fz["gu_suh"], fz["gu_svh"],
@@ -721,6 +766,11 @@ def apply() -> list[str]:
                         return None
                     if mg.K != mu.K or bool(mg.mcg) != bool(mu.mcg) or bool(mg.mul1) != bool(mu.mul1):
                         return None
+                    # v1.5.3 half-integer bitrates (LinearEXL3.K 1.5 / 2.5 / 3.5): the multi-row
+                    # GEMV cores decode integer K only; those layers stay on the mgemm route,
+                    # whose exl3_mgemm runs them on the cooperative kernel
+                    if not all(float(ml.K).is_integer() for ml in (mg, mu, md)):
+                        return None
                     if any(getattr(l.inner, "bias", None) is not None for ml in (mg, mu, md) for l in ml.linears):
                         return None
                     I = cfg.interm_a.shape[-1]
@@ -729,8 +779,16 @@ def apply() -> list[str]:
                     if cfg.out_d.dtype != torch.float or Hi % 128 or I % 128 or cfg.out_d.shape[-1] % 128:
                         return None
                     cbk = lambda ml: 2 if ml.mul1 else (1 if ml.mcg else 0)
+                    # Slot bound: the scratch (2 * rows gate|up slots) and the op's arrival
+                    # counters (exl3_gemv_multirow_rdna.hip: 2S <= 128, 2S * I/128 and S * Ho/128
+                    # within EXL3_MGEMV_SEG_COUNTERS = 128 * 256). Larger calls -- Qwen3.8's
+                    # top_k 10 at 7..8 rows, reached by v1.5.3's model.warmup "rows 8" pass and
+                    # by 7..8-token prefill chunks -- take the mgemm route instead of raising
+                    seg = 128 * 256
+                    max_s = min(rows, 64, seg // (2 * (I // 128)), seg // (cfg.out_d.shape[-1] // 128))
                     return {
                         "rows": 2 * rows,
+                        "max_s": max_s,
                         "gu_trellis": torch.cat([mg.ptrs_trellis, mu.ptrs_trellis]).contiguous(),
                         "gu_suh": torch.cat([mg.ptrs_suh, mu.ptrs_suh]).contiguous(),
                         "gu_svh": torch.cat([mg.ptrs_svh, mu.ptrs_svh]).contiguous(),
@@ -742,7 +800,10 @@ def apply() -> list[str]:
 
                 def _forward_mgemm_route(self, *args, **kwargs):
                     bc = self.bc
-                    if bc is None:
+                    # Only modules set up by _load_mgemm_route (which sets _rocm_out_alias) take
+                    # the proxy; anything else -- e.g. upstream's test_moe_shared_schedule, which
+                    # drives forward on a stand-in object with a fake bc -- runs upstream verbatim
+                    if bc is None or not hasattr(self, "_rocm_out_alias"):
                         return _orig_bsn_forward(self, *args, **kwargs)
                     self.bc = _BCProxy(bc, self)
                     try:
@@ -750,6 +811,12 @@ def apply() -> list[str]:
                     finally:
                         self.bc = bc
 
+                # v1.5.3 BC_BlockSparseMLP sh_coop: the shared expert as a one-expert exl3_moe_coop
+                # launch inside run_bszN. Never run here (run_bszN is the proxy above and the
+                # tail's Python shared expert runs, bc_sh_exp False), and exl3_moe_coop is a stub
+                # on ROCm; off, so the constructor does not build its parameter block and scratch
+                if hasattr(_bsn, "_moe_shared_coop"):
+                    _bsn._moe_shared_coop = False
                 _bsn_cls.load_local = _load_mgemm_route
                 _bsn_cls.forward = _forward_mgemm_route
                 applied.append("MoE bsz<=MAX_BSZN decode -> per-token exl3_mgemm route (v1.4.4's; mgemv fast path; exl3_moe_coop not ported)")
@@ -1104,6 +1171,12 @@ def apply() -> list[str]:
                     with torch.cuda.device(device):
                         src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
                         ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
+                        # v1.5.3: same shared-memory gate as upstream's _compile_kernel (the
+                        # caller catches BCKernelTooLarge and takes the eager path)
+                        _lim = _bca.smem_limit(device)
+                        if ck.metadata.shared > _lim:
+                            raise _bca.BCKernelTooLarge(
+                                f"{name}: {ck.metadata.shared} B of shared memory exceeds the device's {_lim} B")
                         k = _ext.TritonKernel(ck.asm["cubin"], ck.metadata.name,
                                               ck.metadata.num_warps, ck.metadata.shared)
                     _bufops_cache[key] = k
@@ -1128,48 +1201,41 @@ def apply() -> list[str]:
             applied.append(f"!! FAILED BC bufops patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
-    # "std" softmax routing (Qwen3.8 and kin) at 2..8 rows: the multi-row router GEMV
+    # Router int8 tables (v1.5.3 _gate_t): not built on ROCm
     # ------------------------------------------------------------------
-    # routing_std passes the transposed gate only at bsz 1, so 2..8-row calls (MTP
-    # verify, small batches) send the router to hgemm: on Qwen3.8's (E = 512, k = 2560)
-    # gate a hipBLAS 128x128 tile per call, 105 us for 2.6 MB (48 calls per MTP step,
-    # 5.0 of 58.7 ms busy). rocm/routing_rdna.hip already has the m = 2..8 router GEMV
-    # (DS4's routing_ds3 path, RDNA_NOTES "Decode leftovers") -- it just needs gate_t.
-    # Each row is the m == 1 kernel's chain, so verify-row router logits become
-    # bit-identical to plain decode's (they were hgemm's reduction). Top-k and the
-    # weights are the same routing_std_topk kernel. DS4 (routing_ds3) is untouched.
-    # EXL3_ROCM_ROUTER_STD_MR=0 restores upstream (hgemm at bsz > 1).
-    if _env_on("EXL3_ROCM_ROUTER_STD_MR", True):
+    # block_sparse_mlp_routing._gate_t now builds, next to the transposed gate, an int8 hi/lo
+    # copy + row scales (ext.det_quant_weight) for the deterministic multi-row router GEMM
+    # (routing_gemm.cu). That GEMM is sm_80 PTX; on ROCm rocm/routing_gemm_rdna.hip declines it
+    # (routing_gemm_det_fits -> False), so the tables would be dead weight: 2 * E * K bytes per
+    # MoE layer (DS4 ~90 MB, Qwen3.8 ~126 MB) plus a quantize launch per router at first use.
+    # This keeps _gate_t to the transposed gate; with gate_i8 None the ext routing takes its
+    # non-det path, which is what it takes on ROCm anyway -- same kernels, same results.
+    # EXL3_ROCM_ROUTER_I8=1 restores upstream's _gate_t.
+    #
+    # (Retired here: EXL3_ROCM_ROUTER_STD_MR. It passed gate_t to ext.routing_std at bsz 2..8 so
+    # the RDNA multi-row router GEMV served MTP verify rows. v1.5.3's routing_std passes gate_t at
+    # every bsz itself, so upstream now reaches the same kernel with no hook.)
+    if not _env_on("EXL3_ROCM_ROUTER_I8", False):
         try:
-            import torch
             from ..modules import block_sparse_mlp_routing as _bsr
-            from ..modules import block_sparse_mlp as _bsm
-            from ..ext import exllamav3_ext as _ext
-            _orig_routing_std = _bsr.routing_std
+            _orig_gate_t = _bsr._gate_t
 
-            def _routing_std_rdna(bsz, cfg, y, params):
-                if 2 <= bsz <= 8 and not params.get("activate_all_experts") \
-                        and y.dtype == torch.half and y.is_contiguous() and y.shape[-1] % 2 == 0:
-                    if cfg.gate_tensor_t is None:
-                        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-                    router_logits, selected_experts, routing_weights = \
-                        _bsr._routing_buffers(cfg, bsz, y.device)
-                    _ext.routing_std(y, cfg.gate_tensor, router_logits, selected_experts,
-                                     routing_weights, cfg.per_expert_scale, cfg.gate_tensor_t, None)
-                    return selected_experts, routing_weights
-                return _orig_routing_std(bsz, cfg, y, params)
+            def _gate_t_rdna(cfg):
+                if cfg.gate_tensor_t is None:
+                    cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+                return cfg.gate_tensor_t
 
-            _bsr.routing_std = _routing_std_rdna
-            _bsm.routing_std = _routing_std_rdna
-            applied.append("std routing at 2..8 rows on the multi-row router GEMV (EXL3_ROCM_ROUTER_STD_MR)")
+            _bsr._gate_t = _gate_t_rdna
+            applied.append("router int8 tables not built (det router GEMM is sm_80 PTX, declined on ROCm; EXL3_ROCM_ROUTER_I8)")
         except Exception as e:
-            applied.append(f"!! FAILED std routing multi-row patch: {type(e).__name__}: {e}")
+            applied.append(f"!! FAILED router int8 patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
-    # Paged prefill attention at head_dim 256: RDNA tile
+    # Paged prefill attention tiles on RDNA: head_dim 256 and head_dim <= 128
     # ------------------------------------------------------------------
-    # paged_attn_triton_prefill's head_dim-256 tile (block_m 64, block_n 32, 8 warps,
-    # 2 stages) spills on gfx1151 (256 VGPR + 772 B scratch). One stage frees the
+    # head_dim 256 (EXL3_ROCM_PREFILL_HD256): paged_attn_triton_prefill's head_dim-256 tile
+    # (block_m 64, block_n 32, 8 warps, 2 stages at v1.5.0; 4 warps from v1.5.3) spills on
+    # gfx1151 (256 VGPR + 772 B scratch). One stage frees the
     # registers; at q_len >= 128 a 128-row tile (still 16 rows per warp, the
     # rule noted at the config) halves the K/V re-reads. Qwen3.8 shapes (24 q / 2 kv
     # heads, fp16 cache), us: q 1792 fresh 5770 -> 2917; q 255 after 1792 1621 -> 884;
@@ -1178,7 +1244,21 @@ def apply() -> list[str]:
     # (1.15e-3 / 4.2e-5). Scope: head_dim 129..256, fp16 cache (qc None), no explicit
     # tile from the caller. DS4 (DSA prefill, D 512) never reaches this; Gemma's
     # 256-dim layers do (PPL gate). EXL3_ROCM_PREFILL_HD256=0 restores upstream.
-    if _env_on("EXL3_ROCM_PREFILL_HD256", True):
+    #
+    # head_dim <= 128 (EXL3_ROCM_PREFILL_HD128, v1.5.3): upstream moved this tile from
+    # (128, 32, 8, 2) -- the value the ROCm fork had selected explicitly via an in-file
+    # _is_rocm edit to triton_paged.py (gfx1151: BN 32 over 64, 13.06 vs 11.67 TFLOP/s at
+    # q_len 2048; rocm_tools/bench_prefill_tiles.py) -- to 4 warps (issue #384: whole 16-row MMA
+    # tiles per warp on NVIDIA) and, because ROCm's get_device_capability() reports gfx major 11
+    # and so trips the Blackwell test, 3 stages: (128, 32, 4, 3). That is 32 rows per warp, off
+    # the RDNA rule (block_m / num_warps == 16; off-ratio configs measured up to 4x slower), and
+    # unmeasured here. The in-file edit is gone (triton_paged.py is upstream's verbatim); this
+    # restores the fork's (128, 8 warps, 2 stages) for fp16 and quantized caches alike (block_n
+    # stays the upstream pick: 32, or the quantized-cache width). Not reached by DS4 / Qwen3.8 /
+    # Gemma (head_dim 512 / 256 / 256+512). EXL3_ROCM_PREFILL_HD128=0 takes v1.5.3's tile.
+    _pf_hd256 = _env_on("EXL3_ROCM_PREFILL_HD256", True)
+    _pf_hd128 = _env_on("EXL3_ROCM_PREFILL_HD128", True)
+    if _pf_hd256 or _pf_hd128:
         try:
             import triton
             from ..modules.attention_fn import triton_paged as _tpm
@@ -1187,21 +1267,29 @@ def apply() -> list[str]:
 
             def _prefill_rdna(*a, **kw):
                 q = kw.get("q", a[0] if a else None)
-                if q is not None and kw.get("qc") is None and kw.get("block_m") is None \
+                if q is not None and kw.get("block_m") is None \
                         and kw.get("block_n") is None and kw.get("num_warps") is None \
-                        and kw.get("num_stages") is None and q.dim() == 4 \
-                        and 128 < triton.next_power_of_2(q.shape[-1]) <= 256:
-                    kw["block_m"] = 128 if q.shape[1] >= 128 else 64
-                    kw["block_n"] = 32
-                    kw["num_warps"] = 8
-                    kw["num_stages"] = 1
+                        and kw.get("num_stages") is None and q.dim() == 4:
+                    hd_pad = triton.next_power_of_2(q.shape[-1])
+                    if _pf_hd256 and kw.get("qc") is None and 128 < hd_pad <= 256:
+                        kw["block_m"] = 128 if q.shape[1] >= 128 else 64
+                        kw["block_n"] = 32
+                        kw["num_warps"] = 8
+                        kw["num_stages"] = 1
+                    elif _pf_hd128 and hd_pad <= 128:
+                        kw["block_m"] = 128
+                        kw["num_warps"] = 8
+                        kw["num_stages"] = 2
                 return _orig_prefill(*a, **kw)
 
             _tpm.paged_attn_triton_prefill = _prefill_rdna
             _swm.paged_attn_triton_prefill = _prefill_rdna
-            applied.append("paged prefill attention, head_dim 256: 128/64 x 32 tile, 1 stage (EXL3_ROCM_PREFILL_HD256)")
+            if _pf_hd256:
+                applied.append("paged prefill attention, head_dim 256: 128/64 x 32 tile, 1 stage (EXL3_ROCM_PREFILL_HD256)")
+            if _pf_hd128:
+                applied.append("paged prefill attention, head_dim <= 128: 128-row tile, 8 warps, 2 stages (EXL3_ROCM_PREFILL_HD128)")
         except Exception as e:
-            applied.append(f"!! FAILED prefill hd256 patch: {type(e).__name__}: {e}")
+            applied.append(f"!! FAILED paged prefill tile patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # GatedResidual (Qwen3.8) prefill mix: gate-mean in one kernel
@@ -1216,6 +1304,27 @@ def apply() -> list[str]:
     # expression (rocm_tools/gr_mix_bench.py --prefill). Everything before it
     # (norm, the two GEMMs, silu, post) is the upstream code verbatim.
     # EXL3_ROCM_GR_PREFILL=0 restores the torch expression.
+    #
+    # v1.5.3: upstream's _mix gained a third, tiled int8 path (hc_mix_tiled.cu) between the
+    # fused decode pair and this cuBLAS one; it is gated off under torch.version.hip, so on ROCm
+    # the cuBLAS branch still serves every R > FUSED_MAX_R. proj_h is now zero-padded to a
+    # multiple of 64 rows (for the tiled kernel), so the projection reads proj_h[:proj_m] as
+    # upstream's branch does. A module that did select the tiled path is left to upstream.
+    #
+    # FUSED_MAX_R: upstream lowered the fused decode pair's bound from 32 to 8 because the tiled
+    # int8 path beats it above 8 rows on NVIDIA. Without that path (ROCm), rows 9..32 would drop
+    # to this cuBLAS branch instead; EXL3_ROCM_GR_FUSED_R (default 32, the v1.5.0 bound) keeps
+    # them on the fused pair (sized for them: GR_MAX_R 32). Only batched decode reaches 9..32
+    # rows (MTP verify is 1 + ndt).
+    try:
+        from ..modules import hyperconnections as _hcm0
+        _gr_r = int(os.environ.get("EXL3_ROCM_GR_FUSED_R", 32))
+        if _gr_r != _hcm0.GatedResidual.FUSED_MAX_R:
+            _hcm0.GatedResidual.FUSED_MAX_R = _gr_r
+            applied.append(f"GatedResidual fused decode pair up to {_gr_r} rows (v1.5.0 bound; EXL3_ROCM_GR_FUSED_R)")
+    except Exception as e:
+        applied.append(f"!! FAILED GatedResidual row-bound patch: {type(e).__name__}: {e}")
+
     if _env_on("EXL3_ROCM_GR_PREFILL", True):
         try:
             import torch
@@ -1229,7 +1338,8 @@ def apply() -> list[str]:
             def _gr_mix_rdna(self, streams, cached = True):
                 H, Dh = self.hc_mult, self.hidden_size
                 R = streams.shape[0] * streams.shape[1]
-                if R <= self.FUSED_MAX_R or H != 4 or Dh % 4 != 0 or not streams.is_cuda:
+                if R <= self.FUSED_MAX_R or H != 4 or Dh % 4 != 0 or not streams.is_cuda \
+                        or getattr(self, "tiled", False) or self.proj_h is None:
                     return _orig_gr_mix(self, streams, cached)
                 s3 = streams.reshape(R, H, Dh)
                 if s3.dtype != torch.float:
@@ -1242,7 +1352,7 @@ def apply() -> list[str]:
                 normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
                 _ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
                               self.rms_eps, 0.0, 1.0, False, False, H)
-                dm = torch.matmul(normed.view(R, H * Dh), self.proj_h.t())
+                dm = torch.matmul(normed.view(R, H * Dh), self.proj_h[: self.proj_m].t())
                 t = _F.silu(dm[:, : self.rank] / H)
                 if self.use_combine:
                     post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))

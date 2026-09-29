@@ -231,6 +231,15 @@ def eligible(kw, cfg = None):
     return hp, bd
 
 
+def _mqa_kw(kw, t, cfg):
+    hp, bd = t
+    kw = dict(kw)
+    kw.update(HP = hp, BD = bd, KC = cfg["kc"], KSTAGES = cfg["kstages"],
+              BLOCK_N = cfg["block_n"], BLOCK_W = cfg["block_w"],
+              num_warps = cfg["num_warps"], num_stages = 1)
+    return kw
+
+
 def launch(args, kw, cfg = None):
     """Launch the MQA prefill kernel for an upstream _dsa_attn_kernel call (args / kw exactly
     as dsa_attn passes them); returns the compiled kernel, or None if not eligible."""
@@ -239,10 +248,7 @@ def launch(args, kw, cfg = None):
     if t is None:
         return None
     hp, bd = t
-    kw = dict(kw)
-    kw.update(HP = hp, BD = bd, KC = cfg["kc"], KSTAGES = cfg["kstages"],
-              BLOCK_N = cfg["block_n"], BLOCK_W = cfg["block_w"],
-              num_warps = cfg["num_warps"], num_stages = 1)
+    kw = _mqa_kw(kw, t, cfg)
     R = args[0].shape[0]
     D = kw["D_c"] + kw["D_r"]
     grid = (R * (kw["H"] // hp) * (D // bd),)
@@ -269,6 +275,19 @@ class _KernelProxy:
                 return self.orig[grid](*args, **kw)
             return ck
         return _launch
+
+    def run(self, *args, grid, warmup, **kw):
+        """v1.5.3: dsa_attn picks (BLOCK_H, BLOCK_N, stages) from a ladder probed by a
+        compile-only kernel.run(warmup = True) (attention_fn/smem.py). Report the kernel that
+        will launch: for eligible calls the MQA prefill kernel, which takes neither BLOCK_H nor
+        the ladder's BLOCK_N / stages, so the stock candidate fits and the launch is unchanged
+        from v1.5.0 (without this, the probe would compile the upstream kernel -- the one this
+        proxy exists to avoid -- and could step the ladder or raise NoFittingConfig on its
+        footprint)."""
+        t = eligible(kw)
+        if t is None:
+            return self.orig.run(*args, grid = grid, warmup = warmup, **kw)
+        return _dsa_prefill_mqa_kernel.run(*args, grid = grid, warmup = warmup, **_mqa_kw(kw, t, CFG))
 
     def __getattr__(self, name):
         return getattr(self.orig, name)

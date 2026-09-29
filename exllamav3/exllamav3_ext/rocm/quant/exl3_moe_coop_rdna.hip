@@ -37,7 +37,7 @@ static const char* const kNoCoop =
     "ported to ROCm. This route is disabled by default on ROCm (exllamav3/rocm_py, "
     "EXL3_ROCM_MOE_BSZN); unset EXL3_ROCM_MOE_BSZN to use the fused exl3_moe kernel instead.";
 
-void exl3_moe_coop_launch(const MoeCoopParams& p, int K_gu, int K_d, int cb, int device, cudaStream_t stream)
+void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
 {
     (void) p; (void) K_gu; (void) K_d; (void) cb; (void) device; (void) stream;
     TORCH_CHECK(false, kNoCoop);
@@ -52,7 +52,7 @@ MoeCoopParams exl3_moe_coop_prepare
     const c10::optional<at::Tensor>& g_bias,
     const c10::optional<at::Tensor>& u_bias,
     const c10::optional<at::Tensor>& d_bias,
-    int Kg, int Ku, int Kd,
+    float Kg, float Ku, float Kd,
     bool mcg, bool mul1,
     int act,
     float act_limit,
@@ -66,7 +66,7 @@ MoeCoopParams exl3_moe_coop_prepare
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_gate_w,
-    int& K_gu, int& K_d, int& cb
+    float& K_gu, float& K_d, int& cb
 )
 {
     // BC_BlockSparseMLP's constructor calls this unconditionally at load. Nothing is
@@ -85,7 +85,7 @@ MoeCoopParams exl3_moe_coop_prepare
 
 void exl3_moe_coop_run
 (
-    MoeCoopParams p, int K_gu, int K_d, int cb,
+    MoeCoopParams p, float K_gu, float K_d, int cb,
     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
     const c10::optional<at::Tensor>& sh_out
 )
@@ -108,7 +108,7 @@ void exl3_moe_coop
     const c10::optional<at::Tensor>& g_bias,
     const c10::optional<at::Tensor>& u_bias,
     const c10::optional<at::Tensor>& d_bias,
-    int Kg, int Ku, int Kd,
+    float Kg, float Ku, float Kd,
     bool mcg, bool mul1,
     int act,
     float act_limit,

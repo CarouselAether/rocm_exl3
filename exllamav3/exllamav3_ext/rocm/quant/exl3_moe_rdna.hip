@@ -45,6 +45,7 @@ namespace cg = cooperative_groups;
                                        // match the kernel's MOE_TILESIZE_K, since
                                        // blockDim is derived from it here
 #include "../../quant/exl3_devctx.cuh"
+#include "../../quant/bits_k.cuh"
 #include "exl3_moe_inner_rdna.hip.h"                 // moe_pipe::smem_launch_bytes
 #include <set>
 #include <map>
@@ -251,9 +252,9 @@ void exl3_moe
 
     const int act_function,
 
-    const int K_gate,
-    const int K_up,
-    const int K_down,
+    const float K_gate,
+    const float K_up,
+    const float K_down,
 
     const at::Tensor& gate_ptrs_trellis,
     const at::Tensor& gate_ptrs_suh,
@@ -343,8 +344,14 @@ void exl3_moe
 
     // TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
 
+    // v1.5.3: bitrates. Compile-time instances for uniform integer K, the runtime-switch instance (K = 0)
+    // otherwise; the kernel receives the rates in half-bit units (see bits_k.cuh), as upstream
+    const int K2_gate = k2_from_K(K_gate), K2_up = k2_from_K(K_up), K2_down = k2_from_K(K_down);
+    TORCH_CHECK(gate_mul1 || (K2_gate % 2 == 0 && K2_up % 2 == 0 && K2_down % 2 == 0),
+                "exl3_moe: half-integer bitrates require the mul1 codebook");
+    const bool any_half = (K2_gate | K2_up | K2_down) & 1;
     int K = 0;
-    if (K_gate == K_up && K_up == K_down) K = K_gate;
+    if (K2_gate == K2_up && K2_up == K2_down && K2_gate % 2 == 0) K = K2_gate / 2;
 
     TORCH_CHECK_DIM(gate_ptrs_trellis, 1);
     TORCH_CHECK(gate_ptrs_trellis.size(0) == num_experts, "Number of gate tensors doesn't match num_experts");
@@ -368,7 +375,9 @@ void exl3_moe
     // With a known number of active experts, launch only as many groups as there are experts and widen them to
     // use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT
     int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
-    const bool pipe = moe_pipe_enabled();
+    // The pipelined mainloop (exl3_moe_inner_rdna.hip.h) decodes integer K only; a half-integer rate takes the
+    // shared exl3_gemm inner (the EXL3_ROCM_MOE_PIPE=0 kernel), whose K = 0 switch has the half_k cases
+    const bool pipe = moe_pipe_enabled() && !any_half;
 
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
@@ -478,9 +487,9 @@ void exl3_moe
         (void*) &num_groups,
         (void*) &act_limit,
         (void*) &act_function,
-        (void*) &K_gate,
-        (void*) &K_up,
-        (void*) &K_down,
+        (void*) &K2_gate,
+        (void*) &K2_up,
+        (void*) &K2_down,
         (void*) &locks,
         &_output_scratch,
         &_fused_base,

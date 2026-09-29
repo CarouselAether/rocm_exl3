@@ -83,7 +83,7 @@ __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TK / 16)
 void ref_inner(const half* A, const uint16_t* B, void* C,
                int m, int k, int n, int* locks, const half* svh)
 {
-    exl3_gemm_kernel_inner<bits, c_fp32, cb, TM, TK, TN, SH, FR, true>
+    exl3_gemm_kernel_inner<bits, false, c_fp32, cb, TM, TK, TN, SH, FR, true>
         (A, B, C, m, k, n, locks, svh);
 }
 
@@ -143,7 +143,7 @@ void run_case(int shape_idx, int size_m, int size_k, int size_n, int num_sms, co
     hipError_t ref_err = hipDeviceSynchronize();
 
     // ---- test: one cooperative launch ----
-    void* kernel = (void*) exl3_gemm_kernel<bits, c_fp32, cb, TM, TK, TN, SH, FR>;
+    void* kernel = (void*) exl3_gemm_kernel<bits, false, c_fp32, cb, TM, TK, TN, SH, FR>;
 
     // The shipped dispatch does not instantiate the template, it looks the
     // pointer up in the map's per-(K, cb) instance tables. If those tables are

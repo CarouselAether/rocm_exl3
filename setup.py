@@ -176,6 +176,13 @@ ROCM_EXCLUDE = (
     # __shfl_xor chain) lower to ds_bpermute; the sibling moves the same lane values with DPP,
     # bit-identical. EXL3_ROCM_HC_DPP=0 restores the shuffles.
     "/hc_mix.cu",                # -> rocm/hc_mix_rdna.hip
+    # v1.5.3: deterministic int8 tensor-core kernels (det_gemm.cuh: mma.m16n8k32.s8, cp.async,
+    # ldmatrix PTX) for cross-architecture tensor-parallel agreement. The PTX compiles out on
+    # ROCm, but routing_gemm_det_fits() would still select the (then empty) router GEMM on any
+    # device reporting CC major >= 8, which RDNA does. The generated siblings
+    # (rocm_tools/gen_det_siblings.py) decline / raise; det_quant_weight stays as upstream.
+    "/routing_gemm.cu",          # -> rocm/routing_gemm_rdna.hip
+    "/hc_mix_tiled.cu",          # -> rocm/hc_mix_tiled_rdna.hip
 )
 
 def _collect_sources():

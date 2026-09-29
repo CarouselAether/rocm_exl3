@@ -405,6 +405,7 @@ bool exl3_gemv_try_launch
     int size_k,
     int size_n,
     int K,
+    bool half_k,
     int cb,
     bool c_fp32,
     bool has_su_sv,
@@ -419,6 +420,12 @@ bool exl3_gemv_try_launch
     // exl3_gemv_graph_param_block for why allocation cannot happen mid-capture.
     exl3_gemv_graph_prewarm(device);
     exl3_gemv_multirow_prewarm(device);   // the m = 2..8 path's block, same reason
+
+    // v1.5.3 half-integer bitrates (1.5 / 2.5 / 3.5 bpw, mul1): upstream added GEMV instances for
+    // them (exl3_gemv_half_inst.cu). The RDNA dot cores (direct / LDS / tiles) decode integer K
+    // only, so decline: the caller falls through to the cooperative GEMM, which has half_k
+    // instances (comp_units_rdna/exl3_comp_unit_h*.hip). Correct, not the fast path.
+    if (half_k) return false;
 
     int mode = exl3_gemv_env_mode();
     if (!force && mode == 0) return false;
@@ -484,6 +491,9 @@ void exl3_gemv
     for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
     int size_k = A.size(-1);
     int size_n = B.size(1) * 16;
+    // v1.5.3: a half-integer tile (16 * K + 8 uint16) has no RDNA GEMV core; see exl3_gemv_try_launch
+    TORCH_CHECK(B.size(2) % 16 == 0, "exl3_gemv: half-integer bitrates are not supported by the RDNA GEMV kernel "
+                "(exl3_gemm runs them on the cooperative GEMM)");
     int K = B.size(2) / 16;
 
     int cb = 0;
