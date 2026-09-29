@@ -97,3 +97,12 @@ Q-1 to Q-10 were answered by the maintainer in a kickoff interview (2026-09-26),
   - Without the split, regenerating or continuing any prompt under 32K would re-prefill the whole prompt. With it, only the tail (at most 255 tokens) is re-prefilled.
   - Recommendation: KEEP option A, and pay down its cost via the MoE mainloop fix. The maintainer has not overridden this, so it is treated as keep-for-now.
 - Answer: (maintainer, in chat, 2026-09-27) Keep the page split. First-prompt speed is for benchmarks; regeneration deep into a conversation is what users care about. Status: answered.
+
+### Q-13: v1.5.3 merge decisions (upstream numerics vs perf/stack bit-identity; warmup)
+- Status: answered
+- Asked by: merge session, 2026-09-29
+- Context: merging upstream v1.5.3 brought three numerics changes: the deterministic router math, GDN prefill in fp16, and a new paged-decode split/combine. They move DS4 logits by up to 0.06 (tokens identical), and break Qwen's MTP == plain-greedy identity on 2 of 3 prompts. Upstream's model.warmup() also now runs at load, alongside the server's own generator warmup.
+- Answer: (maintainer, 2026-09-29)
+  1. Keep upstream's split/combine; no ROCm hook to restore the old formula.
+  2. Follow upstream's numerics defaults. `EXL3_ROCM_ROUTER_DET=0`, `EXL3_GDN_PROJ_FP32=1` and `EXL3_GDN_CONV_TOKEN_MAJOR=0` remain available for A/B.
+  3. Keep both warmups in the server.
