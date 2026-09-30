@@ -2752,3 +2752,112 @@ MTP ndt 2 is a net loss (12.1, 64% acc). A half-K GEMV / moe_decode core at inte
 would save ~20 ms/token (est. ~18-19 t/s). Prefill also slow (pp512 158).
 
 Chart numbers, harness (`--tg_depth`, `-dm`) and caveats: exlproject/CHART.md.
+
+## Half-integer bitrates on the fast paths (2026-09-29): MiMo tg 13.2 -> 30.0, pp512 158 -> 341, MTP 12.1 -> 35.3
+
+Branch `opt/mimo-halfrate` (from perf/stack f8f7adc). MiMo-V2.6-Flash-RL 2.27 bpw: routed experts
+at 2.0 bpw (layers 12-35) and **2.5 bpw (layers 1-11, 36-47, 17664 tensors)**, attention K4, dense
+layer 0 K3, head K6. At the v1.5.3 sync every RDNA fast path declined half K, so the 2.5 bpw
+experts ran `exl3_mgemm_kernel` (cooperative, m = 1) at decode and the non-pipelined `exl3_moe`
+kernel at prefill.
+
+**Profile before** (`bench/results/mimo_profile_before.txt`, rocprofv3, ctx 1024, 16 steps): 76.6
+ms/step, `exl3_mgemm_kernel<2, ...>` 45.6 ms of it (65%): 653 us per gate/up call and 675 us per
+down call for 8 x 2.6 MB = ~32 GB/s, 256 VGPR + 60-64 B scratch. Prefill 2048
+(`logs/prof/mimo_pf2048_s2`): `exl3_moe_kernel<0, 256, 2, 16, false>` 54.5% of GPU time at 92
+ms/call vs 17 ms/call for the K2 pipelined instance on the same shapes.
+
+### What changed
+
+| switch (default on) | change | where |
+|---|---|---|
+| `EXL3_ROCM_HALF_GEMV` | half rates on the multi-row GEMV (single + multi, m = 1..8, weighted too) and `moe_decode`; C++ reads it per call (half calls only), rocm_py at load for moe_decode | tiles header, multirow sibling, `exl3_gemm_rdna.hip`, rocm_py |
+| `EXL3_ROCM_HALF_MOE_PIPE` | uniform half-rate MoE layers on the pipelined mainloop, all row tiles (needs `EXL3_ROCM_MOE_PIPE` on) | `comp_units_rdna/exl3_moe_inst_h{1,2,3}_cb2.hip`, `exl3_moe_rdna.hip`, MoE kernel/inner |
+
+**Mechanism: a pseudo width, not a new template parameter.** A K + 0.5 bpw tensor rides the
+integer `bits` slot as `EXL3_HALF_BITS(K) = 16 + K` (17 / 18 / 19). `Exl3Width<bits>`
+(`exl3_gemv_tiles_rdna.hip.h`) gives `half`, `ka`, `tile_bytes` (32 * bits, or 16 * (2K + 1));
+every half branch is an `if constexpr` on it, so integer instantiations keep their names and
+their code, and the bodies that are templated on bits (split-K driver, multi-row body,
+moe_dec_dot, MoE pipe mainloop) take half rates without edits beyond the tile size. Callers
+pass the pseudo width only for half-rate weights and only while the switch is on.
+
+**Decoder.** Upstream's `dq8_half`: positions alternate K and K + 1 bits, a lane's 8 windows are
+two groups of four, each group two dwords and one funnel shift < 32. Lane plan = 4 dwords (a7, b7,
+a3, b3) + 2 shifts, decode = 2 `v_alignbit` + 6 shifts + 4 fast pair decodes (the tiles core's
+pk_mul/mad16 hash + sad_u8 byte sums, which take the low 16 bits of each window, so no masks).
+Same per-lane VALU count as the K2 aligned decoder within a few ops; 4 VMEM per tile instead of 2.
+U table: `exl3_tiles_u_half_splitk` (U2 at T = 2, U4 at T = 1, U2 at M = 4, U1 at M = 8;
+`-DEXL3_HALF_U_T2/_T1` for a sweep). Not swept: the kernels already run at the bandwidth roof.
+
+**Kernel numbers.** Decode (rocprofv3): `moe_dec_dot<18>` gate+up 211.8 us for 16 x 2.62 MB =
+**198 GB/s**, down 107.8 us = 194 GB/s (K2 instance on the same shapes: 185 / 186 GB/s). Prefill
+(`bench_moe_kernel.py --shape mimo`, 256 experts 4096 <-> 2048, top-8, K 2.5, default grid):
+
+| tokens | old half mainloop | half pipe | K2 pipe, same shape |
+|---|---|---|---|
+| 64 | 51.07 ms (34 GB/s) | **13.80 ms (126 GB/s)** | 13.48 |
+| 256 | 59.81 | **16.38** | 16.24 |
+| 512 | 80.07 | **19.35** | 18.85 |
+| 1792 | 200.50 | **37.43** | 36.26 |
+
+Half pipe N256: 192 VGPR, 15 VGPR spills (K2: 6, K5: 38), 64 B scratch; N128: 171 VGPR, none.
+
+### End to end (bench/run_bench.py, -cs 32768, median of 3; one build per step)
+
+| config | pp512 | pp2048 | tg128@d1024 | MTP ndt 2 @d1024 / @d2048 (acc) |
+|---|---|---|---|---|
+| chart (perf/stack 822fd46) | 158.4 | 273.9 | 13.23 | 12.14 / 11.65 (64% / 60%) |
+| step 2 build, `HALF_GEMV=0` | -- | -- | 13.21 | |
+| step 2 build, on | 158.4 | 276.1 | **29.90** | |
+| step 3 build, `HALF_MOE_PIPE=0` | 158.5 | 277.1 | -- | |
+| step 3 build, all on | **341.1** | **469.2** | **29.97** | **35.27 / 31.28 (73% / 60%)** |
+
+Profile after step 2 (`bench/results/mimo_profile_after_s2.txt`): 76.6 -> 34.5 ms/step, 925
+kernels/step unchanged, gaps 6.6 -> 2.7 ms. Every remaining large kernel is at the roof: attention
+q/o K4 `mr_dot_single` 215 GB/s, expert GEMVs 185-198, lm_head 2.17 ms. At 29.97 t/s MiMo streams
+~5.6 GB/token at ~168 GB/s effective (DS4: 161). The rest is the step's ~2.7 ms of launch gaps and
+small kernels (routing 17.7 us x 47, attention split + combine ~1.8 ms).
+
+MTP was a net loss because every verify step ran the cooperative mgemm at m = 3; with the batched
+moe_decode (bsz 3 rows bit-identical to three bsz 1 calls) the verify step costs little more than a
+plain step and ndt 2 is +18% over plain at d1024. Acceptance moved 64% -> 73% at d1024 (greedy;
+verify rows now take the plain step's arithmetic); spread 5-9% from the text slices, as in the chart.
+
+### Validation
+
+- `rocm_tools/half_gemv_check.py` (new, 196 checks, K 1.5 / 2.5 / 3.5 + K2 control): exl3_gemm
+  rows 1-8 vs reconstruct fp32 6e-7..8e-7 rel (cooperative kernel 2.4e-6..2.7e-6); tiles core ==
+  direct core (`EXL3_ROCM_GEMV_TILES=0`, dq8_half verbatim) **bit-identical**; row r of an m-row
+  call == the m = 1 call **bit-identical**; exl3_mgemm 16 experts, bsz 1 / 3, unweighted and
+  weighted grouped reduce, 6e-7..1e-6 rel (cooperative 4e-6); moe_decode vs fp32 routed-block
+  reference 5.8e-4 rel (fp16 intermediates), bsz 3 == 3 x bsz 1 bit-identical.
+- `bench_moe_kernel.py --shape mimo --check` with `EXL3_ROCM_MOE_BPS=1` (same grid): half pipe
+  **bit-identical** to the old half mainloop at 64 / 256 / 512 / 1792 tokens.
+- MiMo decode_bitwise vs the perf/stack build: 48 greedy tokens identical, logits max |diff| 3.4
+  (mean 0.11; logits up to 32) -- accumulation order (fp32 fdot2 chains vs WMMA).
+- MiMo PPL (eval/ppl.py, 20 x 2048): all on **5.382953** (+0.064% vs 5.379511); both half
+  switches off **5.379511** exactly. The delta is the prefill MoE grid (5 groups x 8 blocks, stream-K
+  split, as for DS4 at the mainloop landing), not the decoder (bit-identical on the same grid).
+- **Isolation**: `rocm_tools/isa_diff.py` (new) vs the perf/stack .so: all 3354 existing gfx1151
+  device functions instruction-identical (PC-relative offsets masked); 168 new = 72 + 72
+  multi-row, 18 moe_dec_dot, 6 exl3_moe_kernel half instances. DS4 decode_bitwise (19-token
+  prompt, 48 steps) and mgemv_bitwise vs perf/stack references: PASS after each step.
+- `hipcc_probe --all` 134/134 on gfx1151, gfx1100, gfx1101, gfx1200, gfx1201.
+- Final build (44ecc92): `bench/run_gates.sh` mgemv_check / reconstruct_had / dsa_kernels / WMMA gate
+  PASS, pytest 984 passed, 1 failed = `test_dflash2.py::test_topk_cuda_matches_torch`, the flake
+  recorded at the v1.5.3 sync (passes 3/3 alone; its kernel is ISA-identical to perf/stack).
+  decode_bitwise Qwen3.8 and mgemv_bitwise DS4 vs perf/stack references PASS.
+- Integer-K speed (bench/run_bench.py, same day): DS4 pp512 / pp2048 / tg128 **349.1 / 519.9 /
+  29.90** (chart 345.7 / 519.0 / 29.97); Qwen3.8 `-ngr` **622.4 / 862.2 / 28.94** (chart 621.1 /
+  862.7 / 28.95).
+
+### Not done / open
+
+- Half-rate lm_head-scale dense outputs (> 2048 N-tiles) and `EXL3_GEMV_MR_M1=0` still take the
+  cooperative GEMM at m = 1: the fused m == 1 GEMV / LDS-prologue mgemv kernels stay integer-K
+  (no model needs them; MiMo's half tensors are all experts).
+- Mixed half/integer MoE layers (gate != up != down rate) keep the old K = 0 mainloop and the
+  mgemm decode route. None seen in real models.
+- Half pipe N256 spills 15 VGPRs (budget 192 for two blocks per WGP); its speed equals K2's, so
+  the spills sit outside the hot loop as for K2/K5. Not tuned.
