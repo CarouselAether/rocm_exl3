@@ -46,24 +46,31 @@ maintainer's merge notes track that. See `RDNA_NOTES.md` → "Syncing to a new u
 
 ### Performance (gfx1151, 2026-09-30)
 
-Ryzen AI Max+ 395, ROCm 10.0, bsz 1. Figures are tok/s, the median of 3 runs. Decode = 128 tokens after a
-1024-token natural-text prompt. MTP = the model's own draft head, `-ndt 2`.
+Ryzen AI Max+ 395, ROCm 10.0, bsz 1, CPU boost off. Figures are tok/s, the median of 3 runs after a warmup, all
+from one session on the final code (the regression suite's full check at `3a4502d`). pp = random-token prompt.
+Decode = 128 tokens after a 1024-token natural-text prompt (chat template around a wikitext-2 slice). The last
+column is speculative decoding with greedy sampling, `-ndt 2`: the model's own MTP head, or for Laguna an
+external drafter.
 
-| Model | pp512 | pp2048 | decode | decode, MTP |
+| Model | pp512 | pp2048 | decode | decode, MTP / draft |
 |---|---|---|---|---|
-| DeepSeek-V4-Flash 2.04 bpw | 346 | 519 | 30.0 | 36.9 |
-| Qwen 3.8-Flash-Next 4 bpw (`-ngr`) | 621 | 863 | 29.0 | 40.2 |
-| GLM-5.3-Flash 2.05 bpw | 262 | 360 | 20.0 | 25.7 |
-| Laguna-S-2.1 4 bpw | 582 | 872 | 34.3 | 40.4 (DFlash drafter at 4 bpw, ndt 2)¹ |
-| MiMo-V2.6-Flash 2.27 bpw | 341 | 469 | 30.0 | 35.3 |
-| Gemma-4-31B ~6 bpw (dense) | 249 | 319 | 8.2 | n/a |
+| DeepSeek-V4-Flash 2.04 bpw | 348 | 516 | 29.9 | 37.5 |
+| Qwen 3.8-Flash-Next 4 bpw (`-ngr`) | 626 | 867 | 28.9 | 38.3 |
+| GLM-5.3-Flash 2.05 bpw | 258 | 358 | 20.0 | 24.0 |
+| Laguna-S-2.1 4 bpw | 581 | 853 | 34.2 | 40.4 (DFlash drafter at 4 bpw)¹ |
+| MiMo-V2.6-Flash 2.27 bpw | 336 | 473 | 30.0 | 35.4 |
+| Gemma-4-31B ~6 bpw (dense) | 248 | 329 | 8.2 | n/a |
 
-¹ Laguna has no MTP head. Its row uses the external DFlash drafter, quantized to **4.0 bpw EXL3** (`genevera/Laguna-S-2.1-DFlash-exl3`), not the BF16 release: 40.4 / 35.7 t/s at d1024 / d2048, 53% / 44% acceptance, greedy (2026-09-30, `opt/dflash-drafter`). The BF16 drafter measures 35.4 / 31.8 at ndt 3.
+¹ Laguna has no MTP head. Its row uses the external DFlash drafter, quantized to **4.0 bpw EXL3**
+(`genevera/Laguna-S-2.1-DFlash-exl3`), not the BF16 release: 40.4 / 35.7 t/s at d1024 / d2048, 53% / 44%
+acceptance (same-day drafter A/B on the same code). The BF16 drafter measures 35.4 / 31.8 at ndt 3.
 
-Against the port as of v1.5.0 on the same machine, DeepSeek-V4-Flash went from 18.0 to 30.0 t/s decode, from
-19.8 to 41.7 t/s with MTP (short natural prompts), and from 113 / 179 to 346 / 519 t/s prefill. What changed, with the numerics notes
-and per-change A/B, is kept in the maintainer's project notes outside the repo; the kernel-level rationale is in
-`exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md`.
+The speculative column moves with the text: each timed run uses a different wikitext slice, so acceptance, and
+with it speed, can vary by up to ~10% from run to run. The other columns repeat within ~1–2%.
+
+Against the port as of v1.5.0 on the same machine, DeepSeek-V4-Flash went from 18.0 to 29.9 t/s decode, from
+19.8 to 41.7 t/s with MTP (short natural prompts), and from 113 / 179 to 348 / 516 t/s prefill. The kernel-level
+rationale for each change is in `exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md`.
 
 ### Requirements
 
