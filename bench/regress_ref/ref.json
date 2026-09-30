@@ -1,0 +1,643 @@
+{
+ "metrics": {
+  "ds4/plain/pp512": {
+   "value": 349.1196749089884,
+   "spread": 0.029645641580617027,
+   "runs": [
+    349.1196749089884,
+    342.44414139391057,
+    352.794018145004
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/ds4_plain_1/dcc2f05_20260929-212351_ds4_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:22:55"
+  },
+  "ds4/plain/pp2048": {
+   "value": 518.2310168391372,
+   "spread": 0.0009657162299313375,
+   "runs": [
+    518.0978001182767,
+    518.5982642220921,
+    518.2310168391372
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/ds4_plain_1/dcc2f05_20260929-212351_ds4_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:22:55"
+  },
+  "ds4/plain/regen3000": {
+   "value": 675.3902435302734,
+   "spread": 0.010482591026803238,
+   "runs": [
+    671.464204788208,
+    678.5440444946289,
+    675.3902435302734
+   ],
+   "unit": "ms",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/ds4_plain_1/dcc2f05_20260929-212351_ds4_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:22:55"
+  },
+  "ds4/plain/regen8000": {
+   "value": 565.1569366455078,
+   "spread": 0.005929700815038558,
+   "runs": [
+    568.0201053619385,
+    565.1569366455078,
+    564.6688938140869
+   ],
+   "unit": "ms",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/ds4_plain_1/dcc2f05_20260929-212351_ds4_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:22:55"
+  },
+  "ds4/plain/tg128@d1024": {
+   "value": 29.90110557656036,
+   "spread": 0.0029040509076089793,
+   "runs": [
+    29.838785241645287,
+    29.92561957443341,
+    29.90110557656036
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/ds4_plain_1/dcc2f05_20260929-212351_ds4_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:22:55"
+  },
+  "ds4/plain/tg128@d2048": {
+   "value": 28.16847665974388,
+   "spread": 0.0011655382421013518,
+   "runs": [
+    28.145931007120065,
+    28.178762443888736,
+    28.16847665974388
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/ds4_plain_1/dcc2f05_20260929-212351_ds4_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:22:55"
+  },
+  "ds4/mtp2/tg128@d1024": {
+   "value": 37.42487516465328,
+   "spread": 0.008446954192067936,
+   "runs": [
+    37.708215870688015,
+    37.39208966452833,
+    37.42487516465328
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/ds4_mtp2_1/dcc2f05_20260929-212759_mtp_ds4_mtp2.json",
+   "acceptance": 0.7319587628865979,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:26:52"
+  },
+  "ds4/mtp2/tg128@d2048": {
+   "value": 36.96127262167589,
+   "spread": 0.051769808820347075,
+   "runs": [
+    37.89022193693819,
+    35.9767439195573,
+    36.96127262167589
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/ds4_mtp2_1/dcc2f05_20260929-212759_mtp_ds4_mtp2.json",
+   "acceptance": 0.7741935483870968,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:26:52"
+  },
+  "ds4/bitwise/short": {
+   "prompt_tokens": 19,
+   "text": " The sky is blue because molecules in the air scatter blue light from the sun more than they scatter red light. The thre",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/ds4_short.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:28:58"
+  },
+  "ds4/bitwise/long": {
+   "prompt_tokens": 721,
+   "text": "Q: Briefly explain why the sky is blue, then name three primary colors.\nA:Q: Briefly explain why the sky is blue, then n",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/ds4_long.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:28:58"
+  },
+  "ds4/ppl/wiki2": {
+   "value": 6.461734,
+   "rows": 100,
+   "length": 2048,
+   "flags": [],
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:30:29"
+  },
+  "qwen/plain/pp512": {
+   "value": 623.7171291309049,
+   "spread": 0.022230297506331622,
+   "runs": [
+    634.5862475026366,
+    623.7171291309049,
+    620.7208301622616
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/qwen_plain_1/dcc2f05_20260929-213853_qwen_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:37:30"
+  },
+  "qwen/plain/pp2048": {
+   "value": 863.0154564331611,
+   "spread": 0.009167774541422764,
+   "runs": [
+    870.5131335995495,
+    863.0154564331611,
+    862.6012024692072
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/qwen_plain_1/dcc2f05_20260929-213853_qwen_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:37:30"
+  },
+  "qwen/plain/regen3000": {
+   "value": 362.0026111602783,
+   "spread": 0.020498581024520714,
+   "runs": [
+    367.8290843963623,
+    360.4085445404053,
+    362.0026111602783
+   ],
+   "unit": "ms",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/qwen_plain_1/dcc2f05_20260929-213853_qwen_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:37:30"
+  },
+  "qwen/plain/regen8000": {
+   "value": 302.95705795288086,
+   "spread": 0.02043528969208952,
+   "runs": [
+    302.95705795288086,
+    305.492639541626,
+    299.3016242980957
+   ],
+   "unit": "ms",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/qwen_plain_1/dcc2f05_20260929-213853_qwen_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:37:30"
+  },
+  "qwen/plain/tg128@d1024": {
+   "value": 28.919744680140475,
+   "spread": 0.0009725657095676108,
+   "runs": [
+    28.89517528303359,
+    28.923301635038946,
+    28.919744680140475
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/qwen_plain_1/dcc2f05_20260929-213853_qwen_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:37:30"
+  },
+  "qwen/plain/tg128@d2048": {
+   "value": 28.58676967335836,
+   "spread": 0.0015055047022235967,
+   "runs": [
+    28.568281306338807,
+    28.61131882250343,
+    28.58676967335836
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/qwen_plain_1/dcc2f05_20260929-213853_qwen_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:37:30"
+  },
+  "qwen/mtp2/tg128@d1024": {
+   "value": 38.204823390788135,
+   "spread": 0.05585742275170543,
+   "runs": [
+    38.204823390788135,
+    37.49281298767217,
+    39.626835958965664
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/qwen_mtp2_1/dcc2f05_20260929-214231_mtp_qwen_mtp2.json",
+   "acceptance": 0.603448275862069,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:41:05"
+  },
+  "qwen/mtp2/tg128@d2048": {
+   "value": 38.04428810489993,
+   "spread": 0.09247668027391599,
+   "runs": [
+    40.58142538395706,
+    37.063215916631485,
+    38.04428810489993
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/qwen_mtp2_1/dcc2f05_20260929-214231_mtp_qwen_mtp2.json",
+   "acceptance": 0.6636363636363637,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:41:05"
+  },
+  "qwen/bitwise/short": {
+   "prompt_tokens": 21,
+   "text": " The sky appears blue because molecules in the atmosphere scatter shorter (blue) wavelengths of sunlight more than longe",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/qwen_short.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:43:21"
+  },
+  "qwen/bitwise/long": {
+   "prompt_tokens": 801,
+   "text": "Q: Briefly explain why the sky is blue, then name three primary colors.\nA:Q: Briefly explain why the sky is blue, then n",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/qwen_long.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:43:21"
+  },
+  "qwen/ppl/wiki2": {
+   "value": 4.739359,
+   "rows": 100,
+   "length": 2048,
+   "flags": [],
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:44:59"
+  },
+  "mimo/plain/pp512": {
+   "value": 336.6754970645906,
+   "spread": 0.010321861307069366,
+   "runs": [
+    336.6754970645906,
+    339.39067696588904,
+    335.9155591796997
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/mimo_plain_1/dcc2f05_20260929-215104_mimo_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:49:56"
+  },
+  "mimo/plain/pp2048": {
+   "value": 475.85318061524464,
+   "spread": 0.002939283456018555,
+   "runs": [
+    475.85318061524464,
+    475.6704924007876,
+    477.0691597820638
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/mimo_plain_1/dcc2f05_20260929-215104_mimo_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:49:56"
+  },
+  "mimo/plain/tg128@d1024": {
+   "value": 29.91122264805047,
+   "spread": 0.0019097652348064643,
+   "runs": [
+    29.939369185862677,
+    29.882245772718875,
+    29.91122264805047
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/mimo_plain_1/dcc2f05_20260929-215104_mimo_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:49:56"
+  },
+  "mimo/plain/tg128@d2048": {
+   "value": 29.805337781780906,
+   "spread": 0.00016280644806766564,
+   "runs": [
+    29.800693773759903,
+    29.805337781780906,
+    29.805546274937612
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/mimo_plain_1/dcc2f05_20260929-215104_mimo_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:49:56"
+  },
+  "mimo/mtp2/tg128@d1024": {
+   "value": 35.27556426055973,
+   "spread": 0.05124954630020782,
+   "runs": [
+    35.3366538028749,
+    33.52879713903739,
+    35.27556426055973
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/mimo_mtp2_1/dcc2f05_20260929-215352_mtp_mimo_mtp2.json",
+   "acceptance": 0.7307692307692307,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:52:35"
+  },
+  "mimo/mtp2/tg128@d2048": {
+   "value": 31.29675454483344,
+   "spread": 0.08443808751679116,
+   "runs": [
+    29.296201628158183,
+    31.93883972740636,
+    31.29675454483344
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/mimo_mtp2_1/dcc2f05_20260929-215352_mtp_mimo_mtp2.json",
+   "acceptance": 0.603448275862069,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:52:35"
+  },
+  "mimo/bitwise/short": {
+   "prompt_tokens": 19,
+   "text": " The sky is blue because of Rayleigh scattering, which causes shorter wavelengths of light to scatter more than longer w",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/mimo_short.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:54:56"
+  },
+  "mimo/bitwise/long": {
+   "prompt_tokens": 760,
+   "text": "Q: Briefly explain why the sky is blue, then name three primary colors.\nA:Q: Briefly explain why the sky is blue, then n",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/mimo_long.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:54:56"
+  },
+  "mimo/ppl/wiki2": {
+   "value": 5.382953,
+   "rows": 20,
+   "length": 2048,
+   "flags": [],
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:56:39"
+  },
+  "glm/bitwise/short": {
+   "prompt_tokens": 20,
+   "text": " The sky is blue because it is the color of the sky. The primary colors are blue, red, and green.\nQ: What is the capital",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/glm_short.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:03:39"
+  },
+  "glm/bitwise/long": {
+   "prompt_tokens": 761,
+   "text": "Q: Briefly explain why the sky is blue, then name three primary colors.\nA:Q: Briefly explain why the sky is blue, then n",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/glm_long.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:03:39"
+  },
+  "glm/ppl/wiki2": {
+   "value": 4.405898,
+   "rows": 20,
+   "length": 2048,
+   "flags": [],
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:05:32"
+  },
+  "laguna/plain/pp512": {
+   "value": 582.9481542730085,
+   "spread": 0.006479480217586144,
+   "runs": [
+    582.9481542730085,
+    583.214285559097,
+    579.4370845256067
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/laguna_plain_1/dcc2f05_20260929-220922_laguna_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:08:33"
+  },
+  "laguna/plain/pp2048": {
+   "value": 858.664933996253,
+   "spread": 0.013189289086246359,
+   "runs": [
+    865.9560052691656,
+    858.664933996253,
+    854.6308252264664
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/laguna_plain_1/dcc2f05_20260929-220922_laguna_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:08:33"
+  },
+  "laguna/plain/tg128@d1024": {
+   "value": 34.230337832655266,
+   "spread": 0.02258759629745214,
+   "runs": [
+    33.47253934046983,
+    34.24572039255925,
+    34.230337832655266
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/laguna_plain_1/dcc2f05_20260929-220922_laguna_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:08:33"
+  },
+  "laguna/plain/tg128@d2048": {
+   "value": 34.18050128812528,
+   "spread": 0.0021685353873014336,
+   "runs": [
+    34.18050128812528,
+    34.1269369627529,
+    34.2010585893519
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/laguna_plain_1/dcc2f05_20260929-220922_laguna_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:08:33"
+  },
+  "laguna/dflash3/tg128@d1024": {
+   "value": 31.042964947072317,
+   "spread": 0.19568440003753423,
+   "runs": [
+    34.206199054675224,
+    31.042964947072317,
+    28.131575083621172
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/laguna_dflash3_1/dcc2f05_20260929-221116_dm_laguna_dflash3.json",
+   "acceptance": 0.44242424242424244,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:10:26"
+  },
+  "laguna/dflash3/tg128@d2048": {
+   "value": 30.400048832971816,
+   "spread": 0.11495125398575558,
+   "runs": [
+    30.400048832971816,
+    28.05267626006266,
+    31.547199994640977
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/laguna_dflash3_1/dcc2f05_20260929-221116_dm_laguna_dflash3.json",
+   "acceptance": 0.37777777777777777,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:10:26"
+  },
+  "laguna/bitwise/short": {
+   "prompt_tokens": 21,
+   "text": " The sky appears blue due to Rayleigh scattering, where shorter wavelengths of light (blue/violet) are scattered more th",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/laguna_short.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:12:11"
+  },
+  "laguna/bitwise/long": {
+   "prompt_tokens": 762,
+   "text": "\nOkay, the user is asking me to explain why the sky is blue and then name three primary colors. Let me start by recallin",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/laguna_long.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:12:11"
+  },
+  "gemma/plain/pp512": {
+   "value": 248.04486579602158,
+   "spread": 0.0012439585740053633,
+   "runs": [
+    248.2654119081137,
+    248.04486579602158,
+    247.95685437056872
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/gemma_plain_1/dcc2f05_20260929-221426_gemma_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:13:27"
+  },
+  "gemma/plain/pp2048": {
+   "value": 332.12014829760835,
+   "spread": 0.0076757178437116495,
+   "runs": [
+    332.12014829760835,
+    330.67852755545135,
+    333.22778810399547
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/gemma_plain_1/dcc2f05_20260929-221426_gemma_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:13:27"
+  },
+  "gemma/plain/tg128@d1024": {
+   "value": 8.165452684965015,
+   "spread": 0.0005248210264257285,
+   "runs": [
+    8.165452684965015,
+    8.16670770523996,
+    8.162422303980605
+   ],
+   "unit": "tok/s",
+   "json": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/bench/gemma_plain_1/dcc2f05_20260929-221426_gemma_plain.json",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:13:27"
+  },
+  "gemma/bitwise/short": {
+   "prompt_tokens": 20,
+   "text": " The sky appears blue because of a phenomenon called Rayleigh scattering. When sunlight enters Earth's atmosphere, it in",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/gemma_short.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:16:44"
+  },
+  "gemma/bitwise/long": {
+   "prompt_tokens": 761,
+   "text": "Q: Briefly explain why the sky is blue, then name three primary colors.\nA:Q: Briefly explain why the sky is blue, then n",
+   "status": "saved",
+   "file": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/gemma_long.pt",
+   "steps": 48,
+   "verify": "identical",
+   "nondeterministic": false,
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:16:44"
+  },
+  "suite/gates/gates": {
+   "steps": {
+    "mgemv_check": 0,
+    "reconstruct_had": 0,
+    "dsa_kernels": 0,
+    "wmma_gate": 0,
+    "pytest": 1
+   },
+   "pytest_failed": [
+    "test_dflash2.py::test_topk_cuda_matches_torch"
+   ],
+   "pytest_summary": "1 failed, 984 passed, 30 skipped, 27 subtests passed in 185.95s (0:03:05)",
+   "rc": 1,
+   "logdir": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253/gates",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:20:04"
+  },
+  "suite/isa/isa": {
+   "so": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/exllamav3_ext.cpython-312-x86_64-linux-gnu.so",
+   "sha256": "105b9c2b1ba90d4d2deaca723e69b59d005cb9531af34dbab86c60c2460e0b36",
+   "commit": "dcc2f05",
+   "time": "2026-09-29T22:24:23"
+  }
+ },
+ "records": [
+  {
+   "commit": "dcc2f05",
+   "time": "2026-09-29T21:22:53",
+   "tier": "full",
+   "metrics": 49,
+   "seconds": 3687,
+   "run_dir": "/home/carousel/Desktop/exlproject/logs/regress_runs/dcc2f05_record_full_20260929-212253"
+  }
+ ],
+ "isa_ref": {
+  "so": "/home/carousel/Desktop/exlproject/logs/regress_refs/dcc2f05/exllamav3_ext.cpython-312-x86_64-linux-gnu.so",
+  "sha256": "105b9c2b1ba90d4d2deaca723e69b59d005cb9531af34dbab86c60c2460e0b36",
+  "commit": "dcc2f05"
+ },
+ "stack": {
+  "commit": "dcc2f05",
+  "branch": "tools/regress",
+  "dirty": false,
+  "time": "2026-09-29T22:24:46",
+  "torch": "2.15.0.dev20260926+rocm10.0",
+  "hip": "7.15.26333",
+  "rocm_pip": "10.0.0",
+  "kernel": "7.0.0-34-generic",
+  "cpu_boost": "0",
+  "swap": "off",
+  "perf_level": "auto",
+  "cpu_max_khz": "3000000",
+  "ext_so": {
+   "path": "/home/carousel/Desktop/exlproject/rocm_exl3/exllamav3_ext.cpython-312-x86_64-linux-gnu.so",
+   "sha256": "105b9c2b1ba90d4d2deaca723e69b59d005cb9531af34dbab86c60c2460e0b36",
+   "mtime": "2026-09-29T20:03:51"
+  },
+  "env": {}
+ },
+ "tolerances": {
+  "plain": 0.02,
+  "spec": 0.08,
+  "regen": 0.03,
+  "ppl": 0.005
+ }
+}
