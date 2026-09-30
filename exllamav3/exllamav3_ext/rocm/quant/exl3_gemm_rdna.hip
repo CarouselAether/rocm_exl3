@@ -342,12 +342,15 @@ int exl3_gemm_gr
     // m = 2..8 (speculative-decoding verify steps): the multi-row GEMV, in and
     // out of capture, before the cooperative GEMM (exl3_gemv_multirow_rdna.hip)
     // (size_m >= 1: the path itself declines m == 1 unless EXL3_GEMV_MR_M1 is on)
-    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 8 && !half_k)
+    // Half-integer rates take this path only (the pseudo width EXL3_HALF_BITS(K), behind
+    // EXL3_ROCM_HALF_GEMV; the m == 1 fused GEMV below still declines them)
+    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 8
+        && (!half_k || exl3_rocm_half_gemv_enabled()))
     {
         if (exl3_gemv_multirow_try_launch
         (
             A_ptr, B_ptr, C_ptr, suh_ptr, (half*) A_had_ptr, svh_ptr,
-            size_m, size_k, size_n, K, cb, c_fp32, device, stream, graph
+            size_m, size_k, size_n, half_k ? EXL3_HALF_BITS(K) : K, cb, c_fp32, device, stream, graph
         ))
         {
             cuda_check(cudaPeekAtLastError());
@@ -715,13 +718,16 @@ int exl3_mgemm_gr
     // (size_m >= 1: the path declines m == 1 unless EXL3_GEMV_MR_M1 is on, so the
     // m == 1 route below still owns m == 1 by default)
     // (half_k: the RDNA GEMV cores are integer-K only; half-integer rates take the cooperative kernel)
-    if (size_m >= 1 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list && !half_k)
+    // (half_k, EXL3_ROCM_HALF_GEMV on: this path only, as the pseudo width EXL3_HALF_BITS(K); the
+    // m == 1 LDS-prologue mgemv below stays integer-K)
+    if (size_m >= 1 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list
+        && (!half_k || exl3_rocm_half_gemv_enabled()))
     {
         if (exl3_mgemv_multirow_try_launch
         (
             A_ptr, B_ptr_ptr, C_ptr, suh_ptr_ptr, (half*) A_had_ptr, svh_ptr_ptr,
             indices_ptr, weights_ptr,
-            size_m, size_k, size_n, K, cb, c_fp32,
+            size_m, size_k, size_n, half_k ? EXL3_HALF_BITS(K) : K, cb, c_fp32,
             bszm_in, bszm_out, min_index, max_index, num_tokens,
             size_n_list_ptr, c_list_ptr,
             device, stream, graph

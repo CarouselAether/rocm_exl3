@@ -109,6 +109,13 @@ Environment switches (all default to the safe value for this backend):
                            MLA decode graph's absorb kernel without the 16-byte
                            pointer hint (triton 3.7 then miscompiles it to NaN)
 
+  Added for half-integer bitrates (2026-09-29, MiMo-V2.6-Flash):
+
+  EXL3_ROCM_HALF_GEMV=0    1.5 / 2.5 / 3.5 bpw tensors back on the cooperative
+                           GEMM / mgemm at m = 1..8 (C++, read per call) and
+                           half-rate MoE layers off moe_decode (read at load);
+                           integer-K tensors never read it
+
 These are bisect handles, not permanent policy -- turn one on, run a prompt, see
 whether the output degrades. Each one's justification is a measurement recorded
 at the patch, not an inherited assumption; a guard whose reason has gone stale
@@ -779,6 +786,7 @@ def apply() -> list[str]:
                 # matching gate/up K and codebook and fp16 intermediates; anything else
                 # stays on the mgemm route above.
                 _moe_fused = _env_on("EXL3_ROCM_MOE_FUSED", True)
+                _half_gemv = _env_on("EXL3_ROCM_HALF_GEMV", True)
 
                 def _mgemm_bszN_batched(mod, y, selected_experts, routing_weights):
                     cfg = mod.experts_cfg
@@ -904,10 +912,19 @@ def apply() -> list[str]:
                         return None
                     if mg.K != mu.K or bool(mg.mcg) != bool(mu.mcg) or bool(mg.mul1) != bool(mu.mul1):
                         return None
-                    # v1.5.3 half-integer bitrates (LinearEXL3.K 1.5 / 2.5 / 3.5): the multi-row
-                    # GEMV cores decode integer K only; those layers stay on the mgemm route,
-                    # whose exl3_mgemm runs them on the cooperative kernel
-                    if not all(float(ml.K).is_integer() for ml in (mg, mu, md)):
+                    # v1.5.3 half-integer bitrates (LinearEXL3.K 1.5 / 2.5 / 3.5, mul1 only):
+                    # EXL3_ROCM_HALF_GEMV (default on, 2026-09-29; RDNA_NOTES "Half-integer
+                    # bitrates on the GEMV paths") -- the op takes them as the pseudo width
+                    # 16 + int(K) (EXL3_HALF_BITS in exl3_gemv_tiles_rdna.hip.h). =0 keeps those
+                    # layers on the mgemm route, whose exl3_mgemm then runs the cooperative kernel
+                    def kcode(ml):
+                        k = float(ml.K)
+                        if k.is_integer():
+                            return int(k)
+                        if _half_gemv and ml.mul1 and k in (1.5, 2.5, 3.5):
+                            return 16 + int(k)
+                        return None
+                    if any(kcode(ml) is None for ml in (mg, mu, md)):
                         return None
                     if any(getattr(l.inner, "bias", None) is not None for ml in (mg, mu, md) for l in ml.linears):
                         return None
@@ -932,7 +949,7 @@ def apply() -> list[str]:
                         "gu_svh": torch.cat([mg.ptrs_svh, mu.ptrs_svh]).contiguous(),
                         "yh": g_tensor_cache.get(self.device, (2 * rows, Hi), torch.half, "rocm_moe_yh2"),
                         "gu": g_tensor_cache.get(self.device, (2 * rows, I), torch.half, "rocm_moe_gu"),
-                        "K_gu": int(mg.K), "cb_gu": cbk(mg), "K_d": int(md.K), "cb_d": cbk(md),
+                        "K_gu": kcode(mg), "cb_gu": cbk(mg), "K_d": kcode(md), "cb_d": cbk(md),
                         "act_limit": float(self.act_limit or 0.0),
                     }
 

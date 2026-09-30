@@ -17,6 +17,14 @@ class Graph;
 // takes; 1 switches the path off. Re-read per call.
 int exl3_gemv_max_m();
 
+// EXL3_ROCM_HALF_GEMV (default on; =0 sends half-integer bitrates back to the
+// cooperative GEMM / mgemm). Callers pass K = EXL3_HALF_BITS(K) (16 + K, see
+// exl3_gemv_tiles_rdna.hip.h) for a K + 0.5 bpw mul1 tensor when this is on.
+bool exl3_rocm_half_gemv_enabled();
+#ifndef EXL3_HALF_BITS
+#define EXL3_HALF_BITS(ka) (16 + (ka))   // pseudo width of a ka + 0.5 bpw tensor (exl3_gemv_tiles_rdna.hip.h)
+#endif
+
 // Allocates the per-device parameter block outside capture (hipMalloc would
 // invalidate an active capture). Called from the m == 1 paths' non-graph
 // sites, which every BC module runs eagerly before it captures.

@@ -114,6 +114,23 @@ static inline int exl3_gemv_mr_min_m(int n_tiles)
     return (exl3_gemv_mr_m1_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES) ? 1 : 2;
 }
 
+// Half-integer bitrates (EXL3_HALF_BITS(K), K = 1..3, mul1): the tiles core's
+// dq8_half decoder (exl3_gemv_tiles_rdna.hip.h) on the same bodies. Callers
+// pass the pseudo width only for half-rate weights and only while this is on;
+// re-read per call (half-rate calls only -- integer calls never reach it).
+bool exl3_rocm_half_gemv_enabled()
+{
+    const char* env = std::getenv("EXL3_ROCM_HALF_GEMV");
+    return !env || atoi(env) != 0;
+}
+
+// Widths this file dispatches: integer 1..8 (any codebook), half 1.5 / 2.5 / 3.5 (mul1)
+static inline bool exl3_gemv_mr_k_ok(int K, int cb)
+{
+    if (K >= 1 && K <= 8) return true;
+    return K >= EXL3_HALF_BITS(1) && K <= EXL3_HALF_BITS(3) && cb == 2;
+}
+
 // -----------------------------------------------------------------------------
 // Per-device parameter block: the patchable pointers the dot kernels read
 // (republished by the rotation kernels, which host the graph sites) and the
@@ -183,7 +200,7 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
     float* out
 )
 {
-    constexpr int tile_elements = 16 * bits;
+    constexpr int tile_elements = Exl3Width<bits>::tile_u16;   // 16 * bits (integer K)
     const int r0 = (lane & 3) * 2;
 
     float accA[M], accB[M];
@@ -196,7 +213,7 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
             (B + (k_tile * n_tiles + tile_n) * tile_elements);
 
         FragB frag0, frag1;
-        dq_dispatch<bits, cb>(b_ptr, lane << 3, frag0, frag1);
+        dq_dispatch<Exl3Width<bits>::ka, cb, Exl3Width<bits>::half>(b_ptr, lane << 3, frag0, frag1);
 
         #pragma unroll
         for (int r = 0; r < M; ++r)
@@ -731,6 +748,9 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
         case 6: LAUNCH_MR_K(6, kernel_name, __VA_ARGS__); break; \
         case 7: LAUNCH_MR_K(7, kernel_name, __VA_ARGS__); break; \
         case 8: LAUNCH_MR_K(8, kernel_name, __VA_ARGS__); break; \
+        case EXL3_HALF_BITS(1): LAUNCH_MR_CB(EXL3_HALF_BITS(1), 2, kernel_name, __VA_ARGS__); break; \
+        case EXL3_HALF_BITS(2): LAUNCH_MR_CB(EXL3_HALF_BITS(2), 2, kernel_name, __VA_ARGS__); break; \
+        case EXL3_HALF_BITS(3): LAUNCH_MR_CB(EXL3_HALF_BITS(3), 2, kernel_name, __VA_ARGS__); break; \
     }
 
 bool exl3_gemv_multirow_try_launch
@@ -753,7 +773,7 @@ bool exl3_gemv_multirow_try_launch
 )
 {
     if (size_m < exl3_gemv_mr_min_m(size_n / 16) || size_m > exl3_gemv_max_m()) return false;
-    if (K < 1 || K > 8) return false;
+    if (!exl3_gemv_mr_k_ok(K, cb)) return false;
     if (size_k % 128 || size_n % 128) return false;
     if (!suh_ptr || !A_had_ptr || !svh_ptr) return false;
     if (size_n / 128 > EXL3_MGEMV_SEG_COUNTERS) return false;
@@ -826,7 +846,7 @@ bool exl3_mgemv_multirow_try_launch
 )
 {
     if (size_m < exl3_gemv_mr_min_m(size_n / 16) || size_m > exl3_gemv_max_m()) return false;
-    if (K < 1 || K > 8) return false;
+    if (!exl3_gemv_mr_k_ok(K, cb)) return false;
     if (size_k % 128 || size_n % 128) return false;
     // Weighted calls (MoE down) at m == 1 with the mgemv epilogue; see the header
     const bool weighted = weights_ptr != nullptr;
@@ -1147,13 +1167,18 @@ static void exl3_moe_dec_launch_dot
         case 6: MOE_DEC_L1(6) break;
         case 7: MOE_DEC_L1(7) break;
         case 8: MOE_DEC_L1(8) break;
+        case EXL3_HALF_BITS(1): MOE_DEC_L2(EXL3_HALF_BITS(1), 2) break;
+        case EXL3_HALF_BITS(2): MOE_DEC_L2(EXL3_HALF_BITS(2), 2) break;
+        case EXL3_HALF_BITS(3): MOE_DEC_L2(EXL3_HALF_BITS(3), 2) break;
     }
     #undef MOE_DEC_L1
     #undef MOE_DEC_L2
     #undef MOE_DEC_L3
 }
 
-// cb: 0 = 3inst, 1 = mcg, 2 = mul1 (exl3_mgemm_gr's encoding)
+// cb: 0 = 3inst, 1 = mcg, 2 = mul1 (exl3_mgemm_gr's encoding). K: integer 1..8, or
+// EXL3_HALF_BITS(k) = 16 + k for a k + 0.5 bpw mul1 matrix (rocm_py passes it only for
+// half-rate layers, and only while EXL3_ROCM_HALF_GEMV is on)
 void exl3_rocm_moe_decode
 (
     const at::Tensor& y,            // (bsz, Hi) half
@@ -1203,7 +1228,8 @@ void exl3_rocm_moe_decode
     TORCH_CHECK(2 * S <= 128 && 2 * S * (I / 128) <= EXL3_MGEMV_SEG_COUNTERS && Ho / 128 <= EXL3_MGEMV_RED_COUNTERS
                 && S * (Ho / 128) <= EXL3_MGEMV_SEG_COUNTERS, "moe_decode: shape exceeds the arrival counters");
     TORCH_CHECK(I / 16 <= EXL3_GEMV_SPLITK_MAX_TILES && Ho / 16 <= EXL3_GEMV_SPLITK_MAX_TILES, "moe_decode: output too wide");
-    TORCH_CHECK(K_gu >= 1 && K_gu <= 8 && K_d >= 1 && K_d <= 8 && cb_gu >= 0 && cb_gu <= 2 && cb_d >= 0 && cb_d <= 2, "moe_decode: K/cb");
+    TORCH_CHECK(cb_gu >= 0 && cb_gu <= 2 && cb_d >= 0 && cb_d <= 2
+                && exl3_gemv_mr_k_ok((int) K_gu, (int) cb_gu) && exl3_gemv_mr_k_ok((int) K_d, (int) cb_d), "moe_decode: K/cb");
 
     int device = y.get_device();
     Exl3GemvMrParams* pb = exl3_gemv_mr_param_block(device, true);

@@ -90,7 +90,10 @@ def main():
                   f"{torch.equal(RT[:n], T[:n])}")
         else:
             ok = False
-            diff = (R[:n].float() - L[:n].float()).abs()
+            # equal elements count as 0 (masked vocab rows hold -inf: inf - inf would be nan)
+            eq = R[:n] == L[:n]
+            diff = torch.where(eq, torch.zeros_like(R[:n].float()), (R[:n].float() - L[:n].float()).abs())
+            diff = torch.nan_to_num(diff, nan=float("inf"))
             steps = (diff.view(n, -1).max(dim=1).values > 0).nonzero().view(-1)
             first = int(steps[0].item()) if steps.numel() else -1
             print(f"  FAIL {steps.numel()} of {n} steps differ; first at step {first}; "
