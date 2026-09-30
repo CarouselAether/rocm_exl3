@@ -116,7 +116,9 @@ class DFlashInputLayer(Module):
         out_dtype: torch.dtype | None = None
     ):
         bsz, seqlen = x.shape
-        noise_mask = torch.full((bsz, self.native_draft_len - 1), self.mask_token_id, dtype = torch.long)
+        # A causal drafter may ask for a shorter block (params["draft_block_rows"], anchor included)
+        draft_len = params.get("draft_block_rows", self.native_draft_len)
+        noise_mask = torch.full((bsz, draft_len - 1), self.mask_token_id, dtype = torch.long)
         x = torch.cat((x, noise_mask), dim = -1)
         if not self.attached_model().loaded_tp:
             x = self.attached_model().modules[0].forward(x, params)
@@ -125,7 +127,7 @@ class DFlashInputLayer(Module):
             x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))
         if self.input_embedding_scale != 1.0:
             x = x * self.input_embedding_scale
-        if self.mask_embedding is not None:
-            # The trailing native_draft_len - 1 positions are the mask tokens
-            x[:, -(self.native_draft_len - 1):, :] = self.mask_embedding.to(x.dtype)
+        if self.mask_embedding is not None and draft_len > 1:
+            # The trailing draft_len - 1 positions are the mask tokens
+            x[:, -(draft_len - 1):, :] = self.mask_embedding.to(x.dtype)
         return x

@@ -293,7 +293,11 @@ class DFlashLagunaModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        # The target's head, TP-aware; exports draft confidence when the generator asks
+        # The target's head, TP-aware; exports draft confidence when the generator asks. Rows past
+        # params["draft_rows"] are never consumed, and each row's argmax is independent of them
+        rows = params.get("draft_rows")
+        if rows is not None and rows < state.shape[-2]:
+            state = state[..., :rows, :].contiguous()
         return self.attached_model().lm_head_argmax(state, params)
 
 
@@ -305,12 +309,26 @@ class DFlashLagunaModel(Model):
         return {}
 
 
+    def _short_block_pays(self) -> bool:
+        # Only for a quantized drafter: Laguna-S EXL3 4 bpw, ndt 3, 13.3 -> 3.6 ms per draft step.
+        # An fp16 drafter already streams its weights at bandwidth at m = 16, and hipBLAS's
+        # small-m kernels are slower (11.3 -> 13.7 ms), so it keeps the full block
+        if getattr(self, "_short_block", None) is None:
+            lin = self.find_module("layers.0.mlp.down_proj")
+            self._short_block = lin is not None and lin.quant_type == "exl3"
+        return self._short_block
+
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # Laguna DFlash drafts causally (dflash_config.causal); the original bidirectional
         # block-attention mode is expressed by clearing the causal flag like dflash.py does
         if not self.config.dflash_causal:
             params["causal"] = False
+        elif params.get("draft_rows") is not None and self._short_block_pays():
+            # Causal drafting: row j attends only to rows <= j, so rows past the consumed anchor +
+            # window never change the draft. Build just those (m = 4 instead of 16 at ndt 3 keeps
+            # the linears on the small-m GEMV paths; an EXL3 drafter at m = 16 runs the GEMM)
+            params["draft_block_rows"] = min(params["draft_rows"], self.config.block_size)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 

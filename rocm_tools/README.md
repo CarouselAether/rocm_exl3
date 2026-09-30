@@ -99,6 +99,16 @@ and reports graph-replay µs per call plus VGPR/spill/scratch from the compiled
 AMDGCN. `--sweep-old` and `--sweep-new` (`EXL3_DSA_SWEEP=tile|splits`) are the
 parameter sweeps behind RDNA_NOTES "DSA decode MQA kernel".
 
+## `dflash_census.py`
+
+DFlash round census on Laguna-S-2.1: per-round target verify, draft forward and
+draft sampling time, and with `--time_calls` every drafter Linear call by
+(m, K, N, format). `--dump` plus `--no_trunc` compare truncated vs full-block
+draft ids under greedy sampling. It is the measurement behind the
+opt/dflash-drafter findings: the fp16 drafter is bandwidth-bound at m = 16, an
+EXL3 drafter at m = 16 falls onto the GEMM (down_proj ~45 GB/s), and a causal
+drafter can build just anchor + ndt rows.
+
 ## Re-verifying after a ROCm upgrade
 
 ROCm changed substantially between 7.1 and 7.2 — several workarounds in the

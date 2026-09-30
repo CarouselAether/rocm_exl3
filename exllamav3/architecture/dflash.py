@@ -334,7 +334,11 @@ class DFlashModel(Model):
         state: torch.Tensor,
         params: dict
     ) -> torch.Tensor:
-        # The target's head, TP-aware; exports draft confidence when the generator asks
+        # The target's head, TP-aware; exports draft confidence when the generator asks. Rows past
+        # params["draft_rows"] are never consumed, and each row's argmax is independent of them
+        rows = params.get("draft_rows")
+        if rows is not None and rows < state.shape[-2]:
+            state = state[..., :rows, :].contiguous()
         return self.attached_model().lm_head_argmax(state, params)
 
 

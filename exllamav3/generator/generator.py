@@ -872,6 +872,10 @@ class Generator:
         }
         if self.draft_calibrator is not None:
             params["export_draft_conf"] = True
+        else:
+            # Only the anchor row + window draft rows are consumed; drafters whose sampling is a
+            # per-row argmax may run the head on just these (the calibrator reads every row)
+            params["draft_rows"] = window + 1
         out_state = self.draft_model.forward(
             input_ids = batch_ids,
             params = params,
