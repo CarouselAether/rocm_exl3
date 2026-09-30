@@ -15,7 +15,9 @@ The expert stream is ~1.6 GB for DS4 (256 experts x 3 x 2 MB at 2 bits), far pas
 every expert that received at least one row (what the kernel must stream).
 
 --check runs every shape with EXL3_ROCM_MOE_PIPE=0 (old mainloop) and =1 (new) in the same
-process and compares outputs bitwise (the switch is read per call). Needs a build with the
+process and compares outputs bitwise (the switch is read per call). Half-integer --bits (2.5 etc.)
+compare the old half_k mainloop against the half-rate pipelined instances (EXL3_ROCM_HALF_MOE_PIPE);
+bit-identical only on the same grid (EXL3_ROCM_MOE_BPS=1). Needs a build with the
 switch; on an older build both runs take the same path and the check trivially passes.
 
 Routing is uniform random top-k per token (seeded), so rows per expert ~ T*k/E.
@@ -29,6 +31,7 @@ from exllamav3.ext import exllamav3_ext as ext
 SHAPES = {
     # name: hidden, intermediate, experts, top_k, bits, mul1
     "ds4":  (4096, 2048, 256, 6, 2, True),
+    "mimo": (4096, 2048, 256, 8, 2.5, True),
     "qwen": (2048, 512, 512, 10, 4, True),
 }
 
@@ -37,7 +40,7 @@ def build(hidden, inter, E, bits, mul1, dev, seed = 0):
     g = torch.Generator(device = "cpu").manual_seed(seed)
     def trellis(k, n):
         # (E, k/16, n/16, 16*bits) uint16, random bits
-        t = torch.randint(0, 65536, (E, k // 16, n // 16, 16 * bits), generator = g, dtype = torch.int32)
+        t = torch.randint(0, 65536, (E, k // 16, n // 16, int(16 * bits)), generator = g, dtype = torch.int32)
         return t.to(torch.int16).to(dev)
     def sv(n, scale):
         s = (torch.randint(0, 2, (E, n), generator = g) * 2 - 1).half() * scale
@@ -74,7 +77,7 @@ def main():
     ap.add_argument("--rows", type = int, default = 128, help = "fused_rows (max tokens per expert)")
     ap.add_argument("--check", action = "store_true")
     ap.add_argument("--pipe", default = None, help = "set EXL3_ROCM_MOE_PIPE for the timed runs")
-    ap.add_argument("--bits", type = int, default = 0, help = "override the shape's bitrate (1..8)")
+    ap.add_argument("--bits", type = float, default = 0, help = "override the shape's bitrate (1..8, or 1.5 / 2.5 / 3.5 with mul1)")
     ap.add_argument("--mcg", action = "store_true", help = "mcg codebook (cb1) instead of mul1")
     args = ap.parse_args()
     if args.pipe is not None:
@@ -82,7 +85,7 @@ def main():
 
     dev = torch.device("cuda:0")
     hidden, inter, E, topk, bits, mul1 = SHAPES[args.shape]
-    if args.bits: bits = args.bits
+    if args.bits: bits = int(args.bits) if float(args.bits).is_integer() else args.bits
     if args.mcg: mul1 = False
     w = build(hidden, inter, E, bits, mul1, dev)
     C = ext.exl3_moe_max_concurrency(0)
@@ -91,7 +94,7 @@ def main():
     tsu = torch.empty_like(tsg)
     tig = torch.empty((C, R, inter), dtype = torch.half, device = dev)
     tiu = torch.empty_like(tig)
-    mat_bytes = hidden * inter * bits // 8
+    mat_bytes = int(hidden * inter * bits // 8)
     print(f" shape={args.shape} hidden={hidden} inter={inter} E={E} top{topk} K={bits} "
           f"concurrency={C} fused_rows={R}  expert bytes={3 * mat_bytes / 2**20:.2f} MiB")
 

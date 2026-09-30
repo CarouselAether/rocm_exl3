@@ -1,0 +1,14 @@
+ -- thermal_guard: kill at Tctl >= 99.5 C, log /home/carousel/Desktop/exlproject/logs/thermal/20260929-201620.csv
+Running as unit: run-rce347e88cb16459cb9f2156f31e3ef85.scope; invocation ID: e198803ccf944b2fb929576215ce4a3c
+ -- Loading /home/carousel/models/MiMo-V2.6-Flash-RL-exl3
+
+ -- Warming up...
+
+ -- Loading tokenizer...
+ -- Model: /home/carousel/models/MiMo-V2.6-Flash-RL-exl3
+ -- Bitrate: 2.29 bpw / 6.00 bpw (head)
+
+
+ -- Evaluated: 20 rows of 2048 tokens
+ -- Perplexity: 5.380110
+ -- thermal_guard: peak Tctl 91.0 C, rc 0

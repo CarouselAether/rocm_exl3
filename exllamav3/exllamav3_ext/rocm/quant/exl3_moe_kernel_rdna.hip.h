@@ -154,7 +154,12 @@ void moe_gemm_tile
     #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
     // v1.5.3: runtime K arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd =
     // the half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, the host checks). Same mapping as upstream
-    if constexpr (t_bits)
+    // (t_bits > 16: a half-rate pipelined instance, EXL3_HALF_BITS(K); this non-pipelined body is
+    // instantiated with it but never runs -- the kernel takes the PIPE branch -- so it maps to the
+    // shared inner's half_k form, which is the same semantics)
+    if constexpr (t_bits > 16)
+        exl3_gemm_kernel_inner<t_bits - 16, true, false, cb, SHAPE_ARGS, false>(ARGS);
+    else if constexpr (t_bits)
         exl3_gemm_kernel_inner<t_bits, false, false, cb, SHAPE_ARGS, false>(ARGS);
     else switch(K)
     {
@@ -178,7 +183,8 @@ void moe_gemm_tile
 // row tiles of 64 / 48 / 32 / 16 (the smallest that covers the rest, capped at 64),
 // sharing each dequantized B fragment across the row blocks.
 // Mixed-K kernels (t_bits == 0) keep the 16-row tile only, so the K switch does not
-// multiply into three row-tile copies.
+// multiply into three row-tile copies. Half-rate instances (t_bits = EXL3_HALF_BITS(K),
+// uniform g/u/d, EXL3_ROCM_HALF_MOE_PIPE) take the fixed-K branch with every row tile.
 template<int t_bits, int cb, int N_TILE>
 __device__ __forceinline__
 void moe_gemm_rows_pipe

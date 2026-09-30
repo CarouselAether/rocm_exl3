@@ -152,6 +152,24 @@ fp_exl3_moe_kernel exl3_moe_kernel_instances_pipe[] =
     exl3_moe_kernel_k8_n128_cb1_pipe(), exl3_moe_kernel_k8_n256_cb1_pipe(), exl3_moe_kernel_k8_n128_cb2_pipe(), exl3_moe_kernel_k8_n256_cb2_pipe()
 };
 
+// Half-integer rates on the pipelined mainloop (2026-09-29): [K - 1][N_off], mul1 only, uniform
+// gate / up / down (comp_units_rdna/exl3_moe_inst_h*_cb2.hip)
+fp_exl3_moe_kernel exl3_moe_kernel_instances_pipe_half[] =
+{
+    exl3_moe_kernel_h1_n128_cb2_pipe(), exl3_moe_kernel_h1_n256_cb2_pipe(),
+    exl3_moe_kernel_h2_n128_cb2_pipe(), exl3_moe_kernel_h2_n256_cb2_pipe(),
+    exl3_moe_kernel_h3_n128_cb2_pipe(), exl3_moe_kernel_h3_n256_cb2_pipe()
+};
+
+// EXL3_ROCM_HALF_MOE_PIPE: 1 (default) = uniform half-integer rates (1.5 / 2.5 / 3.5 bpw, mul1) take
+// the pipelined mainloop through the instances above; 0 = the non-pipelined K = 0 kernel as before.
+// Read per call, and only for half-rate launches (integer-K launches never reach it)
+static bool moe_half_pipe_enabled()
+{
+    const char* e = getenv("EXL3_ROCM_HALF_MOE_PIPE");
+    return !(e && e[0] == '0');
+}
+
 // EXL3_ROCM_MOE_PIPE: 1 (default) = pipelined mainloop, 0 = the shared exl3_gemm inner as
 // before. Read on every call (getenv is ~100 ns against a millisecond-scale kernel), so a
 // tool can A/B both mainloops in one process by setting os.environ between calls
@@ -375,9 +393,12 @@ void exl3_moe
     // With a known number of active experts, launch only as many groups as there are experts and widen them to
     // use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT
     int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
-    // The pipelined mainloop (exl3_moe_inner_rdna.hip.h) decodes integer K only; a half-integer rate takes the
-    // shared exl3_gemm inner (the EXL3_ROCM_MOE_PIPE=0 kernel), whose K = 0 switch has the half_k cases
-    const bool pipe = moe_pipe_enabled() && !any_half;
+    // The pipelined mainloop (exl3_moe_inner_rdna.hip.h) has integer-K instances and, since 2026-09-29, half-rate
+    // instances for uniform gate / up / down K + 0.5 (mul1; EXL3_ROCM_HALF_MOE_PIPE). Any other half-integer mix
+    // takes the shared exl3_gemm inner (the EXL3_ROCM_MOE_PIPE=0 kernel), whose K = 0 switch has the half_k cases
+    const bool pipe_half = any_half && gate_mul1 && K2_gate == K2_up && K2_up == K2_down && K2_gate >= 3 && K2_gate <= 7
+                           && moe_pipe_enabled() && moe_half_pipe_enabled();
+    const bool pipe = (moe_pipe_enabled() && !any_half) || pipe_half;
 
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
@@ -388,7 +409,8 @@ void exl3_moe
         // instances), so the caller's m_tile tier split runs through the same instance
         if (m_tile > 16)
             TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
-        kernel = exl3_moe_kernel_instances_pipe[4 * K + 2 * cb_idx + N_off];
+        kernel = pipe_half ? exl3_moe_kernel_instances_pipe_half[2 * (K2_gate / 2 - 1) + N_off]
+                           : exl3_moe_kernel_instances_pipe[4 * K + 2 * cb_idx + N_off];
     }
     else if (m_tile <= 16)
     {

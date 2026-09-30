@@ -35,6 +35,10 @@
 //   - <= 32 KB of LDS and <= 192 VGPRs, so two 512-thread blocks fit a WGP (the
 //     host confirms with the runtime occupancy query before launching 40 blocks).
 //
+// Half-integer rates (2026-09-29, EXL3_ROCM_HALF_MOE_PIPE): `bits` may be the pseudo
+// width EXL3_HALF_BITS(K) of exl3_gemv_tiles_rdna.hip.h -- the lane plan (4 dwords per
+// block) and exl3_dq_tile_decode carry dq8_half; only BLK_BYTES depends on it here.
+//
 // Tile slicing (stream-K over tiles_k * tiles_n tiles per block), the fp16 partial
 // sums through global memory, the lock protocol and the sub_k reduction are the old
 // inner's: on the same grid the output is bit-identical to EXL3_ROCM_MOE_PIPE=0.
@@ -141,7 +145,7 @@ void moe_gemm_pipe
     constexpr int TILEBLOCKS_N = TILESIZE_N / 16;
     constexpr int NUM_WARPS = EXL3_GEMM_BASE_THREADS / 32;       // per sub_k
     constexpr int FN = TILEBLOCKS_N / NUM_WARPS;                 // N-blocks per warp
-    constexpr int BLK_BYTES = 32 * bits;                         // one 16x16 trellis block
+    constexpr int BLK_BYTES = Exl3Width<bits>::tile_bytes;       // one 16x16 trellis block (32 * bits; half rates 16 * (2K + 1))
     constexpr int SH_A_STRIDE = TILESIZE_K;                     // halves; 16-byte chunks swizzled by row
     constexpr int A_ROWS = TILEBLOCKS_M * 16;
     constexpr int A_VEC = TILESIZE_K / 8;                        // uint4 per A row per k-tile
