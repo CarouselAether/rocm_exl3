@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 0 benchmark harness: pp512, pp2048, tg128 as exl3_server reports them.
 
-Consistency with the server is the point (ENGINEER_QUESTIONS Q-3):
+Consistency with the server is the point (bench numbers must be the numbers users see):
   - the model, cache and draft model load through model_init.init() with the server's
     own arguments (default -cs 65536, as serve_ds4f.sh), so chunk size, cache capacity
     and graph-capture geometry match;
@@ -27,7 +27,7 @@ Workloads, all at bsz 1:
 
 Each workload: 1 discarded warmup + --runs timed runs, median reported. A sysfs sampler
 thread records GPU clock / power / busy during every timed run; amd-smi snapshots are
-taken before and after. Results go to bench/results/<commit>_<timestamp>.json.
+taken before and after. Results go to bench/results/<commit>_<timestamp>.json (gitignored).
 
     bench/run_bench.py -m ~/models/DeepSeek-V4-Flash-0731-exl3-2.04bpw
     bench/run_bench.py -m ... --mtp -ndt 2          # MTP pass (separate process)

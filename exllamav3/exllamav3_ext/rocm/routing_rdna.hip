@@ -308,8 +308,8 @@ void routing_gemv_kernel
 // -----------------------------------------------------------------------------
 // The kernel above is upstream's, kept verbatim for EXL3_ROCM_ROUTER_GEMV=0. On
 // gfx1151 it runs DS4's router (E = 256, k = 4096, 2 MB of fp16 per layer) in
-// 38 us per call, ~55 GB/s against a ~10 us roofline (PROFILE.md section 4 and
-// the c6c19ca decode profile: 1.6 ms/token): a grid of E / 8 = 32 blocks covers
+// 38 us per call, ~55 GB/s against a ~10 us roofline (DS4 decode
+// profiles: 1.6 ms/token): a grid of E / 8 = 32 blocks covers
 // 32 of 40 CUs with 2 waves per SIMD, and each wave has one 128-byte load in
 // flight per loop trip, so the kernel is latency-bound.
 //

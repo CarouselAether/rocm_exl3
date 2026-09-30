@@ -302,7 +302,7 @@ def apply() -> list[str]:
     # ------------------------------------------------------------------
     # Even retuned, the upstream split kernel spills (~700 VGPRs, 2.2 KB
     # scratch/lane) and costs 160-225 us per call at ANY context -- 16% of
-    # DS4 decode (PROFILE.md §4). Root cause: a loop-invariant q tile is kept
+    # DS4 decode (measured). Root cause: a loop-invariant q tile is kept
     # resident as the WMMA A operand (replicated across half-waves on RDNA3,
     # 16 x 512 per warp = 256 VGPRs), next to a BLOCK_H x 576 fp32
     # accumulator. The replacement gives each program all 64 heads of the
@@ -1280,7 +1280,7 @@ def apply() -> list[str]:
     # BCAttn._configure); the pointers declared 16-byte aligned are the slot's
     # static buffers (q / o / partials from g_tensor_cache, offset 0) and the
     # per-layer caches. The attributes change addressing only; the warp count
-    # changes the dot layout (see RDNA_NOTES for the bitwise result). DS4's DSA /
+    # changes the dot layout (bitwise result: RDNA_NOTES "Qwen3.8"). DS4's DSA /
     # MLA kernels are not in the list.
     # EXL3_ROCM_BC_BUFOPS=0 restores the plain AOT signature.
     if _env_on("EXL3_ROCM_BC_BUFOPS", True):

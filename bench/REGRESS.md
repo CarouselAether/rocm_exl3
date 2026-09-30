@@ -10,7 +10,7 @@ bench/regress.sh show                 # print the reference table (also in bench
 bench/regress.sh report <run dir>     # rebuild the report of a finished or interrupted run
 ```
 
-The exit code is 0 only if every metric passes. Reports go to `bench/results/regress/<commit>_<timestamp>.md`. Per-step logs, the bench JSONs and `state.json` go to `exlproject/logs/regress_runs/<commit>_<mode>_<tier>_<timestamp>/`.
+The exit code is 0 only if every metric passes. Reports go to `bench/results/regress/<commit>_<timestamp>.md` (gitignored, local only). Per-step logs, the bench JSONs and `state.json` go to `exlproject/logs/regress_runs/<commit>_<mode>_<tier>_<timestamp>/`.
 
 **Build first.** The suite measures whatever `exllamav3_ext*.so` sits in the repo. It does not build. Every report records the .so's sha256 and build time, and the isa step flags a .so identical to the reference's.
 
@@ -94,5 +94,5 @@ To test the suite itself without touching the real reference, pass `--ref /some/
 
 ## Measured run times and known gaps (reference `dcc2f05`, 2026-09-29)
 
-- **Timings.** `record full` took 61.5 min of steps: bench, bitwise save + verify, PPL, gates and isa for all six models. `check quick` took 13.4 min wall and passed with 11 PASS + 1 INFO. See `bench/results/regress/dcc2f05_20260929-223832.md`.
-- **Eight metrics have no reference yet, because the thermal guard killed them.** They are `glm/plain/*` and `glm/mtp2/*` (GLM hits 100.1 C during its load warmup, which draws ~120 W), plus `gemma/plain/tg128@d2048` and `gemma/ppl/wiki2`. Each crossed 99.5 C Tctl on two attempts, again on a retry started from 39 C, and in a second retry run. The chart run earlier the same day peaked at 96.5 / 97.5 C on these models. Until they are recorded, `check full` shows them as NOREF, which is reported but does not fail. Once the box runs cooler, record them with `bench/regress.sh record full --only 'glm/plain/*' 'glm/mtp2/*' 'gemma/plain/tg128@d2048' 'gemma/ppl/wiki2'`. The guard limit is not to be raised.
+- **Timings.** `record full` took 61.5 min of steps: bench, bitwise save + verify, PPL, gates and isa for all six models. `check quick` took 13.4 min wall and passed with 11 PASS + 1 INFO.
+- **Eight metrics have no reference yet, because the thermal guard killed them.** They are `glm/plain/*` and `glm/mtp2/*` (GLM hits 100.1 C during its load warmup, which draws ~120 W), plus `gemma/plain/tg128@d2048` and `gemma/ppl/wiki2`. Each crossed 99.5 C Tctl on two attempts, again on a retry started from 39 C, and in a second retry run. The chart run earlier the same day peaked at 96.5 / 97.5 C on these models. Until they are recorded, `check full` shows them as NOREF, which is reported but does not fail. The machine was repasted on 2026-09-30 (a GLM run now peaks at ~87 C), so they can be recorded with `bench/regress.sh record full --only 'glm/plain/*' 'glm/mtp2/*' 'gemma/plain/tg128@d2048' 'gemma/ppl/wiki2'`. The guard limit is not to be raised.

@@ -7,7 +7,8 @@ write it.
 Every claim has one of these tags:
 
 - **[code `file:line`]**: read directly from the source.
-- **[NOTES `line`]**: from `exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md`.
+- **[NOTES `line`]**: a line in `RDNA_NOTES.md` as it stood before the 2026-09-30 condensation (the full
+  dated log is kept in the maintainer's project notes); in the condensed file, search by topic.
 - **[UNVERIFIED]**: an inference or an open question. It is not a rule.
 
 Path abbreviations:
@@ -362,8 +363,7 @@ gfx110x and gfx120x, and 65536 for gfx1150/1151.
     does not cover it.
 11. **Dead re-proof path:** the header says to re-prove with
     `../../rocm_exl3_legacy/tests/wmma_smoke2.cpp` [code W:27-30, 205]. That
-    file is not in the repo; the live equivalent is `WC`. `ROCM_PORT_MAP.md`
-    still calls the header `rdna_wmma.hip (368)` [rocm_tools/ROCM_PORT_MAP.md:105].
+    file is not in the repo; the live equivalent is `WC`.
 12. **int8 load alignment:** `load_matrix_a_i8` dereferences a 16-byte
     `int32x4_t` at `A + (L%16)*stride` bytes [code W:592]. The alignment
     measurement covers only the f16 A load [code W:225-232]. The int8 path has

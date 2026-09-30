@@ -30,7 +30,7 @@
 // Second call site, same place: wmma_gemm_try() (rocm/wmma_gemm_rdna.hip) runs the
 // vendored rocm_wmma_gemm WMMA kernels for m > 8 on gfx1151/gfx1100/gfx1101, where
 // hipBLAS's fp32-output GEMM runs a VALU kernel with no matrix cores (3-6x slower than
-// its own fp16-output path; PROFILE.md section 6). EXL3_ROCM_WMMA_GEMM=0 disables it,
+// its own fp16-output path, measured on gfx1151). EXL3_ROCM_WMMA_GEMM=0 disables it,
 // EXL3_ROCM_WMMA_GEMM_F16=0 disables it for fp16 output only. See RDNA_NOTES.md.
 // =============================================================================
 

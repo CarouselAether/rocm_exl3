@@ -1,6 +1,0 @@
- -- thermal_guard: kill at Tctl >= 99.5 C, log /home/carousel/Desktop/exlproject/logs/thermal/20260927-233521.csv
- shape=ds4 hidden=4096 inter=2048 E=256 top6 K=2 concurrency=2 fused_rows=128  expert bytes=6.00 MiB
-   T=256   active=255  rows/expert~  6.0 max=15    56.267 ms    28.5 GB/s  spread= 0.6%
-   T=512   active=256  rows/expert~ 12.0 max=23    61.251 ms    26.3 GB/s  spread= 0.3%
-   T=1792  active=256  rows/expert~ 42.0 max=61   154.398 ms    10.4 GB/s  spread= 1.1%
- -- thermal_guard: peak Tctl 52.6 C, rc 0

@@ -46,7 +46,7 @@ PROMPTS = [
 def long_prompt(tokenizer, n_tokens = 3000):
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     text = ""
-    for f in ["README.md", "doc/exl3.md", "doc/convert.md", "PROFILE.md"]:
+    for f in ["README.md", "doc/exl3.md", "doc/convert.md"]:
         p = os.path.join(here, f)
         if os.path.exists(p):
             text += open(p).read() + "\n\n"

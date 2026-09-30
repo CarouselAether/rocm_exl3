@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Gate #4 perplexity eval (ENGINEER_QUESTIONS Q-7): wikitext2 test, 100 rows x 2048 tokens,
+# Perplexity gate: wikitext2 test, 100 rows x 2048 tokens,
 # on the three gate models. Each model runs in its own process under exlproject/thermal_guard.py.
 #
-#   bench/run_ppl.sh [outdir]          # default outdir: bench/results/ppl
+#   bench/run_ppl.sh [outdir]          # default outdir: bench/results/ppl (gitignored)
 #   MODELS="ds4" bench/run_ppl.sh      # subset: ds4 qwen gemma
 #
 # Output: <outdir>/<commit>_<model>.log, plus a one-line summary per model on stdout.

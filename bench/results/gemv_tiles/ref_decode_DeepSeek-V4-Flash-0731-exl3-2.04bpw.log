@@ -1,5 +1,0 @@
- -- thermal_guard: kill at Tctl >= 99.5 C, log /home/carousel/Desktop/exlproject/logs/thermal/20260927-185006.csv
-  48 steps, logits (48, 129280) torch.float32
-  text: ' The sky is blue because molecules in the air scatter blue light from the sun more than they scatter red light. The three primary colors are red, yellow, and blue..: The sky is blue because molecules '
-reference written to bench/results/gemv_tiles/ref_decode_DeepSeek-V4-Flash-0731-exl3-2.04bpw.pt
- -- thermal_guard: peak Tctl 66.0 C, rc 0

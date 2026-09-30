@@ -138,10 +138,12 @@ the other nine entries are one-for-one `_rdna` siblings, each justified in its
   backs `BC_BlockSparseMLP::run_bszN` upstream. Built on `exl3_gemv_kernel.cuh`
   (PTX GEMV), so it needs a re-derivation, not an include swap. **Not ported.**
   `rocm/quant/exl3_moe_coop_rdna.hip` stubs the entry points; `rocm_py` keeps
-  `block_sparse_mlp.forward` off that route (`EXL3_ROCM_MOE_BSZN`) and runs bsz ≤ 8
-  MoE decode through the per-token `exl3_mgemm` route upstream had at v1.4.4
-  (three calls per token, each on the mgemv fast path). Same fp32 accuracy as the
-  fused kernel and twice its decode speed (RDNA_NOTES, "MoE decode route restored").
+  `block_sparse_mlp.forward` off that route (`EXL3_ROCM_MOE_BSZN`). bsz ≤ 8 MoE
+  decode instead runs every token of the call in one set of launches through the
+  fork's own fused op, `torch.ops.exl3_rocm.moe_decode` (gate+up in one GEMV,
+  activation folded into down). `EXL3_ROCM_MOE_FUSED=0` falls back to four
+  mgemm-route launches, `EXL3_ROCM_MOE_BATCH=0` to the per-token `exl3_mgemm` route
+  upstream had at v1.4.4 (RDNA_NOTES, "MoE decode route restored").
 
 ## LDS budget on non-Strix RDNA parts
 
@@ -181,12 +183,15 @@ shapes, never a failed launch. Verified with
       fp32 comparison; GLM-4.6V and Qwen 3.8-Flash-Next generation)
 - [x] `quantize` + 8 tile instantiations — builds and links, **not yet executed**
       (no conversion has been run on RDNA)
-- [x] `ROCM_EXCLUDE` covers every replaced source (setup.py keeps 117 sources,
-      the probe compiles the same 117, no upstream twins remain)
+- [x] `ROCM_EXCLUDE` covers every replaced source (setup.py and the probe compile
+      the same set, no upstream twins remain)
 - [x] v1.5.0 sync — built and validated on gfx1151 (2026-09-20): full build,
       numeric ladder, pytest, coherent generation on the verified models. MoE
       `count_lo`/`count_hi` tiers and the deterministic `output_scratch` +
       `exl3_moe_gather` path run by default.
+- [x] v1.5.3 sync — built and validated on gfx1151 (2026-09-29): siblings re-synced,
+      half-integer bitrates (1.5 / 2.5 / 3.5 bpw) on the GEMV decode and pipelined
+      MoE prefill paths, regression suite (`bench/regress.sh`) green on six models
 - [ ] v1.5.0 opt-ins that are built but unexercised: sliced mgemm
       (`EXL3_ROCM_QKV_SLICE=1`); batched `reconstruct[_had]_batch` + `hgemm_batched`
       (`EXL3_ROCM_BATCH_RECON=1`); quantize tile length 160 and the

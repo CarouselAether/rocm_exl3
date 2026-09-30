@@ -24,25 +24,27 @@ git diff --stat v1.5.3 -- '*.cu' '*.cuh' '*.cpp' '*.h' ':(exclude)exllamav3/exll
 # (empty)
 ```
 
-Outside `rocm/`, `rocm_py/` and `rocm_tools/` (and the fork's own `bench/`, `docs/` and notes), exactly three
-upstream files differ from v1.5.3. There is also one added file (`requirements_rocm.txt`) and one ignore line
-in `.gitignore`:
+Outside `rocm/`, `rocm_py/` and `rocm_tools/` (and the fork's own `bench/`, `docs/`, `rocm_patches/` and notes),
+seven upstream files differ from v1.5.3. There is also one added file (`requirements_rocm.txt`) and a few ignore
+lines in `.gitignore`:
 
 | file | change |
 |---|---|
 | `setup.py` | ROCm backend selector, `hipcc` builder and `ROCM_EXCLUDE`. All ROCm behaviour is inside `HIPBuildExtension`, so a CUDA build is untouched upstream code. |
 | `exllamav3/__init__.py` | Six lines calling `rocm_py.apply()` at the end of package init. It returns immediately when `torch.version.hip` is `None`, so it is inert on CUDA. |
 | `README.md` | This section. |
+| `exllamav3/generator/generator.py`, `exllamav3/architecture/dflash.py`, `exllamav3/architecture/dflash_laguna.py`, `exllamav3/modules/arch_specific/dflash.py` | DFlash drafting cost: the draft lm_head runs only on the rows that are used, and a causal EXL3 drafter builds only anchor + ndt block rows. Platform-neutral. Logged with the reason and how to verify in `rocm_patches/UPSTREAM_PY_CHANGES.md`. |
 
 ```sh
 git diff --stat v1.5.3 -- . ':(exclude)exllamav3/exllamav3_ext/rocm' ':(exclude)exllamav3/rocm_py' ':(exclude)rocm_tools' ':(exclude)bench' ':(exclude)docs' ':(exclude)rocm_patches' ':(exclude)*.md'
 ```
 
-That is the whole surface. Rebasing onto a new upstream means re-applying three files, none of them kernels. The
+That is the whole surface. Rebasing onto a new upstream means re-applying those files, none of them kernels
+(`rocm_patches/` has the patch export for the Python edits). The
 real work is re-syncing the siblings and hooks whose upstream originals changed. `rocm_patches/` and the
 maintainer's merge notes track that. See `RDNA_NOTES.md` → "Syncing to a new upstream release".
 
-### Performance (gfx1151, 2026-09-29)
+### Performance (gfx1151, 2026-09-30)
 
 Ryzen AI Max+ 395, ROCm 10.0, bsz 1. Figures are tok/s, the median of 3 runs. Decode = 128 tokens after a
 1024-token natural-text prompt. MTP = the model's own draft head, `-ndt 2`.
@@ -53,14 +55,15 @@ Ryzen AI Max+ 395, ROCm 10.0, bsz 1. Figures are tok/s, the median of 3 runs. De
 | Qwen 3.8-Flash-Next 4 bpw (`-ngr`) | 621 | 863 | 29.0 | 40.2 |
 | GLM-5.3-Flash 2.05 bpw | 262 | 360 | 20.0 | 25.7 |
 | Laguna-S-2.1 4 bpw | 582 | 872 | 34.3 | 40.4 (DFlash drafter at 4 bpw, ndt 2)¹ |
-| MiMo-V2.6-Flash 2.27 bpw | 158 | 274 | 13.2 | 12.1 |
+| MiMo-V2.6-Flash 2.27 bpw | 341 | 469 | 30.0 | 35.3 |
 | Gemma-4-31B ~6 bpw (dense) | 249 | 319 | 8.2 | n/a |
 
 ¹ Laguna has no MTP head. Its row uses the external DFlash drafter, quantized to **4.0 bpw EXL3** (`genevera/Laguna-S-2.1-DFlash-exl3`), not the BF16 release: 40.4 / 35.7 t/s at d1024 / d2048, 53% / 44% acceptance, greedy (2026-09-30, `opt/dflash-drafter`). The BF16 drafter measures 35.4 / 31.8 at ndt 3.
 
 Against the port as of v1.5.0 on the same machine, DeepSeek-V4-Flash went from 18.0 to 30.0 t/s decode, from
-19.8 to 41.7 t/s with MTP, and from 113 / 179 to 346 / 519 t/s prefill. What changed, with the numerics notes
-and per-change A/B, is in `RESULTS.md`; the method is in `PROFILE.md`.
+19.8 to 41.7 t/s with MTP (short natural prompts), and from 113 / 179 to 346 / 519 t/s prefill. What changed, with the numerics notes
+and per-change A/B, is kept in the maintainer's project notes outside the repo; the kernel-level rationale is in
+`exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md`.
 
 ### Requirements
 
@@ -133,7 +136,7 @@ HIP 7.15), torch 2.15.0.dev20260926+rocm10.0, triton-rocm 3.8.0, Python 3.12. Al
 with torch 2.13.0+rocm7.2.
 
 Verified end to end on the models in the performance table: DeepSeek-V4-Flash, Qwen 3.8-Flash-Next,
-GLM-5.3-Flash, Laguna-S-2.1 (with its DFlash drafter), MiMo-V2.6-Flash and Gemma-4-31B. GLM-4.6V was verified
+GLM-5.3-Flash, Laguna-S-2.1 (with its DFlash drafter, BF16 and 4 bpw EXL3), MiMo-V2.6-Flash and Gemma-4-31B. GLM-4.6V was verified
 at v1.5.0. The other architectures in the supported list should work but are untested. Reports welcome.
 
 **v1.5.3 sync status (2026-09-29, validated on gfx1151):** merged from v1.5.0 (133 upstream commits). Upstream's
@@ -150,7 +153,7 @@ changes were ported into every RDNA sibling and `rocm_py` hook whose original ch
 |---|---|
 | MiMo-V2 (text, MTP, DFlash drafter) | supported; the vision tower is untested |
 | Kimi-Linear | builds; untested (no model) |
-| Fractional bitrates (1.5 / 2.5 / 3.5 bpw) | supported (reconstruct, GEMM, mgemm, fused MoE, quantizer). There is no fast GEMV decode path for half rates yet, which is why MiMo-V2.6 at 2.27 bpw decodes slowly. |
+| Fractional bitrates (1.5 / 2.5 / 3.5 bpw) | supported (reconstruct, GEMM, mgemm, fused MoE, quantizer), with fast paths for GEMV decode and the pipelined MoE prefill (`EXL3_ROCM_HALF_GEMV`, `EXL3_ROCM_HALF_MOE_PIPE`): MiMo-V2.6 at 2.27 bpw decodes at 30 t/s. |
 | DFlash rework, DFlash2 drafters, n-gram SAM corpus | supported |
 | Deterministic router math, GDN fp16 prefill, new paged-decode split | supported; ROCm follows upstream's numerics |
 | int8 GEMV, cooperative MoE decode (`exl3_moe_coop`), fp16-accumulate `hgemm` | not ported (CUDA-only); the RDNA kernels are used instead |
@@ -198,8 +201,9 @@ python rocm_tools/exl3_server/server.py -m ~/models/<model>-exl3 -cs 32768 -ngra
 # serves on http://127.0.0.1:3953
 ```
 
-`-ngram 2 -dds` (n-gram drafting, skipped while acceptance is low) is the recommended speculative-decoding setting on
-this GPU. Endpoints: `GET /health`, `GET /props`, `GET /v1/models`, `POST /v1/chat/completions` (prompt built with the
+For models with an MTP head, `-mtp -ndt 2` is the fastest speculative setting on this GPU (the MTP column above);
+for Laguna, the 4 bpw DFlash drafter with `-dm <dir> -ndt 2`. For other models, `-ngram 2 -dds` (n-gram drafting,
+skipped while acceptance is low) needs no extra model. Endpoints: `GET /health`, `GET /props`, `GET /v1/models`, `POST /v1/chat/completions` (prompt built with the
 model's own chat template), `POST /v1/completions` (prompt used verbatim, for clients that apply their own instruct
 template), `POST /tokenize`, `POST /detokenize`. Streaming uses standard OpenAI SSE chunks ending in `data: [DONE]`.
 Sampling flags set the *defaults*; each request can override them. See
@@ -279,7 +283,7 @@ Implementation: `exllamav3/rocm_py/ngram_lock.py`.
 
 | flag | what it does |
 |---|---|
-| `-dm DIR` | separate draft model, like llama.cpp's `--model-draft`; DFlash / EAGLE-3-style drafters load directly (e.g. `-dm ~/models/Laguna-S-2.1-DFlash`) |
+| `-dm DIR` | separate draft model, like llama.cpp's `--model-draft`; DFlash / EAGLE-3-style drafters load directly (e.g. `-dm ~/models/Laguna-S-2.1-DFlash`). A quantized EXL3 drafter is faster than the BF16 one on this GPU (Laguna: 40.4 vs 35.4 t/s, see the performance table) |
 | `-mtp` | draft with the model's own MTP head (DeepSeek V4, Qwen3.8-Flash-Next, ...); not with `-dm` |
 | `-ndt N` | draft tokens per step (default: the draft model's own default, else 4) |
 | `-ngram N` | n-gram drafting from repeats already in the context, minimum match length N; no extra model. `-ngram 2` is the cheap default |

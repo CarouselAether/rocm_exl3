@@ -154,7 +154,7 @@ struct Case
     int bits, cb, k, n, nmat, W, M, a_lds;
 };
 
-// DS4-Flash 2.04bpw decode shapes (bench/results trace grids), plus the
+// DS4-Flash 2.04bpw decode shapes (decode trace grids), plus the
 // Qwen3.8 / Gemma codebook-bitrate combinations
 static Case cases[] = {
     {"ds4 routed gate/up K2 4096->2048 x6",  2, 2, 4096,  2048, 6, 8, 1, 0},

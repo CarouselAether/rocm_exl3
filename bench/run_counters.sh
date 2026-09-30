@@ -6,7 +6,7 @@
 #
 # Switches the GPU perf level to profile_standard (the perfmon clock is gated at `auto` on
 # RDNA3/4, so some counters read zero) and ALWAYS restores `auto` on exit, even on failure.
-# Needs the sysfs file chmod'ed by the maintainer (ENGINEER_QUESTIONS Q-8).
+# Needs the sysfs power_dpm_force_performance_level file made writable by the maintainer.
 # EXCLUDE=regex skips kernels from collection (exl3_moe: PMC deadlocks co-resident kernels, RDNA_NOTES).
 # Every pass runs under thermal_guard with a timeout (Q-10). rocprofv3 re-runs the app per --pmc pass.
 set -uo pipefail

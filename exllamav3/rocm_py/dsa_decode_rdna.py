@@ -11,7 +11,7 @@ width, so its fp32 accumulator is BLOCK_H x (D_c_pad 512 + D_r 64) -- at BLOCK_H
 ceiling with ~700 VGPRs spilled (2.2 KB scratch per lane). Each decode split covers only
 ~8-40 keys, so the call is all fixed cost: scratch round-trips, 128 programs each
 re-reading the same K rows. Measured 160-225 us per call on gfx1151 regardless of
-context (PROFILE.md §4).
+context.
 
 Here one program owns HP heads (the MMA M dimension; the single KV head is shared by
 all 64) and one BD-wide column block of the output, over a key split:

@@ -626,7 +626,8 @@ def write_report(st, ref, allow_numerics=()):
         model, mode, wl = x.split("/")
         rows.append(f"| {model} | {mode} | {wl} | {fmt(x, refm)} | {fmt(x, cur)} | "
                     f"{(f'{d:+.2%}' if d is not None else '')} | {tol_str(x)} | **{s}** | {note} |")
-    ok = all(s in ("PASS", "IMPROVED", "INFO", "CHANGED") for s in statuses)
+    # NOREF (metric never recorded) is reported, not a failure (REGRESS.md); ERROR and FAIL are
+    ok = all(s in ("PASS", "IMPROVED", "INFO", "CHANGED", "NOREF") for s in statuses)
     s = st["stack"]
     secs = sum(v.get("seconds", 0) for v in st["steps"].values())
     ref_commits = sorted({(ref or {}).get("metrics", {}).get(x, {}).get("commit", "?") for x in metrics})

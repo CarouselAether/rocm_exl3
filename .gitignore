@@ -12,3 +12,6 @@ dist
 exllamav3_ext.cpython-*.so
 # rocprofv3 leaves counter dumps in the cwd
 .rocprofv3/
+
+# bench/regress output (kept in the maintainer project folder, not the repo)
+bench/results/

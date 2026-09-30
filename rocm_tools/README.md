@@ -170,5 +170,3 @@ RDNA sibling differs from the upstream file it replaces — are in
 [`exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md`](../exllamav3/exllamav3_ext/rocm/RDNA_NOTES.md).
 Its "Verification tools" table covers every script here, not just the four above.
 
-[ROCM_PORT_MAP.md](ROCM_PORT_MAP.md) is the original porting log. Its pass counts
-(31 / 43 of 50) are historical; the current baseline is above.
