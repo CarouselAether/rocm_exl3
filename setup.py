@@ -564,8 +564,11 @@ class HIPBuildExtension(build_ext):
             "-lc10_hip", "-lamdhip64", "-lhipblas", "-lrocblas", "-lhiprand",
         ]
 
+        # -fgpu-rdc device-links here: without --offload-arch hipcc auto-detects every
+        # GPU on the machine (e.g. an iGPU next to the dGPU) and embeds a metadata-less
+        # stub for it, which crashes comgr on the first HIP launch (issue #4).
         cmd = (["hipcc", "-shared", "-fgpu-rdc", "--hip-link", "-o", ext_path]
-               + objs + lib_args + link_libs + ["-fPIC"])
+               + arch_flags + objs + lib_args + link_libs + ["-fPIC"])
         print(f"[link] {ext_path}", flush=True)
         if verbose:
             print("  " + " ".join(cmd))
