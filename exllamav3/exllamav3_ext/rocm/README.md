@@ -145,17 +145,18 @@ the other nine entries are one-for-one `_rdna` siblings, each justified in its
   mgemm-route launches, `EXL3_ROCM_MOE_BATCH=0` to the per-token `exl3_mgemm` route
   upstream had at v1.4.4 (RDNA_NOTES, "MoE decode route restored").
 
-## LDS budget on non-Strix RDNA parts
+## LDS budget
 
-Strix Halo (gfx1151) has **64 KB** of LDS per workgroup, measured. Discrete
-RDNA parts are assumed to take upstream's 90 KB figure (not measured here), so
-this is a build-time define rather than a constant. `setup.py` sets it from its
-`GPU_ARCH_SMEM` table — 65536 for gfx1150/gfx1151 and unknown targets, 92160 for
-gfx110x/gfx120x, the smallest across a multi-arch build. The header default of
-64 KB only applies to a hand-run `hipcc` without the define:
+RDNA caps a workgroup at **64 KB** of LDS: measured on gfx1151 (Strix Halo) and
+gfx1201 (RX 9070 XT, R9700; issue #1). Discrete RDNA parts were once assumed to
+take upstream's 90 KB NVIDIA figure; on gfx1201 that died at model load, because
+the cooperative autotune passes the figure straight to `cudaFuncSetAttribute`.
+The value is still a build-time define, `setup.py` setting it from its
+`GPU_ARCH_SMEM` table (65536 for every supported arch and for unknown targets).
+The header default of 64 KB applies to a hand-run `hipcc` without the define:
 
 ```bash
-hipcc -DEXL3_RDNA_SMEM_MAX=92160 ...    # what setup.py passes for a 90 KB part
+hipcc -DEXL3_RDNA_SMEM_MAX=65536 ...    # what setup.py passes
 ```
 
 It is deliberately **not** selected with an arch macro. `__gfx1151__` exists only

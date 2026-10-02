@@ -306,18 +306,16 @@ SUPPORTED_GPU_ARCHS = {
 
 # LDS (shared memory) per workgroup the EXL3 kernels may assume, per arch.
 #
-# The APUs are the odd ones out: Strix / Strix Halo report sharedMemPerBlock =
-# 65536 (measured on gfx1151), while the discrete parts take upstream's 90 KB.
-# Getting this wrong is not a correctness bug -- exl3_rdna_smem_budget() clamps
-# to the device's real sharedMemPerBlock at runtime and shape admission uses the
-# clamped value -- but too high a figure costs a failed shape selection and too
-# low costs the wider tiles.
-GPU_ARCH_SMEM = {
-    "gfx1100": 92160, "gfx1101": 92160, "gfx1102": 92160,
-    "gfx1150": 65536, "gfx1151": 65536,   # Strix / Strix Halo APUs
-    "gfx1200": 92160, "gfx1201": 92160,
-}
-DEFAULT_ARCH_SMEM = 65536   # unknown arch: assume the smaller budget
+# Every RDNA generation caps a workgroup at 64 KB of LDS: measured on gfx1151
+# (Strix Halo) and on gfx1201 (RX 9070 XT, R9700; issue #1), and the RDNA3 ISA
+# gives the same per-workgroup limit for the discrete gfx110x parts. The 90 KB
+# upstream figure is an NVIDIA number. Too high a figure is a hard failure, not
+# a missed tile: the cooperative autotune path passes it straight to
+# cudaFuncSetAttribute, which rejects it (GPU assert in coop_autotune.cu).
+GPU_ARCH_SMEM = {a: 65536 for a in (
+    "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+)}
+DEFAULT_ARCH_SMEM = 65536   # unknown arch: assume the RDNA budget
 
 
 def _resolve_smem_max(archs):
