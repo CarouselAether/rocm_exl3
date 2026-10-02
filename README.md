@@ -110,13 +110,25 @@ pip install -r requirements_rocm.txt   # the other dependencies (the installed R
 #    (or AMD's stable wheel: pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device-gfx1151]==2.13.0+rocm10.0.0")
 
 # 2. Build against that SDK. A login shell's /opt/rocm must not leak in.
-SDK=$(rocm-sdk path --root)
-env -u LD_LIBRARY_PATH PATH=$SDK/bin:$PATH ROCM_PATH=$SDK ROCM_HOME=$SDK \
-    pip install --no-build-isolation .
+rocm_tools/build_rocm10.sh
 ```
 
-`ROCM_HOME` matters: torch's extension builder takes the runtime path from it. Without it the extension can end up
-linked against a system ROCm instead of the wheel's.
+`build_rocm10.sh` scrubs any system ROCm from the environment, runs `rocm-sdk init` (which unpacks hipcc into
+the SDK) if needed, and points `PATH`, `ROCM_PATH` and `ROCM_HOME` at the wheel SDK. `ROCM_HOME` matters: torch's
+extension builder takes the runtime path from it. Without it the extension can end up linked against a system
+ROCm instead of the wheel's.
+
+**Exact maintainer stack.** `requirements_rocm10.txt` pins the versions the performance table and the
+validation runs used (torch 2.15.0.dev20260926+rocm10.0, triton-rocm 3.8.0, ROCm SDK 10.0.0). Use it in place
+of step 1 when you want to reproduce a result or rule out the stack:
+
+```sh
+pip install -r requirements_rocm10.txt
+rocm_tools/build_rocm10.sh
+```
+
+ROCm 10 also fixes the segfault in `libhsa-runtime64` that 7.2.x processes can hit at exit (issue #2). The torch
+`+rocm7.2` wheels bundle ROCr 7.2.1, not 7.2.4.
 
 **ROCm 7.2.4 (system install):**
 

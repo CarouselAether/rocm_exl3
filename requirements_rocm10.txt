@@ -1,0 +1,48 @@
+# ROCm 10, pinned: the exact stack the maintainer builds, tests and benchmarks on
+# (gfx1151, Python 3.12; the same wheels exist for 3.11-3.14). For the loose,
+# always-latest ROCm 10 install see README "Install"; for ROCm 7.2.4 use
+# requirements_rocm.txt.
+#
+#   python -m venv .venv && . .venv/bin/activate
+#   pip install -r requirements_rocm10.txt
+#   rocm_tools/build_rocm10.sh
+#
+# Everything ROCm comes from wheels (torch's own runtime plus the rocm SDK that
+# hipcc and the headers come from), so no system ROCm install is needed, and a
+# system /opt/rocm must not leak into the build -- build_rocm10.sh scrubs it.
+#
+# ROCm 10 is also the fix for the SIGSEGV in libhsa-runtime64 at process exit
+# (issue #2): a ROCr shutdown use-after-free, fixed in ROCm 10, still present in
+# every 7.2.x. Note that torch "+rocm7.2" wheels bundle ROCr 7.2.1, not 7.2.4.
+#
+# The torch pin is a nightly. PyTorch prunes old nightlies from its index; if
+# this one is gone, take the newest +rocm10.0 nightly (README "Install") or AMD's
+# stable wheel:
+#   pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device-gfx1151]==2.13.0+rocm10.0.0"
+# (swap device-gfx1151 for your GPU, e.g. device-gfx1201).
+
+--index-url https://download.pytorch.org/whl/nightly/rocm10.0
+--extra-index-url https://pypi.org/simple
+
+torch==2.15.0.dev20260926+rocm10.0
+triton-rocm==3.8.0+gitc01b6774
+rocm[libraries,devel]==10.0.0
+
+tokenizers==0.23.2
+numpy==2.5.3
+rich==15.0.0
+typing_extensions==4.16.0
+safetensors==0.8.0
+ninja==1.13.2
+pillow==12.3.0
+PyYAML==6.0.3
+marisa-trie==1.4.1
+pydantic==2.13.5
+llguidance==1.8.0
+
+# rocm_tools/exl3_server
+fastapi==0.141.1
+uvicorn==0.53.0
+sse-starlette==3.4.11
+transformers==5.17.0
+Jinja2==3.1.6
