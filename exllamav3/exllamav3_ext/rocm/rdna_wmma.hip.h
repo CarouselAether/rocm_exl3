@@ -268,19 +268,48 @@ __device__ __forceinline__ void mma_sync(
     const WmmaFragB& b)
 {
 #if defined(__gfx1200__) || defined(__gfx1201__)
-    // RDNA4: the gfx11 WMMA encodings do not exist -- LLVM fails instruction
-    // selection on this intrinsic ("Cannot select: llvm.amdgcn.wmma.f32...").
-    // The only live instantiations reaching this wrapper are the fused-MoE
-    // comp units, and rocm_py steers MoE to the per-expert path on gfx120x,
-    // so this body is unreachable at runtime there. Trap rather than emulate:
-    // silent wrong numbers are the one unacceptable outcome, and a real gfx12
-    // WMMA port (half-size fragments, no operand duplication across wave
-    // halves) needs RDNA4 hardware to validate the layout -- not done yet.
+    // RDNA4: the gfx11 encoding does not exist, so use the gfx12 form. This
+    // wrapper is reached by the dense quantized GEMM (exl3_gemm_inner_rdna.hip.h,
+    // every EXL3 matmul past the GEMV row limit) as well as the fused-MoE comp
+    // units -- not only the latter, as an earlier note here claimed.
+    //
+    // gfx12 v_wmma_f32_16x16x16_f16 takes 8 halves per lane: lane L holds its
+    // row/column (L % 16) for K = 8*(L/16) .. +7. The gfx11 fragments carry all
+    // 16 K values in every lane, so each operand is a per-lane half select. The
+    // accumulator differs only in which columns a lane pair (L, L^16) holds:
+    // gfx11 col = 2*i + h, gfx12 col = i + 8*h (h = L / 16). Four xor-16 swaps
+    // convert in and four convert back, so WmmaFragC's layout and every
+    // load/store helper stay unchanged. Not optimal: a native gfx12 fragment
+    // layout would drop the swaps.
+    //
+    // Layout measured and validated on gfx1201 by RDNA4 users (issue #1: R9700
+    // mma_sync vs fp64 reference, exl3_stack_check, multirow_check, Qwen3.8-27B
+    // end to end); the maintainer has no gfx12 hardware.
+    //
     // Other wrappers in this header keep the bare gfx11 builtin on purpose:
     // if a future instantiation drags them into a gfx12 build, a LOUD compile
     // failure is the correct behavior.
-    (void) a; (void) b; (void) c;
-    __builtin_trap();
+    typedef _Float16 half8_t __attribute__((ext_vector_type(8)));
+    const bool h = (threadIdx.x & 16) != 0;
+    const half8_t a8 = h ? a.data.hi : a.data.lo;
+    const half8_t b8 = h ? b.data.hi : b.data.lo;
+
+    float8_t g;
+    #pragma unroll
+    for (int t = 0; t < 4; t++) {
+        float r = __shfl_xor(h ? c.data[t] : c.data[4 + t], 16);
+        g[2 * t]     = h ? r : c.data[t];
+        g[2 * t + 1] = h ? c.data[4 + t] : r;
+    }
+
+    g = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(b8, a8, g);
+
+    #pragma unroll
+    for (int t = 0; t < 4; t++) {
+        float r = __shfl_xor(h ? g[2 * t] : g[2 * t + 1], 16);
+        c.data[t]     = h ? r : g[2 * t];
+        c.data[4 + t] = h ? g[2 * t + 1] : r;
+    }
 #else
     c.data = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b.data, a.data, c.data);
 #endif
