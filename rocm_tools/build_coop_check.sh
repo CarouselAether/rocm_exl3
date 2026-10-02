@@ -61,6 +61,6 @@ wait
 
 hipcc -o /tmp/gemm_coop_check "$OBJ"/*.o \
   --offload-arch="$GPU_ARCH" -fgpu-rdc \
-  -L"$TORCH_LIB" -ltorch -ltorch_cpu -lc10 -Wl,-rpath,"$TORCH_LIB"
+  -L"$TORCH_LIB" -ltorch -ltorch_cpu -lc10 -lc10_hip -Wl,-rpath,"$TORCH_LIB"
 rm -rf "$OBJ"
 echo "built /tmp/gemm_coop_check ($i TUs)"
