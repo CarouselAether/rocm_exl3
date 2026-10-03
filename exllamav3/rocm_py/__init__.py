@@ -94,6 +94,9 @@ Environment switches (all default to the safe value for this backend):
 
   Added at the v1.5.3 sync (2026-09-29):
 
+  EXL3_ROCM_PREFILL_SPLITS=0  paged prefill kv split count back on upstream's cost model
+                           (default: ceil(real kv / EXL3_ROCM_PREFILL_SPLIT_KV=4096))
+  EXL3_ROCM_KV_UPDATE_ROWS=0  paged KV-cache append on upstream's per-(token, head) kernel
   EXL3_ROCM_PREFILL_HD128=0  paged prefill attention at head_dim <= 128 on v1.5.3's
                            4-warp tile instead of the RDNA 8-warp one
   EXL3_ROCM_ROUTER_I8=1    build upstream's int8 router tables (unused on ROCm)
@@ -1445,6 +1448,86 @@ def apply() -> list[str]:
                 applied.append("paged prefill attention, head_dim <= 128: 128-row tile, 8 warps, 2 stages (EXL3_ROCM_PREFILL_HD128)")
         except Exception as e:
             applied.append(f"!! FAILED paged prefill tile patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # Paged prefill: kv split count from the real kv length (EXL3_ROCM_PREFILL_SPLITS)
+    # ------------------------------------------------------------------
+    # paged_attn_triton_prefill splits the kv range when bound_kv = page-table width * page_size
+    # + chunk length reaches 8192, picking the split count by a grid-quantization cost model.
+    # Two problems on RDNA (rocprofv3, Qwen3-0.6B, gfx1151): the bound counts the new chunk twice
+    # when the page table already covers it (perf.py: a 4096-token chunk on an empty cache reads
+    # as 8192), and the cost model then picks splits on ceil-noise (4 splits for a 0.6% predicted
+    # gain) while assuming uniform full-length programs, which causal prefill is not. Measured per
+    # layer-call: 4096 tokens 10.26 ms auto vs 4.44 split 1; 16384 tokens 89.4 auto vs 60.8 split 4.
+    # Rule here: ceil(real kv / 4096) splits (each program covers ~4K kv tokens), within 4% of the
+    # best fixed split on every measured (q_len, past) case. The real kv length (max past + chunk)
+    # comes from params["cache_seqlens"] when it is a host tensor (the Job prefill path builds it
+    # on the CPU), so no sync; otherwise, and for windowed / non-causal / quantized-cache calls,
+    # upstream's heuristic stands. Upstream's 128 MB partial-buffer bound is kept.
+    # EXL3_ROCM_PREFILL_SPLITS=0 restores upstream; EXL3_ROCM_PREFILL_SPLIT_KV sets the kv span.
+    if _env_on("EXL3_ROCM_PREFILL_SPLITS", True):
+        try:
+            import triton
+            import torch
+            from ..modules.attention_fn import triton_paged as _tpm
+            from ..modules import sliding_attn as _swm
+            from ..modules import attn as _attnm
+            _span = int(os.environ.get("EXL3_ROCM_PREFILL_SPLIT_KV", 4096))
+            _host_kv = {"v": None}
+
+            def _with_host_kv(orig):
+                def wrapper(self, x, bsz, seqlen, params, *a, **kw):
+                    if seqlen <= 16:   # decode / short verify: never reaches the prefill kernel
+                        return orig(self, x, bsz, seqlen, params, *a, **kw)
+                    cs = params.get("cache_seqlens") if isinstance(params, dict) else None
+                    prev = _host_kv["v"]
+                    _host_kv["v"] = (int(cs.max()) + seqlen) if (
+                        isinstance(cs, torch.Tensor) and cs.device.type == "cpu" and cs.numel()
+                    ) else None
+                    try:
+                        return orig(self, x, bsz, seqlen, params, *a, **kw)
+                    finally:
+                        _host_kv["v"] = prev
+                return wrapper
+
+            _inner_prefill = _tpm.paged_attn_triton_prefill
+
+            def _prefill_splits(*a, **kw):
+                kv = _host_kv["v"]
+                if kv is not None and kw.get("num_splits") is None and kw.get("qc") is None:
+                    q = kw["q"] if "q" in kw else a[0]
+                    causal = kw["causal"] if "causal" in kw else (a[7] if len(a) > 7 else False)
+                    window = kw["window_size"] if "window_size" in kw else (a[9] if len(a) > 9 else None)
+                    if causal and q.dim() == 4 and _tpm._normalize_window(window)[0] < 0:
+                        b, ql, nq, hd = q.shape
+                        cap = (128 * 1024 * 1024) // (triton.cdiv(ql, 128) * 128 * b * nq * triton.next_power_of_2(hd) * 4)
+                        kw["num_splits"] = max(1, min(8, triton.cdiv(kv, _span), cap))
+                return _inner_prefill(*a, **kw)
+
+            _attnm.Attention.decode_flash_attn = _with_host_kv(_attnm.Attention.decode_flash_attn)
+            _swm.SlidingAttention.decode_flash_attn = _with_host_kv(_swm.SlidingAttention.decode_flash_attn)
+            _tpm.paged_attn_triton_prefill = _prefill_splits
+            _swm.paged_attn_triton_prefill = _prefill_splits
+            applied.append(f"paged prefill: kv splits from the real kv length, ~{_span} kv tokens per program (EXL3_ROCM_PREFILL_SPLITS)")
+        except Exception as e:
+            applied.append(f"!! FAILED prefill splits patch: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # Paged KV-cache append: row-tiled copy (EXL3_ROCM_KV_UPDATE_ROWS)
+    # ------------------------------------------------------------------
+    # Upstream's _paged_kv_update_kernel is one tiny program per (token, kv head); at 8192 tokens x
+    # 8 kv heads x 128 that is 2.57 ms per layer on gfx1151 (26 GB/s), ~8% of a Qwen3-0.6B prefill.
+    # rocm_py/kv_update.py copies BLOCK_T tokens x the whole n_kv * head_dim row per program:
+    # 0.35 ms, bit-identical (pure copy). bc_attn's AOT compile of the original is untouched.
+    # EXL3_ROCM_KV_UPDATE_ROWS=0 restores upstream's launch.
+    if _env_on("EXL3_ROCM_KV_UPDATE_ROWS", True):
+        try:
+            from ..modules.attention_fn import triton_paged as _tpm
+            from . import kv_update as _kvu
+            _kvu.install(_tpm._paged_kv_update_kernel)
+            applied.append("paged KV-cache append: row-tiled copy, bit-identical (EXL3_ROCM_KV_UPDATE_ROWS)")
+        except Exception as e:
+            applied.append(f"!! FAILED KV update patch: {type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # GatedResidual (Qwen3.8) prefill mix: gate-mean in one kernel
