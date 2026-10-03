@@ -223,8 +223,17 @@ def refuse(msg):
     sys.exit(2)
 
 
+def allow_boost():
+    """EXL3_REGRESS_ALLOW_BOOST=1: run with CPU boost on (a thermal test of the machine, not a perf
+    comparison: the reference was recorded with boost off). thermal_guard still kills at 99.5 C."""
+    return os.environ.get("EXL3_REGRESS_ALLOW_BOOST") == "1"
+
+
 def preflight_global(metrics):
-    if boost() != "0":
+    if boost() != "0" and allow_boost():
+        print("\n !! CPU boost is ON (EXL3_REGRESS_ALLOW_BOOST=1): perf numbers are not comparable to the "
+              "boost-off reference; thermal_guard still kills at 99.5 C\n", flush=True)
+    elif boost() != "0":
         refuse(f"CPU boost is on (/sys/devices/system/cpu/cpufreq/boost = {boost()}). Boost + GPU load tripped "
                "THERMTRIP on 2026-09-26, and it changes the numbers. Turn it off: "
                "echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost")
@@ -237,7 +246,7 @@ def preflight_global(metrics):
 
 def preflight_step(model):
     """Before every GPU process: boost off, swap off (Qwen), no other GPU process, free memory, cool CPU."""
-    if boost() != "0":
+    if boost() != "0" and not allow_boost():
         refuse("CPU boost turned on during the run")
     if MODELS.get(model, {}).get("noswap") and swap_on():
         refuse("swap turned on during the run (Qwen -ngr)")

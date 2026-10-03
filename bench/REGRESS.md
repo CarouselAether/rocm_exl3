@@ -57,7 +57,9 @@ To narrow a run, pass `--models ds4 gemma` (add `suite` to keep gates and isa) o
 | Gates | a step fails, or a test fails that is not a known flake | Known flake: `test_dflash2.py::test_topk_cuda_matches_torch` (top-k tie order). Tests that already failed in the reference are also allowed. |
 | isa diff | never | Informational. |
 
-An improvement beyond the tolerance shows as IMPROVED and never fails. A metric missing from the output (crash, timeout, thermal kill) shows as ERROR, which fails.
+An improvement beyond the tolerance shows as IMPROVED and never fails.
+
+`EXL3_REGRESS_ALLOW_BOOST=1` lets a run start with CPU boost on, as a thermal test of the machine. The perf numbers are then not comparable to the boost-off reference. `thermal_guard` still kills a step at 99.5 C, and the report records the boost state. A metric missing from the output (crash, timeout, thermal kill) shows as ERROR, which fails.
 
 ## Safety and system state
 
